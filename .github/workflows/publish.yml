@@ -1,0 +1,134 @@
+name: Publish to crates.io
+
+# Tag-driven release: pushing a version tag `vX.Y.Z` runs the gates, publishes to crates.io, and
+# cuts a GitHub Release. A normal push to `main` runs the gates only (see ci.yml) — it does NOT
+# publish. Mirrors the sibling DIG crates (dig-dht / dig-nat / dig-constants) so the same org secrets
+# apply.
+#
+# RELEASE ORDERING (ecosystem rule: release-first for shared contracts): the published build depends
+# on the crates.io `dig-dht` and `dig-nat` (which in turn depend on the crates.io `dig-constants`).
+# dig-constants, dig-nat, and dig-dht must all be published to crates.io — and the `git` sources for
+# `dig-dht` / `dig-nat` in Cargo.toml swapped for the plain crates.io versions — BEFORE dig-download is
+# published, or the publish step (correctly) fails on the unresolved git dependencies (`cargo publish`
+# rejects a git dependency). The orchestrator sequences the release tags.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to publish (e.g., v0.1.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  gate:
+    name: Gate (fmt / clippy / test / coverage >=80%)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy, llvm-tools-preview
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Check clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Run tests with coverage (gate >=80% lines)
+        run: >-
+          cargo llvm-cov --all
+          --fail-under-lines 80
+
+      - name: Check documentation
+        run: cargo doc --no-deps
+
+  publish:
+    name: Publish to crates.io
+    runs-on: ubuntu-latest
+    needs: gate
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Verify the package builds
+        run: cargo build --release
+
+      - name: Verify the package can be packaged
+        run: cargo package --locked
+
+      - name: Check CARGO_REGISTRY_TOKEN is set
+        run: |
+          if [ -z "${{ secrets.CARGO_REGISTRY_TOKEN }}" ]; then
+            echo "CARGO_REGISTRY_TOKEN secret is not set in repository settings"
+            exit 1
+          fi
+
+      - name: Publish to crates.io
+        run: cargo publish --locked --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  create-release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: publish
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Extract version from tag
+        id: extract_version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: "dig-download v${{ steps.extract_version.outputs.VERSION }}"
+          body: |
+            ## dig-download v${{ steps.extract_version.outputs.VERSION }}
+
+            Multi-source download orchestrator for the DIG Node peer network — locates content
+            holders via dig-dht, fans byte ranges across multiple peers simultaneously over dig-nat
+            (`dig.fetchRange`), verifies each range independently against the capsule's chain-anchored
+            merkle root, rebalances around dropped/slow/bad sources, and reassembles into the node's
+            store with pause + resume (staged `.download.tmp` + atomic finalize) that never re-fetches
+            a verified range.
+
+            ### Installation
+            ```toml
+            [dependencies]
+            dig-download = "${{ steps.extract_version.outputs.VERSION }}"
+            ```
+          draft: false
+          prerelease: false
