@@ -1,0 +1,79 @@
+# dig-download — the node-side multi-source download orchestrator for the DIG Node peer network.
+#
+# dig-download answers "get me this content, fast and verified": given a `ContentId` (store / root /
+# capsule / resource), it (1) LOCATES the peers holding it via dig-dht `find_providers`, (2) confirms
+# them + plans ranges via the L7 `dig.getAvailability`, (3) fans DIFFERENT byte ranges across
+# DIFFERENT providers SIMULTANEOUSLY over dig-nat mux streams (`dig.fetchRange`), (4) VERIFIES each
+# range independently against the capsule's chain-anchored merkle root, (5) RETRIES a bad/dropped
+# range from another provider, and (6) REASSEMBLES the verified bytes in order into the node's store —
+# with pause + resume that never refetches an already-verified range. This is the node engine that
+# supersedes the retired browser-side `dig-download-utility`.
+#
+# Dependency philosophy (mirrors dig-dht / dig-nat): keep the tree SMALL and the network INJECTABLE.
+# The orchestrator is written entirely against trait boundaries — `ProviderLocator` (locate holders),
+# `RangeTransport` (fetch a range from a holder), `Sink` (write into the store), `StateStore` (persist
+# resume progress), and `Verifier`/`ProofVerifier` (per-range + chain-anchored integrity) — so the
+# whole scheduler / rebalance / verify / pause-resume machinery is tested over an IN-MEMORY harness
+# (mock DHT + mock range sources + in-memory sink + in-memory state store, NO real network / mainnet).
+# The real impls (`DhtProviderLocator` over dig-dht, `NatRangeTransport` over dig-nat) are thin
+# adapters over those two crates; the store-backed `Sink` + digstore merkle `ProofVerifier` are wired
+# by dig-node (see the implementers' note in the crate docs).
+[package]
+name = "dig-download"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75.0"
+license = "Apache-2.0 OR MIT"
+description = "Multi-source download orchestrator for the DIG Node peer network — locates content holders via dig-dht, fans byte ranges across multiple peers simultaneously over dig-nat (dig.fetchRange), verifies each range independently against the capsule's chain-anchored merkle root, rebalances around dropped/slow/bad sources, and reassembles into the node's store with pause + resume that never refetches a verified range."
+repository = "https://github.com/DIG-Network/dig-download"
+readme = "README.md"
+keywords = ["download", "multisource", "p2p", "content", "dig"]
+categories = ["network-programming"]
+
+[dependencies]
+# LOCATE — "which peers hold this content?" dig-download derives a `ContentId` (store / root /
+# capsule / resource) and asks dig-dht `find_providers` for the holders' `ProviderRecord`s.
+#
+# Sourcing: dig-dht is not yet on crates.io, so we resolve from the DIG-Network git repo for both the
+# standalone CI checkout and the superproject build. `version = "0.1"` is what `cargo publish` records.
+dig-dht = { version = "0.1", git = "https://github.com/DIG-Network/dig-dht" }
+
+# REACH + FETCH — the mTLS peer transport the range fetch rides: `dig.getAvailability` +
+# `dig.fetchRange` over dig-nat mux streams, plus the wire shapes (`RangeRequest`, `RangeFrame`,
+# `AvailabilityItem`/`Answer`/`Response`) and `PeerId`/`PeerTarget`/`connect`.
+#
+# Sourcing (IMPORTANT — single dig-nat instance): the BARE git form (same URL + default branch as
+# dig-dht's own `dig-nat` dependency) so cargo UNIFIES both to ONE `dig-nat` crate instance. dig-dht
+# re-exports `dig_nat::PeerId`, and dig-download uses that SAME type across the locator + transport;
+# a divergent git spec (pinned rev / different branch) would fork dig-nat into two incompatible
+# instances and the types would stop lining up. `version = "0.1"` is what `cargo publish` records.
+dig-nat = { version = "0.1", git = "https://github.com/DIG-Network/dig-nat" }
+
+# Async runtime for the orchestrator task + the concurrent range fan-out + backoff timers.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync", "io-util"] }
+async-trait = "0.1"
+
+# The concurrent range scheduler drives many in-flight (provider, range) fetches at once with a
+# `FuturesUnordered`, topping up as sources finish/drop.
+futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
+
+# Resume state (`StateStore`) + the file-backed store persist per-range progress as JSON so an
+# interrupted (or paused) download resumes from the exact verified-range set.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Content integrity: `resource_leaf = SHA-256(concatenated chunk ciphertexts)` (L7 §9 / digstore
+# merkle-proofs) — the whole-resource commitment a reassembled resource is verified against.
+sha2 = "0.10"
+
+# Structured errors + observability.
+thiserror = "2"
+tracing = "0.1"
+
+[dev-dependencies]
+# The in-memory harness spins up mock providers + mock range sources + an in-memory sink/state store
+# in one process (NO real network). test-util drives the backoff timers deterministically.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "test-util"] }
+
+[profile.release]
+overflow-checks = true
