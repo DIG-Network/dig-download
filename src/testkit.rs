@@ -96,6 +96,11 @@ pub enum Behavior {
     Corrupt,
     /// Returns one byte short — caught immediately by the per-range length/alignment check.
     Truncate,
+    /// Returns a boundary-aligned SHORT range: only the FIRST whole chunk of a multi-chunk range,
+    /// so the bytes still start AND end on a chunk boundary. This defeats a purely structural
+    /// alignment check (the short prefix is chunk-aligned) and is caught only by a per-range LENGTH
+    /// check comparing `bytes.len()` to the requested `range.length` (the CRITICAL #179 finding).
+    ShortAligned,
     /// Availability says "not held" and every fetch errors (a peer that does not have the content).
     Unavailable,
     /// Honest for the first `n` successful fetches, then every fetch errors — models a peer dropping
@@ -235,6 +240,18 @@ impl RangeTransport for MockRangeTransport {
             Behavior::Corrupt => {
                 for b in bytes.iter_mut() {
                     *b ^= 0xFF; // right length, wrong content → fails whole-resource root binding
+                }
+            }
+            Behavior::ShortAligned => {
+                // Serve only the FIRST whole chunk of the requested range. The result still starts
+                // and ends on a chunk boundary (so a purely structural alignment check passes) but
+                // is shorter than req.length — the CRITICAL boundary-aligned-short case.
+                let first_chunk_idx = self.content.chunk_index_at(req.offset) as usize;
+                if let Some(&first_len) = self.content.chunk_lens.get(first_chunk_idx) {
+                    let keep = (first_len as usize).min(bytes.len());
+                    if keep < bytes.len() {
+                        bytes.truncate(keep);
+                    }
                 }
             }
             _ => {}
