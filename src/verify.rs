@@ -21,9 +21,11 @@
 //! is checked against it (a peer that reports a *different* `chunk_lens` / `root` is serving a
 //! different generation and is rejected). The on-chain binding — that `resource_leaf` really is
 //! committed under `root` — is delegated to an injected [`ProofVerifier`] so this crate does not
-//! re-implement the digstore merkle-proof byte format; dig-node supplies the real one (see the
-//! implementers' note in the crate docs). Without one, the default [`TrustingProofVerifier`] verifies
-//! structural + length + self-consistency only (it does not bind to the chain).
+//! re-implement the digstore merkle-proof byte format; dig-node supplies the real one via
+//! [`MerkleVerifier::with_proof_verifier`] (see the implementers' note in the crate docs). There is
+//! no fail-open default constructor: the only structural-only path
+//! ([`MerkleVerifier::insecure_structural_only`]) is explicitly named and `#[doc(hidden)]`, so a
+//! production caller cannot accidentally build a verifier that skips the on-chain binding.
 
 use std::sync::Arc;
 
@@ -115,8 +117,9 @@ impl ResourceCommitment {
 /// the digstore merkle inclusion check.
 ///
 /// This is a **seam**: the digstore merkle-proof byte format lives with the store types, so dig-node
-/// injects the real verifier and this crate ships only the [`TrustingProofVerifier`] default (which
-/// does NOT bind to the chain). See the implementers' note in the crate docs.
+/// injects the real verifier and this crate ships only the explicitly-opt-in
+/// [`StructuralOnlyProofVerifier`] (which does NOT bind to the chain). See the implementers' note in
+/// the crate docs.
 pub trait ProofVerifier: Send + Sync {
     /// Return `true` iff `resource_leaf` (SHA-256 of the whole resource ciphertext) is the leaf
     /// committed under `root` per `inclusion_proof`. For a capsule fetch (`inclusion_proof` / `root`
@@ -129,14 +132,21 @@ pub trait ProofVerifier: Send + Sync {
     ) -> bool;
 }
 
-/// The default [`ProofVerifier`]: **structural only**. It accepts any `resource_leaf` (it does not
-/// parse the digstore merkle proof), so a [`MerkleVerifier`] using it enforces length + chunk
-/// alignment + metadata consistency + resource self-consistency, but NOT the on-chain root binding.
-/// dig-node replaces this with a real digstore proof verifier to bind to the chain.
+/// A **structural-only, fail-OPEN** [`ProofVerifier`] that accepts any `resource_leaf` without
+/// parsing the digstore merkle proof — so a [`MerkleVerifier`] using it enforces length + chunk
+/// alignment + metadata consistency + resource self-consistency, but does **NOT** bind the resource
+/// to the on-chain root.
+///
+/// This provides **no chain-anchored integrity** and MUST NOT be used in production: a
+/// [`Downloader`](crate::Downloader) built with it will accept right-length-but-forged content that a
+/// real proof verifier would reject. It exists only to unit-test the structural checks and to let a
+/// caller opt in EXPLICITLY via [`MerkleVerifier::insecure_structural_only`]. dig-node injects a real
+/// digstore proof verifier via [`MerkleVerifier::with_proof_verifier`] to bind to the chain.
+#[doc(hidden)]
 #[derive(Debug, Clone, Copy, Default)]
-pub struct TrustingProofVerifier;
+pub struct StructuralOnlyProofVerifier;
 
-impl ProofVerifier for TrustingProofVerifier {
+impl ProofVerifier for StructuralOnlyProofVerifier {
     fn verify_inclusion(
         &self,
         _resource_leaf: &[u8; 32],
@@ -185,18 +195,30 @@ pub struct MerkleVerifier {
 }
 
 impl MerkleVerifier {
-    /// A verifier with the default [`TrustingProofVerifier`] (structural checks only — no on-chain
-    /// binding). Use [`with_proof_verifier`](Self::with_proof_verifier) to bind to the chain.
-    pub fn new() -> Self {
-        MerkleVerifier {
-            proof: Arc::new(TrustingProofVerifier),
-        }
-    }
-
-    /// A verifier that binds `resource_leaf` to the chain-anchored `root` with `proof` (dig-node
-    /// supplies the real digstore proof verifier).
+    /// A verifier that binds `resource_leaf` to the chain-anchored `root` with `proof` — the
+    /// production constructor. dig-node supplies the real digstore proof verifier here so the
+    /// whole-resource check is chain-anchored.
+    ///
+    /// There is deliberately **no** `new()` / `Default` fail-open constructor: a chain-bound
+    /// [`ProofVerifier`] must be supplied explicitly, so a consumer cannot *accidentally* get a
+    /// verifier that skips the on-chain binding. The only structural-only path is the explicitly
+    /// named, `#[doc(hidden)]` [`insecure_structural_only`](Self::insecure_structural_only).
     pub fn with_proof_verifier(proof: Arc<dyn ProofVerifier>) -> Self {
         MerkleVerifier { proof }
+    }
+
+    /// A **structural-only, fail-OPEN** verifier (length + alignment + metadata consistency only,
+    /// NO chain binding) — see [`StructuralOnlyProofVerifier`].
+    ///
+    /// This gives no chain-anchored integrity and is for tests / explicit opt-in ONLY; production
+    /// callers MUST use [`with_proof_verifier`](Self::with_proof_verifier) with a real digstore proof
+    /// verifier. The name and `#[doc(hidden)]` are intentional: getting the insecure path requires
+    /// asking for it by name.
+    #[doc(hidden)]
+    pub fn insecure_structural_only() -> Self {
+        MerkleVerifier {
+            proof: Arc::new(StructuralOnlyProofVerifier),
+        }
     }
 
     /// The committed `resource_leaf` of `full`: the SHA-256 of the whole resource ciphertext (L7 §9;
@@ -204,12 +226,6 @@ impl MerkleVerifier {
     pub fn resource_leaf(full: &[u8]) -> [u8; 32] {
         let digest = Sha256::digest(full);
         digest.into()
-    }
-}
-
-impl Default for MerkleVerifier {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -290,7 +306,7 @@ mod tests {
     #[test]
     fn verify_range_accepts_whole_chunks() {
         let c = commitment(vec![10, 20, 5]);
-        let v = MerkleVerifier::new();
+        let v = MerkleVerifier::insecure_structural_only();
         // chunk 0 alone (10 bytes)
         assert!(v.verify_range(&c, 0, 10, &[0u8; 10]).is_ok());
         // chunks 1..3 (25 bytes) starting at chunk 1
@@ -300,7 +316,7 @@ mod tests {
     #[test]
     fn verify_range_rejects_wrong_length() {
         let c = commitment(vec![10, 20, 5]);
-        let v = MerkleVerifier::new();
+        let v = MerkleVerifier::insecure_structural_only();
         // chunk 0 should be 10 bytes; 9 bytes → length mismatch (also not a chunk boundary).
         assert!(matches!(
             v.verify_range(&c, 0, 10, &[0u8; 9]),
@@ -317,7 +333,7 @@ mod tests {
         // chunk (10 bytes). Those 10 bytes ARE chunk-aligned, so alignment alone would pass — the
         // exact-length check is what rejects the short range.
         let c = commitment(vec![10, 20, 5]);
-        let v = MerkleVerifier::new();
+        let v = MerkleVerifier::insecure_structural_only();
         assert!(matches!(
             v.verify_range(&c, 0, 30, &[0u8; 10]),
             Err(VerifyError::Length {
@@ -338,7 +354,7 @@ mod tests {
     #[test]
     fn verify_range_rejects_out_of_range_chunk_index() {
         let c = commitment(vec![10]);
-        let v = MerkleVerifier::new();
+        let v = MerkleVerifier::insecure_structural_only();
         assert!(matches!(
             v.verify_range(&c, 5, 10, &[0u8; 10]),
             Err(VerifyError::Alignment(_))
@@ -348,7 +364,7 @@ mod tests {
     #[test]
     fn verify_resource_length_mismatch() {
         let c = commitment(vec![10, 20]);
-        let v = MerkleVerifier::new();
+        let v = MerkleVerifier::insecure_structural_only();
         assert!(matches!(
             v.verify_resource(&c, &[0u8; 5]),
             Err(VerifyError::Length { .. })
@@ -356,10 +372,15 @@ mod tests {
     }
 
     #[test]
-    fn verify_resource_trusting_passes_on_length_match() {
+    fn insecure_structural_only_is_fail_open_on_the_root() {
+        // The explicitly-named structural-only verifier does NOT bind to the chain: right-length but
+        // arbitrary bytes pass verify_resource (this is why the constructor is named "insecure" and
+        // #[doc(hidden)] — production callers must use with_proof_verifier). There is deliberately no
+        // MerkleVerifier::new() / Default that could yield this posture by accident (#179 HIGH).
         let c = commitment(vec![10, 20]);
-        let v = MerkleVerifier::new();
+        let v = MerkleVerifier::insecure_structural_only();
         assert!(v.verify_resource(&c, &[0u8; 30]).is_ok());
+        assert!(v.verify_resource(&c, &[0xFFu8; 30]).is_ok());
     }
 
     #[test]
