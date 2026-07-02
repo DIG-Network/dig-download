@@ -333,6 +333,61 @@ async fn short_aligned_range_recovers_from_a_second_honest_source() {
 }
 
 #[tokio::test]
+async fn commitment_rejects_peer_reporting_a_wrong_root() {
+    // HIGH #179 regression: establish_commitment must NOT adopt a commitment from a peer whose
+    // reported generation root differs from the content-id's root. A sole peer reporting a wrong
+    // root cannot seed the plan, so the download fails to establish metadata (NotFound) rather than
+    // silently downloading the attacker's generation.
+    let content = MockContent::even(20, 2);
+    let transport = Arc::new(MockRangeTransport::new(content.clone()));
+    let cid = mock_content_id();
+    transport
+        .set_behavior(&mock_peer_hex(1), Behavior::WrongRoot)
+        .await;
+    let dl = downloader(
+        transport.clone(),
+        Arc::new(MockProviderLocator::fixed(vec![mock_provider(1, &cid)])),
+        Arc::new(InMemoryStateStore::new()),
+        Arc::new(MerkleVerifier::new()),
+        test_config(10),
+    );
+    let sink = Arc::new(InMemorySink::new());
+    let result = join_ok(dl.download(cid, sink.clone(), DownloadOptions::default())).await;
+    assert!(
+        matches!(result, Err(DownloadError::NotFound { .. })),
+        "a peer reporting a wrong root must not seed the commitment; got {result:?}"
+    );
+    assert_ne!(sink.contents().await, content.bytes);
+}
+
+#[tokio::test]
+async fn wrong_root_peer_ignored_honest_peer_completes() {
+    // A wrong-root peer is skipped during commitment establishment; an honest peer establishes the
+    // correct commitment and the download completes correctly.
+    let content = MockContent::even(20, 2);
+    let transport = Arc::new(MockRangeTransport::new(content.clone()));
+    let cid = mock_content_id();
+    // p1 reports a wrong root; p2 is honest.
+    transport
+        .set_behavior(&mock_peer_hex(1), Behavior::WrongRoot)
+        .await;
+    let providers = vec![mock_provider(1, &cid), mock_provider(2, &cid)];
+    let dl = downloader(
+        transport.clone(),
+        Arc::new(MockProviderLocator::fixed(providers)),
+        Arc::new(InMemoryStateStore::new()),
+        Arc::new(MerkleVerifier::new()),
+        test_config(10),
+    );
+    let sink = Arc::new(InMemorySink::new());
+    let total = join_ok(dl.download(cid, sink.clone(), DownloadOptions::default()))
+        .await
+        .unwrap();
+    assert_eq!(total, 20);
+    assert_eq!(sink.contents().await, content.bytes);
+}
+
+#[tokio::test]
 async fn pause_then_resume_fetches_only_missing_ranges() {
     let content = MockContent::even(40, 4); // 4 chunks of 10
     let transport = Arc::new(MockRangeTransport::new(content.clone()));
