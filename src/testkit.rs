@@ -108,6 +108,10 @@ pub enum Behavior {
     DropAfter(usize),
     /// Every fetch errors (a dead/unreachable peer).
     AlwaysFail,
+    /// Serves correct-length bytes but reports a DIFFERENT generation `root` in the first-frame
+    /// metadata than the content-id's root — a peer trying to shape the commitment to a different
+    /// (attacker-chosen) generation. Must be rejected before the commitment is adopted ([HIGH #179]).
+    WrongRoot,
 }
 
 /// A mock [`RangeTransport`] serving [`MockContent`] with per-provider [`Behavior`], recording fetch
@@ -256,10 +260,15 @@ impl RangeTransport for MockRangeTransport {
             }
             _ => {}
         }
+        let mut meta = self.content.meta(req.offset);
+        if matches!(behavior, Behavior::WrongRoot) {
+            // Report a root that differs from both the honest content root and the content-id root.
+            meta.root = Some("cd".repeat(32));
+        }
         Ok(FetchedRange {
             request_offset: req.offset,
             bytes,
-            meta: self.content.meta(req.offset),
+            meta,
         })
     }
 }
@@ -327,9 +336,12 @@ pub fn mock_peer_hex(n: u8) -> String {
     PeerId::from_bytes([n; 32]).to_hex()
 }
 
-/// A throwaway content id (resource granularity) for tests.
+/// A throwaway content id (resource granularity) for tests. Its generation `root` is `[0xAB; 32]`
+/// (hex `"ab".repeat(32)`) so it MATCHES the root [`MockContent`] reports in each range's first
+/// frame — the orchestrator cross-checks the peer-reported root against the content-id root
+/// ([HIGH #179]), so the two must agree for an honest download to proceed.
 pub fn mock_content_id() -> ContentId {
-    ContentId::resource([1; 32], [2; 32], [3; 32])
+    ContentId::resource([1; 32], [0xAB; 32], [3; 32])
 }
 
 #[cfg(test)]

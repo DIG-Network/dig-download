@@ -713,9 +713,20 @@ impl Job {
     /// read the whole-resource `chunk_lens` / `total_length` / `root` from its first frame.
     async fn establish_commitment(&mut self) -> Result<(), DownloadError> {
         let providers = self.providers.clone();
+        let want_root = self.content_root_hex();
         for provider in &providers {
             let req = self.range_request(0, 1)?;
             if let Ok(f) = self.transport.fetch_range(provider, &req).await {
+                // Bind the ground truth to the CALLER's request, not to whichever peer answers
+                // first: reject a peer whose reported generation root differs from the content-id's
+                // root before adopting anything it says ([HIGH #179]). Without this, a single peer
+                // winning the meta-probe race could shape the whole plan to an attacker-chosen
+                // generation, and check_consistent would then discard the honest providers.
+                if let (Some(want), Some(got)) = (&want_root, &f.meta.root) {
+                    if got != want {
+                        continue;
+                    }
+                }
                 if let (Some(tl), Some(cl)) = (f.meta.total_length, f.meta.chunk_lens.clone()) {
                     match ResourceCommitment::from_first_frame(
                         tl,
@@ -889,6 +900,15 @@ impl Job {
                 root: Some(hex32(root)),
                 retrieval_key: Some(hex32(retrieval_key)),
             }),
+        }
+    }
+
+    /// The content-id's generation `root` as lowercase 64-hex (the ground truth every peer-reported
+    /// root is cross-checked against), or `None` for a bare store id (which carries no root).
+    fn content_root_hex(&self) -> Option<String> {
+        match &self.content {
+            ContentId::Store { .. } => None,
+            ContentId::Root { root, .. } | ContentId::Resource { root, .. } => Some(hex32(root)),
         }
     }
 
