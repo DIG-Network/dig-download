@@ -27,12 +27,72 @@
 //! ([`MerkleVerifier::insecure_structural_only`]) is explicitly named and `#[doc(hidden)]`, so a
 //! production caller cannot accidentally build a verifier that skips the on-chain binding.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
 
 use crate::error::VerifyError;
 use crate::plan::ChunkLayout;
+
+/// Streaming SHA-256 of a resource's ciphertext fed range-by-range in ARBITRARY order, so the
+/// whole-resource `resource_leaf` can be computed WITHOUT retaining every range and then
+/// concatenating a second full-length copy (the old path held ~2N bytes for an N-byte resource —
+/// MEDIUM #179).
+///
+/// Ranges are hashed strictly in ascending offset order. A range whose offset is not yet the
+/// next-needed contiguous offset is buffered in a small out-of-order window and drained the moment
+/// the gap before it fills; a range at (or before, as a verified idempotent re-feed of the exact
+/// same bytes) the next offset is hashed immediately. Because the orchestrator feeds only verified,
+/// chunk-aligned, non-overlapping ranges that tile the resource exactly, the buffer holds at most the
+/// ranges fetched out of order and is emptied as the contiguous frontier advances.
+#[derive(Debug, Default)]
+pub struct ResourceHasher {
+    hasher: Sha256,
+    /// The next contiguous byte offset still to be hashed.
+    next_offset: u64,
+    /// Ranges received ahead of `next_offset`, keyed by their offset, awaiting the gap to fill.
+    pending: BTreeMap<u64, Vec<u8>>,
+}
+
+impl ResourceHasher {
+    /// A fresh hasher positioned at offset 0.
+    pub fn new() -> Self {
+        ResourceHasher::default()
+    }
+
+    /// Feed one verified range's `bytes` at absolute `offset`. Hashes it (and any now-contiguous
+    /// buffered ranges) immediately if `offset` is the contiguous frontier, else buffers it. A range
+    /// strictly before the frontier (already hashed) is ignored — feeding is idempotent for a range
+    /// that was hashed and then re-delivered, which cannot happen for distinct ranges but keeps the
+    /// contract robust.
+    pub fn feed(&mut self, offset: u64, bytes: Vec<u8>) {
+        if offset < self.next_offset {
+            return; // already consumed
+        }
+        self.pending.insert(offset, bytes);
+        while let Some(chunk) = self.pending.remove(&self.next_offset) {
+            self.hasher.update(&chunk);
+            self.next_offset = self.next_offset.saturating_add(chunk.len() as u64);
+        }
+    }
+
+    /// The contiguous byte length hashed so far (the frontier offset).
+    pub fn hashed_len(&self) -> u64 {
+        self.next_offset
+    }
+
+    /// Whether any out-of-order ranges are still buffered (a gap remains before the frontier).
+    pub fn has_gap(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    /// Finalize into the `resource_leaf` digest. Valid only once every range has been fed contiguously
+    /// (`has_gap()` is false); a caller checks `hashed_len() == total_length` for completeness.
+    pub fn finalize(self) -> [u8; 32] {
+        self.hasher.finalize().into()
+    }
+}
 
 /// The trusted per-resource metadata a download verifies every range against: the chunk boundaries,
 /// the total length, the chain-anchored generation `root`, and (for a resource, not a capsule) the
@@ -186,6 +246,20 @@ pub trait Verifier: Send + Sync {
         commitment: &ResourceCommitment,
         full: &[u8],
     ) -> Result<(), VerifyError>;
+
+    /// Whole-resource check from a PRE-COMPUTED `resource_leaf` + the contiguously-hashed
+    /// `assembled_len`, so the orchestrator can hash ranges incrementally
+    /// ([`ResourceHasher`]) and avoid retaining the whole resource + a concatenated copy in RAM
+    /// (~2N bytes — MEDIUM #179). `assembled_len` must equal the committed `total_length` (else the
+    /// resource is incomplete → [`VerifyError::Length`]); `leaf` is then bound to the chain-anchored
+    /// `root`. The default implementation mirrors [`verify_resource`](Self::verify_resource) minus the
+    /// hashing.
+    fn verify_resource_leaf(
+        &self,
+        commitment: &ResourceCommitment,
+        leaf: &[u8; 32],
+        assembled_len: u64,
+    ) -> Result<(), VerifyError>;
 }
 
 /// The real [`Verifier`]: chunk-length + alignment per range, `resource_leaf = SHA-256(concat)` bound
@@ -269,15 +343,24 @@ impl Verifier for MerkleVerifier {
         commitment: &ResourceCommitment,
         full: &[u8],
     ) -> Result<(), VerifyError> {
-        if full.len() as u64 != commitment.total_length {
+        let leaf = MerkleVerifier::resource_leaf(full);
+        self.verify_resource_leaf(commitment, &leaf, full.len() as u64)
+    }
+
+    fn verify_resource_leaf(
+        &self,
+        commitment: &ResourceCommitment,
+        leaf: &[u8; 32],
+        assembled_len: u64,
+    ) -> Result<(), VerifyError> {
+        if assembled_len != commitment.total_length {
             return Err(VerifyError::Length {
                 expected: commitment.total_length,
-                actual: full.len() as u64,
+                actual: assembled_len,
             });
         }
-        let leaf = MerkleVerifier::resource_leaf(full);
         if !self.proof.verify_inclusion(
-            &leaf,
+            leaf,
             commitment.inclusion_proof.as_deref(),
             commitment.root.as_deref(),
         ) {
@@ -301,6 +384,83 @@ mod tests {
     fn from_first_frame_rejects_inconsistent_total() {
         let err = ResourceCommitment::from_first_frame(999, vec![10, 20], None, None);
         assert!(matches!(err, Err(VerifyError::Metadata(_))));
+    }
+
+    #[test]
+    fn resource_hasher_matches_concat_hash_regardless_of_feed_order() {
+        // The incremental hasher must produce EXACTLY the SHA-256 of the concatenated ranges, no
+        // matter what order the ranges are fed in (MEDIUM #179 — replaces retain-all + concat).
+        let full: Vec<u8> = (0..90u16).map(|i| i as u8).collect();
+        let expect = MerkleVerifier::resource_leaf(&full);
+
+        // Feed the three 30-byte ranges out of order: 60, 0, 30.
+        let mut h = ResourceHasher::new();
+        h.feed(60, full[60..90].to_vec());
+        assert!(
+            h.has_gap(),
+            "range at 60 is ahead of the frontier → buffered"
+        );
+        assert_eq!(h.hashed_len(), 0);
+        h.feed(0, full[0..30].to_vec());
+        assert_eq!(h.hashed_len(), 30);
+        assert!(h.has_gap(), "range at 60 still buffered, 30..60 missing");
+        h.feed(30, full[30..60].to_vec());
+        assert!(!h.has_gap(), "the gap filled → everything drained");
+        assert_eq!(h.hashed_len(), 90);
+        assert_eq!(h.finalize(), expect);
+
+        // In-order feed yields the same digest.
+        let mut h2 = ResourceHasher::new();
+        for off in [0u64, 30, 60] {
+            h2.feed(off, full[off as usize..off as usize + 30].to_vec());
+        }
+        assert_eq!(h2.hashed_len(), 90);
+        assert_eq!(h2.finalize(), expect);
+    }
+
+    #[test]
+    fn resource_hasher_ignores_a_range_before_the_frontier() {
+        let mut h = ResourceHasher::new();
+        h.feed(0, vec![1u8; 10]);
+        assert_eq!(h.hashed_len(), 10);
+        // A stale re-feed strictly before the frontier is ignored (does not double-hash).
+        h.feed(0, vec![1u8; 10]);
+        assert_eq!(h.hashed_len(), 10);
+        h.feed(10, vec![2u8; 10]);
+        assert_eq!(h.hashed_len(), 20);
+        let mut concat = vec![1u8; 10];
+        concat.extend_from_slice(&[2u8; 10]);
+        assert_eq!(h.finalize(), MerkleVerifier::resource_leaf(&concat));
+    }
+
+    #[test]
+    fn verify_resource_leaf_length_and_root_binding() {
+        let c = commitment(vec![10, 20]);
+        // Precomputed leaf of the correct 30-byte resource.
+        let correct = vec![3u8; 30];
+        let leaf = MerkleVerifier::resource_leaf(&correct);
+        // Short assembled length → Length error before any root binding.
+        let v = MerkleVerifier::insecure_structural_only();
+        assert!(matches!(
+            v.verify_resource_leaf(&c, &leaf, 20),
+            Err(VerifyError::Length { .. })
+        ));
+        // Correct length passes the structural-only verifier.
+        assert!(v.verify_resource_leaf(&c, &leaf, 30).is_ok());
+
+        // A real proof verifier binds the leaf to the root.
+        struct OnlyLeaf([u8; 32]);
+        impl ProofVerifier for OnlyLeaf {
+            fn verify_inclusion(&self, l: &[u8; 32], _p: Option<&str>, _r: Option<&str>) -> bool {
+                l == &self.0
+            }
+        }
+        let v2 = MerkleVerifier::with_proof_verifier(Arc::new(OnlyLeaf(leaf)));
+        assert!(v2.verify_resource_leaf(&c, &leaf, 30).is_ok());
+        assert!(matches!(
+            v2.verify_resource_leaf(&c, &[0u8; 32], 30),
+            Err(VerifyError::Root)
+        ));
     }
 
     #[test]

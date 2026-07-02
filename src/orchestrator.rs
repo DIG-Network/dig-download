@@ -26,7 +26,7 @@
 //! progress is checkpointed to a [`StateStore`], so a paused OR crashed download resumes and re-fetches
 //! ONLY the still-missing ranges.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -44,7 +44,7 @@ use crate::plan::{plan_ranges, Range, RangeState};
 use crate::progress::{DownloadEvent, DownloadProgress, DownloadState, StateStore};
 use crate::sink::Sink;
 use crate::source::{FetchedRange, RangeTransport, SourceTracker};
-use crate::verify::{ResourceCommitment, Verifier};
+use crate::verify::{ResourceCommitment, ResourceHasher, Verifier};
 
 /// Tuning for a download's scheduler + integrity + backoff.
 #[derive(Debug, Clone)]
@@ -183,7 +183,7 @@ impl Downloader {
             resume: DownloadState::new(String::new()),
             paused: opts.start_paused,
             bytes_done: 0,
-            retained: BTreeMap::new(),
+            hasher: None,
             relocate_attempts: 0,
             relocated_since_progress: false,
             total_failures: 0,
@@ -283,7 +283,10 @@ struct Job {
     resume: DownloadState,
     paused: bool,
     bytes_done: u64,
-    retained: BTreeMap<u64, Vec<u8>>,
+    /// Streaming SHA-256 of the resource ciphertext for the whole-resource backstop, fed one verified
+    /// range at a time in offset order (only present when `verify_whole_resource` and no ranges were
+    /// resumed from a prior process). Replaces retaining every range + a full concat copy (~2N RAM).
+    hasher: Option<ResourceHasher>,
     relocate_attempts: usize,
     relocated_since_progress: bool,
     total_failures: usize,
@@ -378,6 +381,16 @@ impl Job {
             .iter()
             .filter(|r| self.resume.is_done(r.index))
             .count();
+        // The whole-resource backstop hashes ranges incrementally in offset order (O(window) RAM
+        // instead of retaining ~2N bytes — MEDIUM #179). It is only usable on a FRESH download where
+        // every range flows through this process; on a crash-resume the earlier ranges are only in
+        // the sink, so no hasher is created and the backstop is skipped (each range was still
+        // per-range verified).
+        self.hasher = if self.config.verify_whole_resource && resumed_ranges == 0 {
+            Some(ResourceHasher::new())
+        } else {
+            None
+        };
         self.bytes_done = self
             .ranges
             .iter()
@@ -393,18 +406,22 @@ impl Job {
         // 5–7. Schedule, verify, reassemble.
         self.schedule_loop().await?;
 
-        // Whole-resource integrity backstop (bind to the chain-anchored root). Fail-closed: over a
-        // fresh (non-resumed) download EVERY verified range is retained in RAM, so the assembly MUST
-        // equal the committed total_length — `verify_resource` returns VerifyError::Length for a
-        // short/incomplete assembly rather than being silently skipped, so a short download can never
-        // fall through to a successful finalize (CRITICAL #179). On a crash-RESUME the earlier ranges
-        // live only in the sink's staging file (not this run's `retained`), so the in-RAM assembly is
-        // legitimately partial; we cannot bind it to the root here without re-reading the sink, but
-        // every range — resumed or freshly fetched — already passed the per-range length + alignment
-        // check, so integrity is not silently lost.
-        if self.config.verify_whole_resource && resumed_ranges == 0 {
-            let full = self.assemble_retained();
-            if let Err(e) = self.verifier.verify_resource(&commitment, &full) {
+        // Whole-resource integrity backstop (bind to the chain-anchored root). Fail-closed: on a
+        // fresh (non-resumed) download every verified range was fed to the incremental `hasher`, so
+        // its contiguous hashed length MUST equal the committed total_length — `verify_resource_leaf`
+        // returns VerifyError::Length for a short/incomplete assembly rather than being silently
+        // skipped, so a short download can never fall through to a successful finalize (CRITICAL
+        // #179). On a crash-RESUME the earlier ranges live only in the sink's staging file (no hasher
+        // was created), so this backstop is skipped; every range — resumed or freshly fetched — still
+        // passed the per-range length + alignment check, so integrity is not silently lost. The
+        // incremental hash avoids retaining every range + a full concat copy (~2N RAM — MEDIUM #179).
+        if let Some(hasher) = self.hasher.take() {
+            let hashed_len = hasher.hashed_len();
+            let leaf = hasher.finalize();
+            if let Err(e) = self
+                .verifier
+                .verify_resource_leaf(&commitment, &leaf, hashed_len)
+            {
                 self.emit(DownloadEvent::Failed {
                     reason: e.to_string(),
                 })
@@ -596,8 +613,8 @@ impl Job {
         match outcome {
             Ok(bytes) => {
                 self.sink.write_at(range.offset, &bytes).await?;
-                if self.config.verify_whole_resource {
-                    self.retained.insert(range.offset, bytes);
+                if let Some(hasher) = self.hasher.as_mut() {
+                    hasher.feed(range.offset, bytes);
                 }
                 self.range_state[idx] = RangeState::Done;
                 self.resume.mark_done(idx);
@@ -860,15 +877,6 @@ impl Job {
             ranges_total: self.ranges.len(),
             active_sources,
         }
-    }
-
-    /// Concatenate the retained verified range bytes in offset order (for the whole-resource verify).
-    fn assemble_retained(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(self.retained.values().map(|b| b.len()).sum());
-        for bytes in self.retained.values() {
-            out.extend_from_slice(bytes);
-        }
-        out
     }
 
     /// Persist the current resume checkpoint.

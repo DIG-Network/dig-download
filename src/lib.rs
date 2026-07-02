@@ -102,5 +102,6 @@ pub use source::{
     RangeTransport, SourceHealth, SourceTracker,
 };
 pub use verify::{
-    MerkleVerifier, ProofVerifier, ResourceCommitment, StructuralOnlyProofVerifier, Verifier,
+    MerkleVerifier, ProofVerifier, ResourceCommitment, ResourceHasher, StructuralOnlyProofVerifier,
+    Verifier,
 };
