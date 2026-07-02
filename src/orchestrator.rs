@@ -368,6 +368,16 @@ impl Job {
                 }
             })
             .collect();
+        // Ranges carried over as already-done from persisted resume state: their verified bytes were
+        // written to the sink in a PRIOR process and are NOT in this run's in-RAM `retained` map, so
+        // the whole-resource in-RAM assembly is intentionally partial and the backstop can't run over
+        // it (see below). A range is only ever marked done after passing the per-range length +
+        // alignment check, so a resumed-done range is still known-good.
+        let resumed_ranges = self
+            .ranges
+            .iter()
+            .filter(|r| self.resume.is_done(r.index))
+            .count();
         self.bytes_done = self
             .ranges
             .iter()
@@ -383,17 +393,23 @@ impl Job {
         // 5–7. Schedule, verify, reassemble.
         self.schedule_loop().await?;
 
-        // Whole-resource integrity backstop (bind to the chain-anchored root).
-        if self.config.verify_whole_resource {
+        // Whole-resource integrity backstop (bind to the chain-anchored root). Fail-closed: over a
+        // fresh (non-resumed) download EVERY verified range is retained in RAM, so the assembly MUST
+        // equal the committed total_length — `verify_resource` returns VerifyError::Length for a
+        // short/incomplete assembly rather than being silently skipped, so a short download can never
+        // fall through to a successful finalize (CRITICAL #179). On a crash-RESUME the earlier ranges
+        // live only in the sink's staging file (not this run's `retained`), so the in-RAM assembly is
+        // legitimately partial; we cannot bind it to the root here without re-reading the sink, but
+        // every range — resumed or freshly fetched — already passed the per-range length + alignment
+        // check, so integrity is not silently lost.
+        if self.config.verify_whole_resource && resumed_ranges == 0 {
             let full = self.assemble_retained();
-            if full.len() as u64 == commitment.total_length {
-                if let Err(e) = self.verifier.verify_resource(&commitment, &full) {
-                    self.emit(DownloadEvent::Failed {
-                        reason: e.to_string(),
-                    })
-                    .await;
-                    return Err(e.into());
-                }
+            if let Err(e) = self.verifier.verify_resource(&commitment, &full) {
+                self.emit(DownloadEvent::Failed {
+                    reason: e.to_string(),
+                })
+                .await;
+                return Err(e.into());
             }
         }
 
@@ -633,8 +649,15 @@ impl Job {
             fetched.meta.chunk_lens.as_deref(),
             fetched.meta.root.as_deref(),
         )?;
-        self.verifier
-            .verify_range(commitment, range.chunk_start as u64, &fetched.bytes)?;
+        // Pass the planned range length so a boundary-aligned SHORT range (fewer whole chunks than
+        // requested) is rejected as a recoverable VerifyError::Length and re-fetched elsewhere,
+        // rather than silently written as a hole (CRITICAL #179).
+        self.verifier.verify_range(
+            commitment,
+            range.chunk_start as u64,
+            range.length,
+            &fetched.bytes,
+        )?;
         Ok(fetched.bytes)
     }
 

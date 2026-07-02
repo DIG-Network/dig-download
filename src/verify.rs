@@ -152,12 +152,20 @@ impl ProofVerifier for TrustingProofVerifier {
 /// [`verify_resource`](Self::verify_resource) once the resource is fully assembled.
 pub trait Verifier: Send + Sync {
     /// Fast per-range check: `bytes` (the reassembled range starting at chunk `first_chunk_index`)
-    /// covers whole chunk(s) whose lengths match the commitment. Returns [`VerifyError::Length`] /
-    /// [`VerifyError::Alignment`] for a mis-sized / unaligned range.
+    /// is EXACTLY `expected_len` bytes AND covers whole chunk(s) whose lengths match the commitment.
+    ///
+    /// The `expected_len` check is load-bearing for integrity: a peer can serve fewer whole chunks
+    /// than requested (a boundary-aligned SHORT range) whose bytes still start and end on chunk
+    /// boundaries — structurally aligned yet incomplete. Requiring `bytes.len() == expected_len`
+    /// (the planned [`Range::length`](crate::plan::Range::length)) rejects that short range as
+    /// [`VerifyError::Length`], so the orchestrator re-fetches it from another provider rather than
+    /// silently writing a hole. Returns [`VerifyError::Length`] for a mis-sized range and
+    /// [`VerifyError::Alignment`] for an unaligned one.
     fn verify_range(
         &self,
         commitment: &ResourceCommitment,
         first_chunk_index: u64,
+        expected_len: u64,
         bytes: &[u8],
     ) -> Result<(), VerifyError>;
 
@@ -210,8 +218,18 @@ impl Verifier for MerkleVerifier {
         &self,
         commitment: &ResourceCommitment,
         first_chunk_index: u64,
+        expected_len: u64,
         bytes: &[u8],
     ) -> Result<(), VerifyError> {
+        // Length first, fail-closed: a boundary-aligned SHORT range (fewer whole chunks than
+        // planned) still passes the alignment check below, so the ONLY thing that catches it is
+        // this exact-length comparison against the planned range length.
+        if bytes.len() as u64 != expected_len {
+            return Err(VerifyError::Length {
+                expected: expected_len,
+                actual: bytes.len() as u64,
+            });
+        }
         let start = first_chunk_index as usize;
         let layout = &commitment.layout;
         if start >= layout.chunk_count() {
@@ -274,19 +292,46 @@ mod tests {
         let c = commitment(vec![10, 20, 5]);
         let v = MerkleVerifier::new();
         // chunk 0 alone (10 bytes)
-        assert!(v.verify_range(&c, 0, &[0u8; 10]).is_ok());
+        assert!(v.verify_range(&c, 0, 10, &[0u8; 10]).is_ok());
         // chunks 1..3 (25 bytes) starting at chunk 1
-        assert!(v.verify_range(&c, 1, &[0u8; 25]).is_ok());
+        assert!(v.verify_range(&c, 1, 25, &[0u8; 25]).is_ok());
     }
 
     #[test]
     fn verify_range_rejects_wrong_length() {
         let c = commitment(vec![10, 20, 5]);
         let v = MerkleVerifier::new();
-        // chunk 0 should be 10 bytes; 9 is not a chunk boundary → alignment error
+        // chunk 0 should be 10 bytes; 9 bytes → length mismatch (also not a chunk boundary).
         assert!(matches!(
-            v.verify_range(&c, 0, &[0u8; 9]),
-            Err(VerifyError::Alignment(_))
+            v.verify_range(&c, 0, 10, &[0u8; 9]),
+            Err(VerifyError::Length {
+                expected: 10,
+                actual: 9
+            })
+        ));
+    }
+
+    #[test]
+    fn verify_range_rejects_boundary_aligned_short_range() {
+        // CRITICAL #179: a range planned over chunks 0..2 (30 bytes) but served only the first whole
+        // chunk (10 bytes). Those 10 bytes ARE chunk-aligned, so alignment alone would pass — the
+        // exact-length check is what rejects the short range.
+        let c = commitment(vec![10, 20, 5]);
+        let v = MerkleVerifier::new();
+        assert!(matches!(
+            v.verify_range(&c, 0, 30, &[0u8; 10]),
+            Err(VerifyError::Length {
+                expected: 30,
+                actual: 10
+            })
+        ));
+        // A too-LONG boundary-aligned range (extra whole chunk) is likewise rejected on length.
+        assert!(matches!(
+            v.verify_range(&c, 0, 10, &[0u8; 30]),
+            Err(VerifyError::Length {
+                expected: 10,
+                actual: 30
+            })
         ));
     }
 
@@ -295,7 +340,7 @@ mod tests {
         let c = commitment(vec![10]);
         let v = MerkleVerifier::new();
         assert!(matches!(
-            v.verify_range(&c, 5, &[0u8; 10]),
+            v.verify_range(&c, 5, 10, &[0u8; 10]),
             Err(VerifyError::Alignment(_))
         ));
     }

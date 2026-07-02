@@ -264,6 +264,75 @@ async fn whole_resource_integrity_backstop_rejects_forged_content() {
 }
 
 #[tokio::test]
+async fn boundary_aligned_short_range_is_rejected_not_finalized() {
+    // CRITICAL #179 regression: a range planned over MULTIPLE whole chunks, served by a peer that
+    // returns only the first whole chunk. Those bytes are boundary-aligned (they start and end on a
+    // chunk boundary) so a purely structural alignment check would ACCEPT them as complete — a
+    // silent short/incomplete download. The per-range LENGTH check must reject the short range as a
+    // recoverable failure and re-fetch it; with only a short-serving provider the download must NOT
+    // finalize as success.
+    //
+    // 4 chunks of 10; window 20 → 2 ranges of 20 bytes (2 chunks each). ShortAligned serves 10.
+    let content = MockContent::even(40, 4);
+    let transport = Arc::new(MockRangeTransport::new(content.clone()));
+    let cid = mock_content_id();
+    transport
+        .set_behavior(&mock_peer_hex(1), Behavior::ShortAligned)
+        .await;
+    // Small attempt budget so the all-short provider set terminates quickly.
+    let mut config = test_config(20);
+    config.max_range_attempts = 3;
+    let dl = downloader(
+        transport.clone(),
+        Arc::new(MockProviderLocator::fixed(vec![mock_provider(1, &cid)])),
+        Arc::new(InMemoryStateStore::new()),
+        Arc::new(MerkleVerifier::new()),
+        config,
+    );
+    let sink = Arc::new(InMemorySink::new());
+    let result = join_ok(dl.download(cid, sink.clone(), DownloadOptions::default())).await;
+
+    // The download MUST NOT succeed: a boundary-aligned short range is not a complete range.
+    assert!(
+        matches!(result, Err(DownloadError::NoProviders { .. })),
+        "a boundary-aligned short range must be rejected, not finalized as success; got {result:?}"
+    );
+    // And the sink must not hold a full, "complete-looking" resource.
+    assert_ne!(
+        sink.contents().await,
+        content.bytes,
+        "the short download must not have produced the whole resource"
+    );
+}
+
+#[tokio::test]
+async fn short_aligned_range_recovers_from_a_second_honest_source() {
+    // The short-serving peer's ranges are re-fetched from an honest peer → the download completes
+    // correctly (the length check discards the short range without poisoning the result).
+    let content = MockContent::even(40, 4);
+    let transport = Arc::new(MockRangeTransport::new(content.clone()));
+    let cid = mock_content_id();
+    // p1 serves boundary-aligned short ranges; p2 is honest.
+    transport
+        .set_behavior(&mock_peer_hex(1), Behavior::ShortAligned)
+        .await;
+    let providers = vec![mock_provider(1, &cid), mock_provider(2, &cid)];
+    let dl = downloader(
+        transport.clone(),
+        Arc::new(MockProviderLocator::fixed(providers)),
+        Arc::new(InMemoryStateStore::new()),
+        Arc::new(MerkleVerifier::new()),
+        test_config(20),
+    );
+    let sink = Arc::new(InMemorySink::new());
+    let total = join_ok(dl.download(cid, sink.clone(), DownloadOptions::default()))
+        .await
+        .unwrap();
+    assert_eq!(total, 40);
+    assert_eq!(sink.contents().await, content.bytes);
+}
+
+#[tokio::test]
 async fn pause_then_resume_fetches_only_missing_ranges() {
     let content = MockContent::even(40, 4); // 4 chunks of 10
     let transport = Arc::new(MockRangeTransport::new(content.clone()));
