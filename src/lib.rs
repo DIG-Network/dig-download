@@ -52,8 +52,10 @@
 //!    NAT-traversal ladder and runs `dig.getAvailability` / `dig.fetchRange`.
 //! 3. **Verifier** — [`MerkleVerifier::with_proof_verifier`] with the **digstore merkle-proof
 //!    verifier** (the store crate owns the proof byte format) so the whole-resource check binds to the
-//!    chain-anchored root. (Without it, [`MerkleVerifier::new`] enforces per-range + structural
-//!    integrity only.)
+//!    chain-anchored root. This is the ONLY production constructor: there is no fail-open default, so a
+//!    node cannot accidentally run without the on-chain binding. (The explicitly-named,
+//!    `#[doc(hidden)]` `MerkleVerifier::insecure_structural_only` enforces per-range + structural
+//!    integrity only and is for tests / deliberate opt-in.)
 //! 4. **Sink** — per download, a [`FileSink::new(final_path)`](FileSink) (stages to
 //!    `<final_path>.download.tmp`, atomically renames on finalize), OR a digstore-backed [`Sink`] that
 //!    writes the capsule/resource ciphertext into the store and finalizes on install.
@@ -100,5 +102,5 @@ pub use source::{
     SourceHealth, SourceTracker,
 };
 pub use verify::{
-    MerkleVerifier, ProofVerifier, ResourceCommitment, TrustingProofVerifier, Verifier,
+    MerkleVerifier, ProofVerifier, ResourceCommitment, StructuralOnlyProofVerifier, Verifier,
 };

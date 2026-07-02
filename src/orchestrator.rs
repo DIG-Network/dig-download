@@ -719,7 +719,7 @@ impl Job {
             if let Ok(f) = self.transport.fetch_range(provider, &req).await {
                 // Bind the ground truth to the CALLER's request, not to whichever peer answers
                 // first: reject a peer whose reported generation root differs from the content-id's
-                // root before adopting anything it says ([HIGH #179]). Without this, a single peer
+                // root before adopting anything it says (HIGH #179). Without this, a single peer
                 // winning the meta-probe race could shape the whole plan to an attacker-chosen
                 // generation, and check_consistent would then discard the honest providers.
                 if let (Some(want), Some(got)) = (&want_root, &f.meta.root) {

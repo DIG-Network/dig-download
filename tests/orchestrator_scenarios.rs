@@ -76,7 +76,7 @@ async fn multi_source_concurrent_reassembles_whole_resource() {
         transport.clone(),
         Arc::new(MockProviderLocator::fixed(providers)),
         Arc::new(InMemoryStateStore::new()),
-        Arc::new(MerkleVerifier::new()),
+        Arc::new(MerkleVerifier::insecure_structural_only()),
         test_config(10),
     );
     let sink = Arc::new(InMemorySink::new());
@@ -112,7 +112,7 @@ async fn bad_source_range_is_refetched_from_another() {
         transport.clone(),
         Arc::new(MockProviderLocator::fixed(providers)),
         Arc::new(InMemoryStateStore::new()),
-        Arc::new(MerkleVerifier::new()),
+        Arc::new(MerkleVerifier::insecure_structural_only()),
         test_config(10),
     );
 
@@ -160,7 +160,7 @@ async fn source_dropping_mid_download_rebalances() {
         transport.clone(),
         Arc::new(MockProviderLocator::fixed(providers)),
         Arc::new(InMemoryStateStore::new()),
-        Arc::new(MerkleVerifier::new()),
+        Arc::new(MerkleVerifier::insecure_structural_only()),
         config,
     );
 
@@ -196,7 +196,7 @@ async fn relocate_when_sources_exhausted() {
         transport.clone(),
         locator.clone(),
         Arc::new(InMemoryStateStore::new()),
-        Arc::new(MerkleVerifier::new()),
+        Arc::new(MerkleVerifier::insecure_structural_only()),
         config,
     );
 
@@ -286,7 +286,7 @@ async fn boundary_aligned_short_range_is_rejected_not_finalized() {
         transport.clone(),
         Arc::new(MockProviderLocator::fixed(vec![mock_provider(1, &cid)])),
         Arc::new(InMemoryStateStore::new()),
-        Arc::new(MerkleVerifier::new()),
+        Arc::new(MerkleVerifier::insecure_structural_only()),
         config,
     );
     let sink = Arc::new(InMemorySink::new());
@@ -321,7 +321,7 @@ async fn short_aligned_range_recovers_from_a_second_honest_source() {
         transport.clone(),
         Arc::new(MockProviderLocator::fixed(providers)),
         Arc::new(InMemoryStateStore::new()),
-        Arc::new(MerkleVerifier::new()),
+        Arc::new(MerkleVerifier::insecure_structural_only()),
         test_config(20),
     );
     let sink = Arc::new(InMemorySink::new());
@@ -348,7 +348,7 @@ async fn commitment_rejects_peer_reporting_a_wrong_root() {
         transport.clone(),
         Arc::new(MockProviderLocator::fixed(vec![mock_provider(1, &cid)])),
         Arc::new(InMemoryStateStore::new()),
-        Arc::new(MerkleVerifier::new()),
+        Arc::new(MerkleVerifier::insecure_structural_only()),
         test_config(10),
     );
     let sink = Arc::new(InMemorySink::new());
@@ -376,7 +376,7 @@ async fn wrong_root_peer_ignored_honest_peer_completes() {
         transport.clone(),
         Arc::new(MockProviderLocator::fixed(providers)),
         Arc::new(InMemoryStateStore::new()),
-        Arc::new(MerkleVerifier::new()),
+        Arc::new(MerkleVerifier::insecure_structural_only()),
         test_config(10),
     );
     let sink = Arc::new(InMemorySink::new());
@@ -397,7 +397,7 @@ async fn pause_then_resume_fetches_only_missing_ranges() {
         transport.clone(),
         Arc::new(MockProviderLocator::fixed(vec![mock_provider(1, &cid)])),
         Arc::new(InMemoryStateStore::new()),
-        Arc::new(MerkleVerifier::new()),
+        Arc::new(MerkleVerifier::insecure_structural_only()),
         test_config(10),
     );
 
@@ -456,7 +456,7 @@ async fn interrupted_download_resumes_from_persisted_state() {
         transport_a.clone(),
         Arc::new(MockProviderLocator::fixed(vec![mock_provider(1, &cid)])),
         state.clone(),
-        Arc::new(MerkleVerifier::new()),
+        Arc::new(MerkleVerifier::insecure_structural_only()),
         test_config(10),
     );
     let sink_a: Arc<dyn Sink> = Arc::new(FileSink::new(&final_path));
@@ -484,7 +484,7 @@ async fn interrupted_download_resumes_from_persisted_state() {
         transport_b.clone(),
         Arc::new(MockProviderLocator::fixed(vec![mock_provider(1, &cid)])),
         state.clone(),
-        Arc::new(MerkleVerifier::new()),
+        Arc::new(MerkleVerifier::insecure_structural_only()),
         test_config(10),
     );
     let sink_b: Arc<dyn Sink> = Arc::new(FileSink::new(&final_path));
@@ -533,7 +533,7 @@ async fn file_download_finalizes_atomically_and_gc_reaps_abandoned() {
             transport,
             Arc::new(MockProviderLocator::fixed(vec![mock_provider(1, &cid)])),
             Arc::new(InMemoryStateStore::new()),
-            Arc::new(MerkleVerifier::new()),
+            Arc::new(MerkleVerifier::insecure_structural_only()),
             test_config(10),
         );
         let final_path = dir.join("done.dig");
@@ -557,7 +557,7 @@ async fn file_download_finalizes_atomically_and_gc_reaps_abandoned() {
             transport,
             Arc::new(MockProviderLocator::fixed(vec![mock_provider(1, &cid)])),
             Arc::new(InMemoryStateStore::new()),
-            Arc::new(MerkleVerifier::new()),
+            Arc::new(MerkleVerifier::insecure_structural_only()),
             test_config(10),
         );
         let final_path = dir.join("paused.dig");
@@ -605,7 +605,7 @@ async fn no_providers_located_is_not_found() {
         transport,
         Arc::new(MockProviderLocator::fixed(vec![])), // nobody holds it
         Arc::new(InMemoryStateStore::new()),
-        Arc::new(MerkleVerifier::new()),
+        Arc::new(MerkleVerifier::insecure_structural_only()),
         test_config(10),
     );
     let sink = Arc::new(InMemorySink::new());
@@ -630,7 +630,7 @@ async fn exhausted_providers_yields_no_providers() {
         transport,
         Arc::new(MockProviderLocator::fixed(vec![mock_provider(1, &cid)])),
         Arc::new(InMemoryStateStore::new()),
-        Arc::new(MerkleVerifier::new()),
+        Arc::new(MerkleVerifier::insecure_structural_only()),
         config,
     );
     let sink = Arc::new(InMemorySink::new());
@@ -650,7 +650,7 @@ async fn bare_store_id_is_not_downloadable() {
         transport,
         Arc::new(MockProviderLocator::fixed(vec![])),
         Arc::new(InMemoryStateStore::new()),
-        Arc::new(MerkleVerifier::new()),
+        Arc::new(MerkleVerifier::insecure_structural_only()),
         test_config(10),
     );
     let sink = Arc::new(InMemorySink::new());

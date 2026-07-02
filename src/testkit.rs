@@ -110,7 +110,7 @@ pub enum Behavior {
     AlwaysFail,
     /// Serves correct-length bytes but reports a DIFFERENT generation `root` in the first-frame
     /// metadata than the content-id's root — a peer trying to shape the commitment to a different
-    /// (attacker-chosen) generation. Must be rejected before the commitment is adopted ([HIGH #179]).
+    /// (attacker-chosen) generation. Must be rejected before the commitment is adopted (HIGH #179).
     WrongRoot,
 }
 
@@ -339,7 +339,7 @@ pub fn mock_peer_hex(n: u8) -> String {
 /// A throwaway content id (resource granularity) for tests. Its generation `root` is `[0xAB; 32]`
 /// (hex `"ab".repeat(32)`) so it MATCHES the root [`MockContent`] reports in each range's first
 /// frame — the orchestrator cross-checks the peer-reported root against the content-id root
-/// ([HIGH #179]), so the two must agree for an honest download to proceed.
+/// (HIGH #179), so the two must agree for an honest download to proceed.
 pub fn mock_content_id() -> ContentId {
     ContentId::resource([1; 32], [0xAB; 32], [3; 32])
 }
