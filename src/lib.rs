@@ -98,8 +98,8 @@ pub use progress::{
 };
 pub use sink::{staging_path_for, FileSink, InMemorySink, Sink, STATE_SUFFIX, TMP_SUFFIX};
 pub use source::{
-    assemble_range_stream, FetchedRange, NatRangeTransport, RangeMeta, RangeTransport,
-    SourceHealth, SourceTracker,
+    assemble_range_stream, drain_trailer_bounded, FetchedRange, NatRangeTransport, RangeMeta,
+    RangeTransport, SourceHealth, SourceTracker,
 };
 pub use verify::{
     MerkleVerifier, ProofVerifier, ResourceCommitment, StructuralOnlyProofVerifier, Verifier,
