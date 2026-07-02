@@ -9,6 +9,7 @@
 //! scheduler stops leaning on it.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -222,9 +223,21 @@ pub async fn drain_trailer_bounded<R: AsyncRead + Unpin>(reader: &mut R, cap: u6
     drained
 }
 
+/// A pooled per-peer mTLS connection, shared behind a mutex so many range fetches to the SAME peer
+/// reuse ONE mTLS session (opening a cheap fresh yamux stream each) instead of re-handshaking per
+/// request.
+type PooledConn = Arc<tokio::sync::Mutex<dig_nat::PeerConnection>>;
+
 /// The real [`RangeTransport`] over dig-nat: connects to a provider with the best NAT-traversal
-/// method (`dig_nat::connect`), reuses the connection via a small pool, and runs `dig.getAvailability`
-/// / `dig.fetchRange` over the mux'd mTLS stream.
+/// method (`dig_nat::connect`), **reuses the connection via a per-peer pool**, and runs
+/// `dig.getAvailability` / `dig.fetchRange` over the mux'd mTLS stream.
+///
+/// A download fans many ranges across a few providers; without pooling every range fetch paid a full
+/// NAT-traversal + mTLS handshake (LOW #179). The pool keeps one [`dig_nat::PeerConnection`] per
+/// `peer_id` and opens a new mux stream per request over the reused mTLS session; a connection that
+/// errors is evicted so the next request re-dials. For `fetch_range` the per-peer lock is held only
+/// while opening the (owned) range stream, then released before the bytes are read, so concurrent
+/// ranges to the same peer still stream in parallel.
 ///
 /// The network dial is the only part not exercised by the in-memory tests (it needs real sockets +
 /// certs); the reassembly + provider→target mapping are pure and unit-tested. dig-node constructs one
@@ -234,6 +247,8 @@ pub struct NatRangeTransport {
     identity: dig_nat::LocalIdentity,
     config: dig_nat::NatConfig,
     network_id: String,
+    /// Per-peer connection pool keyed by provider `peer_id` (the 64-hex string).
+    pool: tokio::sync::Mutex<HashMap<String, PooledConn>>,
 }
 
 impl NatRangeTransport {
@@ -247,6 +262,7 @@ impl NatRangeTransport {
             identity,
             config,
             network_id: network_id.into(),
+            pool: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -289,6 +305,26 @@ impl NatRangeTransport {
             .await
             .map_err(|e| DownloadError::transport(&provider.provider_peer_id, e))
     }
+
+    /// Get the pooled connection for `provider`, dialing (and caching) a fresh one if none is pooled.
+    /// Reuses the existing mTLS session across requests; a broken connection is evicted via
+    /// [`evict`](Self::evict) so the next call re-dials.
+    async fn pooled_conn(&self, provider: &ProviderRecord) -> Result<PooledConn, DownloadError> {
+        let key = provider.provider_peer_id.clone();
+        if let Some(conn) = self.pool.lock().await.get(&key).cloned() {
+            return Ok(conn);
+        }
+        // Dial OUTSIDE the pool lock (a handshake can be slow); race-insert, reusing a connection a
+        // concurrent caller may have inserted first so we never hold two sessions to one peer.
+        let fresh = Arc::new(tokio::sync::Mutex::new(self.connect(provider).await?));
+        let mut pool = self.pool.lock().await;
+        Ok(pool.entry(key).or_insert(fresh).clone())
+    }
+
+    /// Drop `provider`'s pooled connection so the next request re-dials (called after a stream error).
+    async fn evict(&self, provider: &ProviderRecord) {
+        self.pool.lock().await.remove(&provider.provider_peer_id);
+    }
 }
 
 #[async_trait]
@@ -298,10 +334,19 @@ impl RangeTransport for NatRangeTransport {
         provider: &ProviderRecord,
         items: Vec<AvailabilityItem>,
     ) -> Result<AvailabilityResponse, DownloadError> {
-        let mut conn = self.connect(provider).await?;
-        conn.query_availability(items)
-            .await
-            .map_err(|e| DownloadError::transport(&provider.provider_peer_id, e))
+        let conn = self.pooled_conn(provider).await?;
+        let res = {
+            let mut guard = conn.lock().await;
+            guard.query_availability(items).await
+        };
+        match res {
+            Ok(resp) => Ok(resp),
+            Err(e) => {
+                // The pooled session is suspect — drop it so the next request re-dials.
+                self.evict(provider).await;
+                Err(DownloadError::transport(&provider.provider_peer_id, e))
+            }
+        }
     }
 
     async fn fetch_range(
@@ -309,11 +354,20 @@ impl RangeTransport for NatRangeTransport {
         provider: &ProviderRecord,
         req: &RangeRequest,
     ) -> Result<FetchedRange, DownloadError> {
-        let mut conn = self.connect(provider).await?;
-        let mut stream = conn
-            .open_range_stream(req)
-            .await
-            .map_err(|e| DownloadError::transport(&provider.provider_peer_id, e))?;
+        let conn = self.pooled_conn(provider).await?;
+        // Hold the per-peer lock ONLY to open the (owned) range stream over the reused mTLS session;
+        // release it before reading frames so concurrent ranges to the same peer stream in parallel.
+        let stream = {
+            let mut guard = conn.lock().await;
+            guard.open_range_stream(req).await
+        };
+        let mut stream = match stream {
+            Ok(s) => s,
+            Err(e) => {
+                self.evict(provider).await;
+                return Err(DownloadError::transport(&provider.provider_peer_id, e));
+            }
+        };
         let (bytes, meta) = assemble_range_stream(&mut stream, req.length)
             .await
             .map_err(|e| {
