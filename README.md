@@ -16,9 +16,9 @@ retired browser-side `dig-download-utility`.
 3. **Plan** — the resource is partitioned into chunk-aligned byte ranges.
 4. **Fan out** — different ranges are fetched from different holders **concurrently** over dig-nat mux
    streams, N in flight per source, topped up as sources finish.
-5. **Verify** — each range is verified independently as it arrives (chunk-length + alignment + the
-   declared generation `root`); a truncated / mis-sized / wrong-generation range is discarded and its
-   source penalized.
+5. **Verify** — each range is verified independently as it arrives (exact expected length + chunk
+   alignment + the declared generation `root`); a truncated, mis-sized, boundary-aligned-short, or
+   wrong-generation range is discarded and its source penalized.
 6. **Retry / rebalance** — a failed, dropped, or unverifiable range is re-queued to another holder
    (bounded backoff); when a still-needed range runs out of live holders, `find_providers` re-runs.
 7. **Reassemble** — verified ranges are written to the sink by offset; once whole, the reassembled
