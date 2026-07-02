@@ -194,6 +194,34 @@ pub async fn assemble_range_stream<R: AsyncRead + Unpin>(
     Ok((buf, meta))
 }
 
+/// The maximum number of trailer bytes drained from a range stream after the complete/last frame,
+/// before the mux stream is closed. A well-behaved peer sends nothing (or a tiny framing tail) after
+/// the last frame, so this bound is generous; it exists solely to close off a malicious peer that
+/// holds the stream open and streams arbitrary filler (see [`drain_trailer_bounded`]).
+const MAX_TRAILER_DRAIN: u64 = 64 * 1024;
+
+/// Drain and DISCARD up to `cap` trailer bytes from `reader` (the leftover after a range's last
+/// frame), so the mux stream closes cleanly WITHOUT buffering an unbounded trailer into memory.
+///
+/// A previous implementation did `stream.read_to_end(&mut Vec::new())`, which has no length bound: a
+/// peer that serves a valid complete range then keeps the stream open and streams filler forces the
+/// client to buffer all of it until OOM (MEDIUM #179). This reads into a small fixed scratch buffer
+/// and stops once `cap` bytes have been seen (or at EOF / error), never growing an unbounded `Vec`.
+/// Returns the number of trailer bytes drained (capped at `cap`).
+pub async fn drain_trailer_bounded<R: AsyncRead + Unpin>(reader: &mut R, cap: u64) -> u64 {
+    let mut scratch = [0u8; 4096];
+    let mut drained: u64 = 0;
+    while drained < cap {
+        let want = ((cap - drained) as usize).min(scratch.len());
+        match reader.read(&mut scratch[..want]).await {
+            Ok(0) => break, // EOF — stream ended cleanly
+            Ok(n) => drained += n as u64,
+            Err(_) => break, // treat a read error as end-of-drain (stream will be dropped)
+        }
+    }
+    drained
+}
+
 /// The real [`RangeTransport`] over dig-nat: connects to a provider with the best NAT-traversal
 /// method (`dig_nat::connect`), reuses the connection via a small pool, and runs `dig.getAvailability`
 /// / `dig.fetchRange` over the mux'd mTLS stream.
@@ -292,9 +320,10 @@ impl RangeTransport for NatRangeTransport {
                 // Re-stamp the (empty) provider on the reassembly error with the real provider id.
                 DownloadError::transport(&provider.provider_peer_id, e)
             })?;
-        // Drain any trailer so the mux stream closes cleanly.
-        let mut sink = Vec::new();
-        let _ = stream.read_to_end(&mut sink).await;
+        // Drain any trailer so the mux stream closes cleanly — BOUNDED, so a peer that keeps the
+        // stream open and streams filler after the last frame cannot exhaust our memory (MEDIUM
+        // #179). Never read_to_end into an unbounded Vec.
+        let _ = drain_trailer_bounded(&mut stream, MAX_TRAILER_DRAIN).await;
         Ok(FetchedRange {
             request_offset: req.offset,
             bytes,
@@ -401,6 +430,28 @@ mod tests {
         let mut cur = std::io::Cursor::new(f.encode());
         let err = assemble_range_stream(&mut cur, 5).await;
         assert!(matches!(err, Err(DownloadError::Transport { .. })));
+    }
+
+    #[tokio::test]
+    async fn drain_trailer_is_bounded_by_cap() {
+        // A "peer" that streams far more trailer than the cap: the drain must stop at the cap, never
+        // buffering the whole thing (MEDIUM #179 — no unbounded read_to_end).
+        let flood = vec![0u8; 1_000_000];
+        let mut cur = std::io::Cursor::new(flood);
+        let drained = drain_trailer_bounded(&mut cur, 64 * 1024).await;
+        assert_eq!(drained, 64 * 1024, "drain must stop exactly at the cap");
+        // The cursor still has bytes left (we did NOT read to end).
+        assert!((cur.position() as usize) < 1_000_000);
+    }
+
+    #[tokio::test]
+    async fn drain_trailer_stops_at_eof_below_cap() {
+        // A well-behaved peer with a small (or empty) trailer: drain returns the actual count and
+        // stops at EOF without waiting for the cap.
+        let mut cur = std::io::Cursor::new(vec![0u8; 100]);
+        assert_eq!(drain_trailer_bounded(&mut cur, 64 * 1024).await, 100);
+        let mut empty = std::io::Cursor::new(Vec::<u8>::new());
+        assert_eq!(drain_trailer_bounded(&mut empty, 64 * 1024).await, 0);
     }
 
     #[tokio::test]
