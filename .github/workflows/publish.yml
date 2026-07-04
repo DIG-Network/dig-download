@@ -12,10 +12,8 @@ name: Publish to crates.io
 # published, or the publish step (correctly) fails on the unresolved git dependencies (`cargo publish`
 # rejects a git dependency). The orchestrator sequences the release tags.
 
+# crates.io publish is MANUAL (workflow_dispatch) pending the crates.io-publishing decision (#230).
 on:
-  push:
-    tags:
-      - 'v*'
   workflow_dispatch:
     inputs:
       version:
