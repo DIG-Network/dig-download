@@ -33,14 +33,19 @@ jobs:
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
 
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
       - name: Check formatting
         run: cargo fmt --all --check
 
       - name: Check clippy
         run: cargo clippy --all-targets -- -D warnings
 
+      # nextest retries a failing test up to 2x and reports failed-then-passed as flaky (surfaced in
+      # the run summary) rather than hiding it (flaky-test management #489).
       - name: Run tests
-        run: cargo test --all
+        run: cargo nextest run --all --retries 2
 
       - name: Build (release)
         run: cargo build --release
@@ -67,14 +72,20 @@ jobs:
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
 
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
       # Unit + integration (scenario) coverage, CI-gated at >=80% lines (ecosystem standard #157). The
       # whole orchestrator — range planning + scheduler, per-range + whole-resource verify, source
       # health/backoff, provider relocate, pause/resume + resume-state, and the .download.tmp staging +
       # GC — is exercised over the in-memory harness (mock DHT providers + mock range sources + in-memory
-      # sink + temp-dir file sinks, NO real network). No file is excluded from the gate.
+      # sink + temp-dir file sinks, NO real network). No file is excluded from the gate. Runs via
+      # nextest (--retries 2) so a flaky test is retried + reported rather than silently failing CI
+      # (flaky-test management #489).
       - name: Run tests with coverage (gate >=80% lines)
         run: >-
-          cargo llvm-cov --all
+          cargo llvm-cov nextest --all
+          --retries 2
           --fail-under-lines 80
           --lcov --output-path lcov.info
 

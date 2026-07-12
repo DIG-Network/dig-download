@@ -410,7 +410,10 @@ mod tests {
         );
         let p = provider(1, "203.0.113.7", 9444);
         let target = t.provider_to_target(&p).unwrap();
-        assert_eq!(target.direct_addr.unwrap().to_string(), "203.0.113.7:9444");
+        assert_eq!(
+            target.direct_addr().unwrap().to_string(),
+            "203.0.113.7:9444"
+        );
         assert_eq!(target.network_id, "DIG_MAINNET");
     }
 
@@ -428,7 +431,7 @@ mod tests {
             u64::MAX,
         );
         let target = t.provider_to_target(&p).unwrap();
-        assert!(target.direct_addr.is_none());
+        assert!(target.direct_addr().is_none());
     }
 
     #[tokio::test]
@@ -563,7 +566,7 @@ mod tests {
         // helpers only read peer_id/target fields — so construct via the public struct fields.
         dig_nat::LocalIdentity {
             cert_der: vec![],
-            key_der: vec![],
+            key_der: vec![].into(),
             peer_id: PeerId::from_bytes([9; 32]),
         }
     }
