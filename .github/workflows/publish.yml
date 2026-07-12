@@ -1,9 +1,11 @@
 name: Publish to crates.io
 
-# Tag-driven release: pushing a version tag `vX.Y.Z` runs the gates, publishes to crates.io, and
-# cuts a GitHub Release. A normal push to `main` runs the gates only (see ci.yml) — it does NOT
-# publish. Mirrors the sibling DIG crates (dig-dht / dig-nat / dig-constants) so the same org secrets
-# apply.
+# Tag-driven release: pushing a version tag `vX.Y.Z` builds, packages, publishes to crates.io, and
+# cuts a GitHub Release. It does NOT re-run the fmt/clippy/test/coverage gates — those already ran
+# (and must be green) on the PR that produced the merged tree being tagged (see ci.yml); re-running
+# the full suite at deploy time is redundant and only adds a flake-exposure surface (#489, #488). A
+# normal push to `main` runs the gates only (ci.yml) — it does NOT publish. Mirrors the sibling DIG
+# crates (dig-dht / dig-nat / dig-constants) so the same org secrets apply.
 #
 # RELEASE ORDERING (ecosystem rule: release-first for shared contracts): the published build depends
 # on the crates.io `dig-dht` and `dig-nat` (which in turn depend on the crates.io `dig-constants`).
@@ -30,43 +32,9 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  gate:
-    name: Gate (fmt / clippy / test / coverage >=80%)
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: stable
-          components: rustfmt, clippy, llvm-tools-preview
-
-      - name: Cache dependencies
-        uses: Swatinem/rust-cache@v2
-
-      - name: Check formatting
-        run: cargo fmt --all --check
-
-      - name: Check clippy
-        run: cargo clippy --all-targets -- -D warnings
-
-      - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@cargo-llvm-cov
-
-      - name: Run tests with coverage (gate >=80% lines)
-        run: >-
-          cargo llvm-cov --all
-          --fail-under-lines 80
-
-      - name: Check documentation
-        run: cargo doc --no-deps
-
   publish:
     name: Publish to crates.io
     runs-on: ubuntu-latest
-    needs: gate
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
