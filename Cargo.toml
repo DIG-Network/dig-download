@@ -20,7 +20,7 @@
 # by dig-node (see the implementers' note in the crate docs).
 [package]
 name = "dig-download"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 rust-version = "1.75.0"
 license = "Apache-2.0 OR MIT"
@@ -42,12 +42,12 @@ dig-dht = { version = "0.1", git = "https://github.com/DIG-Network/dig-dht" }
 # `dig.fetchRange` over dig-nat mux streams, plus the wire shapes (`RangeRequest`, `RangeFrame`,
 # `AvailabilityItem`/`Answer`/`Response`) and `PeerId`/`PeerTarget`/`connect`.
 #
-# Sourcing (IMPORTANT — single dig-nat instance): the BARE git form (same URL + default branch as
-# dig-dht's own `dig-nat` dependency) so cargo UNIFIES both to ONE `dig-nat` crate instance. dig-dht
-# re-exports `dig_nat::PeerId`, and dig-download uses that SAME type across the locator + transport;
-# a divergent git spec (pinned rev / different branch) would fork dig-nat into two incompatible
-# instances and the types would stop lining up. `version = "0.1"` is what `cargo publish` records.
-dig-nat = { version = "0.1", git = "https://github.com/DIG-Network/dig-nat" }
+# Sourcing (IMPORTANT — single dig-nat instance): the plain crates.io release "0.2" (resolves
+# dig-nat 0.2.1), matching dig-dht's own `dig-nat` dependency so cargo UNIFIES both to ONE `dig-nat`
+# crate instance. dig-dht re-exports `dig_nat::PeerId`, and dig-download uses that SAME type across
+# the locator + transport; because dig-dht (>= its crates.io-dig-nat release) and dig-download both
+# resolve dig-nat from crates.io, the types line up. NC-7: prefer the crates.io release over bare-git.
+dig-nat = "0.2"
 
 # Async runtime for the orchestrator task + the concurrent range fan-out + backoff timers.
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync", "io-util"] }
