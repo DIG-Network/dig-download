@@ -34,9 +34,10 @@ categories = ["network-programming"]
 # LOCATE — "which peers hold this content?" dig-download derives a `ContentId` (store / root /
 # capsule / resource) and asks dig-dht `find_providers` for the holders' `ProviderRecord`s.
 #
-# Sourcing: dig-dht is not yet on crates.io, so we resolve from the DIG-Network git repo for both the
-# standalone CI checkout and the superproject build. `version = "0.1"` is what `cargo publish` records.
-dig-dht = { version = "0.1", git = "https://github.com/DIG-Network/dig-dht" }
+# Sourcing: dig-dht resolves from crates.io (>= 0.1.2, which itself deps dig-nat "^0.2"), so cargo
+# unifies dig-dht's dig-nat with dig-download's to a SINGLE dig-nat 0.2.1 instance. NC-7: prefer the
+# crates.io release over bare-git.
+dig-dht = "0.1"
 
 # REACH + FETCH — the mTLS peer transport the range fetch rides: `dig.getAvailability` +
 # `dig.fetchRange` over dig-nat mux streams, plus the wire shapes (`RangeRequest`, `RangeFrame`,
