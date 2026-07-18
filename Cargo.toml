@@ -20,7 +20,7 @@
 # by dig-node (see the implementers' note in the crate docs).
 [package]
 name = "dig-download"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 rust-version = "1.75.0"
 license = "Apache-2.0 OR MIT"
@@ -37,7 +37,7 @@ categories = ["network-programming"]
 # Sourcing: dig-dht resolves from crates.io (>= 0.1.2, which itself deps dig-nat "^0.2"), so cargo
 # unifies dig-dht's dig-nat with dig-download's to a SINGLE dig-nat 0.2.1 instance. NC-7: prefer the
 # crates.io release over bare-git.
-dig-dht = "0.1"
+dig-dht = "0.1.3"
 
 # REACH + FETCH — the mTLS peer transport the range fetch rides: `dig.getAvailability` +
 # `dig.fetchRange` over dig-nat mux streams, plus the wire shapes (`RangeRequest`, `RangeFrame`,
@@ -48,7 +48,7 @@ dig-dht = "0.1"
 # crate instance. dig-dht re-exports `dig_nat::PeerId`, and dig-download uses that SAME type across
 # the locator + transport; because dig-dht (>= its crates.io-dig-nat release) and dig-download both
 # resolve dig-nat from crates.io, the types line up. NC-7: prefer the crates.io release over bare-git.
-dig-nat = "0.2"
+dig-nat = "0.3"
 
 # Async runtime for the orchestrator task + the concurrent range fan-out + backoff timers.
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync", "io-util"] }
