@@ -48,8 +48,9 @@
 //! 1. **Locator** — build a [`dig_dht::DhtService`] (its dig-nat transport + bootstrap peers from the
 //!    relay introducer / gossip pool), wrap it in [`DhtProviderLocator::new`], `Arc` it.
 //! 2. **Transport** — build a [`NatRangeTransport::new`] from the node's
-//!    [`dig_nat::LocalIdentity`] + [`dig_nat::NatConfig`] + `network_id`; it dials providers over the
-//!    NAT-traversal ladder and runs `dig.getAvailability` / `dig.fetchRange`.
+//!    [`dig_nat::NodeCert`] (its CA-signed mTLS identity, minted by dig-tls's
+//!    `NodeCert::load_or_generate`) + [`dig_nat::NatConfig`] + `network_id`; it dials providers over
+//!    the NAT-traversal ladder and runs `dig.getAvailability` / `dig.fetchRange`.
 //! 3. **Verifier** — [`MerkleVerifier::with_proof_verifier`] with the **digstore merkle-proof
 //!    verifier** (the store crate owns the proof byte format) so the whole-resource check binds to the
 //!    chain-anchored root. This is the ONLY production constructor: there is no fail-open default, so a

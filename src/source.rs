@@ -241,10 +241,11 @@ type PooledConn = Arc<tokio::sync::Mutex<dig_nat::PeerConnection>>;
 ///
 /// The network dial is the only part not exercised by the in-memory tests (it needs real sockets +
 /// certs); the reassembly + provider→target mapping are pure and unit-tested. dig-node constructs one
-/// of these with its [`LocalIdentity`](dig_nat::LocalIdentity) + [`NatConfig`](dig_nat::NatConfig) and
-/// hands it to the [`Downloader`](crate::Downloader) — see the implementers' note in the crate docs.
+/// of these with its [`NodeCert`](dig_nat::NodeCert) (its CA-signed mTLS identity, minted by dig-tls's
+/// `NodeCert::load_or_generate`) + [`NatConfig`](dig_nat::NatConfig) and hands it to the
+/// [`Downloader`](crate::Downloader) — see the implementers' note in the crate docs.
 pub struct NatRangeTransport {
-    identity: dig_nat::LocalIdentity,
+    node: std::sync::Arc<dig_nat::NodeCert>,
     config: dig_nat::NatConfig,
     network_id: String,
     /// Per-peer connection pool keyed by provider `peer_id` (the 64-hex string).
@@ -252,14 +253,15 @@ pub struct NatRangeTransport {
 }
 
 impl NatRangeTransport {
-    /// Build a transport that dials providers on `network_id` using `identity` + `config`.
+    /// Build a transport that dials providers on `network_id`, presenting `node` (this peer's
+    /// CA-signed mTLS identity) and using `config` to select the traversal methods + timeouts.
     pub fn new(
-        identity: dig_nat::LocalIdentity,
+        node: std::sync::Arc<dig_nat::NodeCert>,
         config: dig_nat::NatConfig,
         network_id: impl Into<String>,
     ) -> Self {
         NatRangeTransport {
-            identity,
+            node,
             config,
             network_id: network_id.into(),
             pool: tokio::sync::Mutex::new(HashMap::new()),
@@ -301,7 +303,7 @@ impl NatRangeTransport {
         provider: &ProviderRecord,
     ) -> Result<dig_nat::PeerConnection, DownloadError> {
         let target = self.provider_to_target(provider)?;
-        dig_nat::connect(&target, &self.identity, &self.config)
+        dig_nat::connect(&target, &self.node, &self.config)
             .await
             .map_err(|e| DownloadError::transport(&provider.provider_peer_id, e))
     }
@@ -404,7 +406,7 @@ mod tests {
     #[test]
     fn provider_to_target_uses_direct_address() {
         let t = NatRangeTransport::new(
-            fake_identity(),
+            fake_node_cert(),
             dig_nat::NatConfig::default(),
             "DIG_MAINNET",
         );
@@ -420,7 +422,7 @@ mod tests {
     #[test]
     fn provider_to_target_relay_only_without_address() {
         let t = NatRangeTransport::new(
-            fake_identity(),
+            fake_node_cert(),
             dig_nat::NatConfig::default(),
             "DIG_MAINNET",
         );
@@ -560,14 +562,15 @@ mod tests {
         assert!(t.is_available("p", now + Duration::from_millis(260)));
     }
 
-    fn fake_identity() -> dig_nat::LocalIdentity {
-        // A syntactically-valid but non-functional identity is fine for the pure helpers under test
-        // (they never dial). We build it from a minimal self-signed-shaped DER is unnecessary — the
-        // helpers only read peer_id/target fields — so construct via the public struct fields.
-        dig_nat::LocalIdentity {
-            cert_der: vec![],
-            key_der: vec![].into(),
-            peer_id: PeerId::from_bytes([9; 32]),
-        }
+    /// A real (but disposable) CA-signed [`dig_nat::NodeCert`] for the pure helpers under test — they
+    /// never dial, so any validly-minted cert works. `NodeCert` has no public fields (only
+    /// `generate_signed`/`load_or_generate`/`from_pem`), so it is minted from a BLS secret key
+    /// deterministically derived from a fixed label (never a literal keypair — keeps CodeQL's
+    /// hard-coded-crypto-value scan happy, matches dig-tls's own test convention).
+    fn fake_node_cert() -> std::sync::Arc<dig_nat::NodeCert> {
+        use sha2::{Digest, Sha256};
+        let seed: [u8; 32] = Sha256::digest(b"dig-download/tests/fake-node-cert").into();
+        let bls_sk = dig_tls::bls::SecretKey::from_seed(&seed);
+        std::sync::Arc::new(dig_nat::NodeCert::generate_signed(&bls_sk).unwrap())
     }
 }
