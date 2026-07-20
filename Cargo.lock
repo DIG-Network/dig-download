@@ -541,7 +541,7 @@ checksum = "e16d3bf1b902f22c9a3bbece53641194a6f9b96f1397a504976f459f97a76566"
 dependencies = [
  "async-trait",
  "dig-ip",
- "dig-nat",
+ "dig-nat 0.6.0",
  "rand 0.8.7",
  "serde",
  "serde_json",
@@ -553,11 +553,11 @@ dependencies = [
 
 [[package]]
 name = "dig-download"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "dig-dht",
- "dig-nat",
+ "dig-nat 0.7.0",
  "dig-tls",
  "futures",
  "serde",
@@ -599,6 +599,35 @@ name = "dig-nat"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b9ab5e37d699c9ac1ec9413ea7505587bff6ec4e0e8d9d966af8f0e28db46445"
+dependencies = [
+ "async-trait",
+ "dig-constants",
+ "dig-identity",
+ "dig-ip",
+ "dig-tls",
+ "futures",
+ "futures-util",
+ "igd-next",
+ "ring",
+ "rustls-pki-types",
+ "serde",
+ "serde_bytes",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.19",
+ "tokio",
+ "tokio-rustls",
+ "tokio-tungstenite",
+ "tokio-util",
+ "tracing",
+ "yamux",
+]
+
+[[package]]
+name = "dig-nat"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a3ffda0e69477f375229044c3d391fb8132ba0dfabbb59bba1914fcf0cdbb68"
 dependencies = [
  "async-trait",
  "dig-constants",
