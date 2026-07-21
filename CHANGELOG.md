@@ -4,6 +4,14 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.4.0] - 2026-07-21
+
+### Features
+- **source:** Full NAT-traversal dial ladder on the content-fetch leg via `NatRangeTransport::new_with_runtime` (direct → hole-punch → relay), mirroring the DHT-side `connect_with_runtime` path so a NAT'd peer can FETCH from non-Direct-reachable holders it discovers, not just direct ones (#1305). `new` stays Direct-only (empty runtime) — additive/compatible.
+
+### Chores
+- **deps:** Bump dig-dht 0.3 → 0.4 (currency; `find_providers` API unchanged, stays on dig-nat ^0.8 so the tree keeps one dig-nat instance) (#1426)
+
 ## [0.3.0] - 2026-07-21
 
 ### Chores

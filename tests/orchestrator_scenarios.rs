@@ -596,6 +596,10 @@ async fn file_download_finalizes_atomically_and_gc_reaps_abandoned() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Fork-C acceptance (#1426): an UNKNOWN capsule whose `find_providers` returns an EMPTY holder set
+/// MUST surface as [`DownloadError::NotFound`] (not a hang, not a fail-open success). This is what lets
+/// the §5.3 client read ladder fall THROUGH the local node to `rpc.dig.net` when no peer holds the
+/// content — a NotFound is a clean, immediate "not here", never an indefinite stall.
 #[tokio::test]
 async fn no_providers_located_is_not_found() {
     let content = MockContent::even(20, 2);
