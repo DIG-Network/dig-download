@@ -198,6 +198,11 @@ The real `RangeTransport` over dig-nat MUST NOT let a peer exhaust client memory
   mux stream per request rather than re-handshaking per range/availability call; a connection that
   errors is evicted so the next request re-dials. Per §5.3 of the ecosystem contract, a node-class
   client connects over mTLS.
+- **Full NAT-traversal dial (MUST)** — the fetch transport MUST dial each holder over the FULL
+  NAT-traversal ladder (direct → port-mapping → hole-punch → relay), composing exactly the tiers whose
+  live handles the node supplied. A fully-NAT'd peer that DISCOVERS a non-Direct-reachable holder MUST
+  still be able to FETCH from it (over hole-punch/relay), not just from directly-reachable holders. The
+  same ladder that carries DHT discovery carries the byte download.
 
 ---
 

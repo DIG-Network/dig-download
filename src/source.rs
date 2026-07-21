@@ -228,9 +228,20 @@ pub async fn drain_trailer_bounded<R: AsyncRead + Unpin>(reader: &mut R, cap: u6
 /// request.
 type PooledConn = Arc<tokio::sync::Mutex<dig_nat::PeerConnection>>;
 
-/// The real [`RangeTransport`] over dig-nat: connects to a provider with the best NAT-traversal
-/// method (`dig_nat::connect`), **reuses the connection via a per-peer pool**, and runs
-/// `dig.getAvailability` / `dig.fetchRange` over the mux'd mTLS stream.
+/// The real [`RangeTransport`] over dig-nat: connects to a provider over the FULL NAT-traversal ladder
+/// (`dig_nat::connect_with_runtime` — direct → UPnP/NAT-PMP/PCP → hole-punch → relay), **reuses the
+/// connection via a per-peer pool**, and runs `dig.getAvailability` / `dig.fetchRange` over the mux'd
+/// mTLS stream.
+///
+/// # The NAT ladder on the fetch leg (#1305)
+///
+/// Discovery (dig-dht lookups) already rides the full ladder via a live [`dig_nat::NatRuntime`]; the
+/// content byte-download must too, or a fully-NAT'd peer would DISCOVER a provider it can never FETCH
+/// from (a non-Direct-reachable holder reachable only via hole-punch/relay). This transport dials with
+/// [`dig_nat::connect_with_runtime`], composing exactly the tiers whose live handles the injected
+/// [`NatRuntime`] carries: an empty runtime ([`new`](Self::new)) is Direct-only; a node's real runtime
+/// ([`new_with_runtime`](Self::new_with_runtime)) unlocks hole-punch + relay. dig-node builds the SAME
+/// shared `NatRuntime` it uses for the DHT-side dial and hands it here (see its `dig_peer` seam).
 ///
 /// A download fans many ranges across a few providers; without pooling every range fetch paid a full
 /// NAT-traversal + mTLS handshake (LOW #179). The pool keeps one [`dig_nat::PeerConnection`] per
@@ -242,12 +253,17 @@ type PooledConn = Arc<tokio::sync::Mutex<dig_nat::PeerConnection>>;
 /// The network dial is the only part not exercised by the in-memory tests (it needs real sockets +
 /// certs); the reassembly + provider→target mapping are pure and unit-tested. dig-node constructs one
 /// of these with its [`NodeCert`](dig_nat::NodeCert) (its CA-signed mTLS identity, minted by dig-tls's
-/// `NodeCert::load_or_generate`) + [`NatConfig`](dig_nat::NatConfig) and hands it to the
-/// [`Downloader`](crate::Downloader) — see the implementers' note in the crate docs.
+/// `NodeCert::load_or_generate`) + [`NatConfig`](dig_nat::NatConfig) + its live [`NatRuntime`] and
+/// hands it to the [`Downloader`](crate::Downloader) — see the implementers' note in the crate docs.
 pub struct NatRangeTransport {
     node: std::sync::Arc<dig_nat::NodeCert>,
     config: dig_nat::NatConfig,
     network_id: String,
+    /// The live traversal handles (relay reservation / hole-punch coordinator / mapped port) the
+    /// full-ladder dial composes each connect from. An empty runtime yields a Direct-only dial; a
+    /// node's real runtime unlocks the hole-punch + relay tiers (#1305). Shared (`Arc`) so it can be
+    /// the SAME runtime the node's DHT-side dial uses.
+    runtime: Arc<dig_nat::NatRuntime>,
     /// Per-peer connection pool keyed by provider `peer_id` (the 64-hex string).
     pool: tokio::sync::Mutex<HashMap<String, PooledConn>>,
 }
@@ -255,15 +271,38 @@ pub struct NatRangeTransport {
 impl NatRangeTransport {
     /// Build a transport that dials providers on `network_id`, presenting `node` (this peer's
     /// CA-signed mTLS identity) and using `config` to select the traversal methods + timeouts.
+    ///
+    /// This uses an EMPTY [`NatRuntime`], so the dial composes the **Direct** tier only — suitable for
+    /// a fully-reachable node or a test. A NAT'd node that must reach non-Direct providers over
+    /// hole-punch/relay MUST use [`new_with_runtime`](Self::new_with_runtime) with its live runtime.
     pub fn new(
         node: std::sync::Arc<dig_nat::NodeCert>,
         config: dig_nat::NatConfig,
         network_id: impl Into<String>,
     ) -> Self {
+        Self::new_with_runtime(
+            node,
+            config,
+            network_id,
+            Arc::new(dig_nat::NatRuntime::default()),
+        )
+    }
+
+    /// Build a transport that dials over the **FULL** NAT-traversal ladder using the live handles in
+    /// `runtime` (#1305). Mirrors the node's DHT-side [`dig_nat::connect_with_runtime`] path so the
+    /// content-fetch leg reaches providers via hole-punch + relay, not just direct. dig-node passes the
+    /// SAME shared [`NatRuntime`](dig_nat::NatRuntime) it built for its DHT transport.
+    pub fn new_with_runtime(
+        node: std::sync::Arc<dig_nat::NodeCert>,
+        config: dig_nat::NatConfig,
+        network_id: impl Into<String>,
+        runtime: Arc<dig_nat::NatRuntime>,
+    ) -> Self {
         NatRangeTransport {
             node,
             config,
             network_id: network_id.into(),
+            runtime,
             pool: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
@@ -297,13 +336,15 @@ impl NatRangeTransport {
         }
     }
 
-    /// Connect to a provider (fresh mTLS connection via the NAT-traversal ladder).
+    /// Connect to a provider (fresh mTLS connection over the FULL NAT-traversal ladder). Composes
+    /// exactly the tiers whose live handles this transport's [`NatRuntime`](dig_nat::NatRuntime)
+    /// carries — Direct always, plus hole-punch/relay when the node injected them (#1305).
     async fn connect(
         &self,
         provider: &ProviderRecord,
     ) -> Result<dig_nat::PeerConnection, DownloadError> {
         let target = self.provider_to_target(provider)?;
-        dig_nat::connect(&target, &self.node, &self.config)
+        dig_nat::connect_with_runtime(&target, &self.node, &self.config, &self.runtime)
             .await
             .map_err(|e| DownloadError::transport(&provider.provider_peer_id, e))
     }
@@ -409,6 +450,28 @@ mod tests {
             fake_node_cert(),
             dig_nat::NatConfig::default(),
             "DIG_MAINNET",
+        );
+        let p = provider(1, "203.0.113.7", 9444);
+        let target = t.provider_to_target(&p).unwrap();
+        assert_eq!(
+            target.direct_addr().unwrap().to_string(),
+            "203.0.113.7:9444"
+        );
+        assert_eq!(target.network_id, "DIG_MAINNET");
+    }
+
+    #[test]
+    fn new_with_runtime_builds_a_full_ladder_transport() {
+        // #1305: the fetch leg must be constructible with a live NatRuntime (the same handle carrier
+        // the node's DHT dial uses) so hole-punch/relay tiers compose. The dial itself needs real
+        // sockets, so here we assert the runtime-injecting constructor yields a working transport
+        // whose pure provider→target mapping is identical to the Direct-only `new`.
+        let runtime = std::sync::Arc::new(dig_nat::NatRuntime::default());
+        let t = NatRangeTransport::new_with_runtime(
+            fake_node_cert(),
+            dig_nat::NatConfig::default(),
+            "DIG_MAINNET",
+            runtime,
         );
         let p = provider(1, "203.0.113.7", 9444);
         let target = t.provider_to_target(&p).unwrap();
