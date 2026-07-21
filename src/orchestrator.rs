@@ -42,12 +42,30 @@ use crate::gc::ActiveDownloads;
 use crate::locate::ProviderLocator;
 use crate::plan::{plan_ranges, Range, RangeState};
 use crate::progress::{DownloadEvent, DownloadProgress, DownloadState, StateStore};
+use crate::select::{
+    CandidateRef, NullSelector, RangeOutcome, RangeResult, SelectPlan, SelectRequest,
+    SourceSelector,
+};
 use crate::sink::Sink;
 use crate::source::{FetchedRange, RangeTransport, SourceTracker};
 use crate::verify::{ResourceCommitment, ResourceHasher, Verifier};
 
+/// The default per-range fetch timeout: a range that takes longer than this is abandoned and
+/// re-queued to another holder (its source is backed off + reported `TimedOut` to the selector).
+pub const DEFAULT_RANGE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The default interval between background `find_providers` refreshes during a download: new holders
+/// discovered mid-download are merged into the candidate set so the selector can rebalance onto them
+/// (the "live upgrade" of #1435).
+pub const DEFAULT_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
+
 /// Tuning for a download's scheduler + integrity + backoff.
-#[derive(Debug, Clone)]
+///
+/// `Clone` is derived; `Debug` is hand-written to skip the non-`Debug` [`selector`](Self::selector)
+/// trait object. This struct is built via `..Default::default()`, so adding fields is a
+/// non-breaking (minor) change for the only in-tree consumer (dig-node) — an exhaustive struct
+/// literal elsewhere would break, but there is none.
+#[derive(Clone)]
 pub struct DownloadConfig {
     /// Target range size in bytes (a range packs whole chunks up to this; the node fetch window). A
     /// range is always ≥ one whole chunk. Default 3 MiB (the L7 node window).
@@ -69,6 +87,36 @@ pub struct DownloadConfig {
     /// (retains verified bytes in memory to do so). Disable for large streaming downloads whose store
     /// verifies on install; keep on for standalone integrity. Default `true`.
     pub verify_whole_resource: bool,
+    /// The **selection brain**: which candidate peers to fetch from, and in what order. `None` uses a
+    /// fair round-robin [`NullSelector`], keeping dig-download fully usable standalone. dig-node
+    /// injects an adapter over `dig-peer-selector` here so ONE self-tuning brain informs every
+    /// transfer — dig-download itself owns no ranking model (see the [`select`](crate::select) module).
+    pub selector: Option<Arc<dyn SourceSelector>>,
+    /// Per-range fetch timeout: a range fetch exceeding this is abandoned + re-queued elsewhere and
+    /// its source backed off. `None` disables the timeout. Default [`DEFAULT_RANGE_TIMEOUT`] (30s).
+    pub range_timeout: Option<Duration>,
+    /// How often to re-run `find_providers` DURING a download to discover new holders (merged into the
+    /// candidate set for the selector to rebalance onto — the live upgrade). `None` disables periodic
+    /// refresh (the exhaustion-triggered relocate still runs). Default [`DEFAULT_REFRESH_INTERVAL`].
+    pub refresh_interval: Option<Duration>,
+}
+
+impl std::fmt::Debug for DownloadConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DownloadConfig")
+            .field("window", &self.window)
+            .field("max_concurrency", &self.max_concurrency)
+            .field("max_inflight_per_source", &self.max_inflight_per_source)
+            .field("base_backoff", &self.base_backoff)
+            .field("max_backoff", &self.max_backoff)
+            .field("max_relocate_attempts", &self.max_relocate_attempts)
+            .field("max_range_attempts", &self.max_range_attempts)
+            .field("verify_whole_resource", &self.verify_whole_resource)
+            .field("selector", &self.selector.as_ref().map(|_| "<injected>"))
+            .field("range_timeout", &self.range_timeout)
+            .field("refresh_interval", &self.refresh_interval)
+            .finish()
+    }
 }
 
 impl Default for DownloadConfig {
@@ -82,6 +130,9 @@ impl Default for DownloadConfig {
             max_relocate_attempts: 4,
             max_range_attempts: 6,
             verify_whole_resource: true,
+            selector: None,
+            range_timeout: Some(DEFAULT_RANGE_TIMEOUT),
+            refresh_interval: Some(DEFAULT_REFRESH_INTERVAL),
         }
     }
 }
@@ -162,6 +213,13 @@ impl Downloader {
         let (control_tx, control_rx) = mpsc::channel(16);
         let (events_tx, events_rx) = mpsc::channel(256);
 
+        // Resolve the selection brain: the injected one, or the standalone round-robin default.
+        let selector = self
+            .config
+            .selector
+            .clone()
+            .unwrap_or_else(|| Arc::new(NullSelector::new()));
+
         let job = Job {
             content,
             key,
@@ -171,6 +229,7 @@ impl Downloader {
             locator: self.locator.clone(),
             state_store: self.state_store.clone(),
             registry: self.registry.clone(),
+            selector,
             config: self.config.clone(),
             events: events_tx,
             control: control_rx,
@@ -187,6 +246,7 @@ impl Downloader {
             relocate_attempts: 0,
             relocated_since_progress: false,
             total_failures: 0,
+            last_refresh: Instant::now(),
         };
 
         let task = tokio::spawn(job.run());
@@ -257,8 +317,9 @@ impl DownloadHandle {
     }
 }
 
-/// The output of one range fetch: `(range index, provider peer_id, result)`.
-type FetchOutput = (usize, String, Result<FetchedRange, DownloadError>);
+/// The output of one range fetch: `(range index, provider peer_id, elapsed, result)`. `elapsed` is
+/// the measured wall-clock of the attempt, reported to the selector as part of the [`RangeOutcome`].
+type FetchOutput = (usize, String, Duration, Result<FetchedRange, DownloadError>);
 
 /// A single running download's mutable state + the scheduler loop.
 struct Job {
@@ -270,6 +331,9 @@ struct Job {
     locator: Arc<dyn ProviderLocator>,
     state_store: Arc<dyn StateStore>,
     registry: Arc<ActiveDownloads>,
+    /// The injected (or default round-robin) selection brain. dig-download DELEGATES all peer choice
+    /// here and reports every range outcome back — it keeps no ranking model of its own.
+    selector: Arc<dyn SourceSelector>,
     config: DownloadConfig,
     events: mpsc::Sender<DownloadEvent>,
     control: mpsc::Receiver<Control>,
@@ -290,6 +354,8 @@ struct Job {
     relocate_attempts: usize,
     relocated_since_progress: bool,
     total_failures: usize,
+    /// When the last background `find_providers` refresh ran (for the periodic live-upgrade refresh).
+    last_refresh: Instant,
 }
 
 impl Job {
@@ -502,6 +568,18 @@ impl Job {
                 tokio::time::sleep(t.saturating_duration_since(now))
             });
 
+            // Live upgrade: periodically re-run find_providers so a new/faster holder discovered
+            // mid-download joins the candidate set and the selector can rebalance onto it. Disabled
+            // while paused (no scheduling happening) or when unmet ranges remain zero.
+            let refresh_sleep = self
+                .config
+                .refresh_interval
+                .filter(|_| !self.paused)
+                .map(|iv| {
+                    let due = self.last_refresh + iv;
+                    tokio::time::sleep(due.saturating_duration_since(Instant::now()))
+                });
+
             tokio::select! {
                 ctrl = self.control.recv() => {
                     match ctrl {
@@ -525,22 +603,36 @@ impl Job {
                         }
                     }
                 }
-                Some((idx, peer, res)) = inflight.next(), if !inflight.is_empty() => {
-                    self.handle_result(idx, peer, res).await?;
+                Some((idx, peer, elapsed, res)) = inflight.next(), if !inflight.is_empty() => {
+                    self.handle_result(idx, peer, elapsed, res).await?;
                 }
                 _ = async { sleep.unwrap().await }, if wakeup.is_some() => {
                     // Backoff elapsed — loop to re-attempt scheduling.
+                }
+                _ = async { refresh_sleep.unwrap().await }, if refresh_sleep.is_some() => {
+                    // Periodic live-upgrade refresh: merge any newly-discovered holders so the next
+                    // fill's selector.select sees them (no attempt-budget cost — that guards the
+                    // exhaustion path only).
+                    self.last_refresh = Instant::now();
+                    let _ = self.discover_more().await;
                 }
             }
         }
     }
 
-    /// Assign pending ranges to available sources, up to the concurrency + per-source caps.
+    /// Assign pending ranges to sources, up to the concurrency + per-source caps.
+    ///
+    /// Peer CHOICE + ORDER is delegated to the injected [`SourceSelector`]: one `select` per fill pass
+    /// yields the preference order (and any explicit per-range pins) over the currently-live
+    /// candidates, and this loop assigns each pending range to the first ordered peer under its
+    /// in-flight cap. dig-download applies no ranking of its own — it only enforces the mechanical
+    /// concurrency/per-source caps and liveness backoff around the selector's decision.
     fn fill(
         &mut self,
         inflight: &mut FuturesUnordered<Pin<Box<dyn Future<Output = FetchOutput> + Send>>>,
     ) {
         let now = Instant::now();
+        let plan = self.select_plan(now);
         loop {
             if inflight.len() >= self.config.max_concurrency {
                 break;
@@ -548,8 +640,8 @@ impl Job {
             let Some(range_idx) = self.next_pending() else {
                 break;
             };
-            let Some(peer) = self.pick_source(now) else {
-                break; // no schedulable source right now
+            let Some(peer) = self.pick_from_plan(&plan, range_idx) else {
+                break; // the selector offered no schedulable source right now
             };
             self.range_state[range_idx] = RangeState::InFlight(peer.clone());
             *self.inflight_per_source.entry(peer.clone()).or_insert(0) += 1;
@@ -557,7 +649,55 @@ impl Job {
         }
     }
 
-    /// Build the boxed fetch future for `range_idx` from `peer`.
+    /// Ask the selector which live candidates to use for this fill pass, and in what order.
+    ///
+    /// The candidate set is pre-filtered to holders that are schedulable NOW (not inside a
+    /// liveness/backoff window — dig-download's mechanical debounce, NOT a throughput judgement), so
+    /// the selector reasons purely about speed/preference, never about liveness.
+    fn select_plan(&self, now: Instant) -> SelectPlan {
+        let candidates: Vec<CandidateRef> = self
+            .providers
+            .iter()
+            .filter(|p| self.tracker.is_available(&p.provider_peer_id, now))
+            .map(|p| {
+                let addrs = p
+                    .addresses
+                    .iter()
+                    .map(|a| format!("{}:{}", a.host, a.port))
+                    .collect();
+                CandidateRef::new(p.provider_peer_id.clone(), addrs)
+            })
+            .collect();
+        let req = SelectRequest {
+            content_key: &self.key,
+            candidates: &candidates,
+            ranges_needed: self.pending_count(),
+            inflight: self.inflight_per_source.values().sum(),
+        };
+        self.selector.select(&req)
+    }
+
+    /// Resolve `range_idx` to a peer using the selector's [`SelectPlan`]: honor an explicit per-range
+    /// pin if the pinned peer is schedulable, else take the first peer in preference order that is
+    /// under its per-source in-flight cap.
+    fn pick_from_plan(&self, plan: &SelectPlan, range_idx: usize) -> Option<String> {
+        let under_cap = |peer: &str| {
+            self.inflight_per_source.get(peer).copied().unwrap_or(0)
+                < self.config.max_inflight_per_source
+        };
+        // An explicit pin wins when its peer still has capacity.
+        if let Some((_, peer)) = plan.assignments.iter().find(|(r, _)| *r == range_idx) {
+            if under_cap(peer) {
+                return Some(peer.clone());
+            }
+        }
+        plan.ordered.iter().find(|p| under_cap(p)).cloned()
+    }
+
+    /// Build the boxed fetch future for `range_idx` from `peer`, timing the attempt and enforcing the
+    /// per-range timeout. A fetch that exceeds [`DownloadConfig::range_timeout`] resolves to a
+    /// recoverable [`DownloadError::Timeout`] so the range re-queues elsewhere and the slow source is
+    /// backed off + reported `TimedOut` to the selector.
     fn fetch_future(
         &self,
         range_idx: usize,
@@ -571,31 +711,47 @@ impl Job {
             .cloned();
         let transport = self.transport.clone();
         let req = self.range_request(range.offset, range.length);
+        let timeout = self.config.range_timeout;
         Box::pin(async move {
+            let started = Instant::now();
             let provider = match provider {
                 Some(p) => p,
                 None => {
                     return (
                         range_idx,
                         peer.clone(),
+                        started.elapsed(),
                         Err(DownloadError::transport(&peer, "provider vanished")),
                     )
                 }
             };
             let req = match req {
                 Ok(r) => r,
-                Err(e) => return (range_idx, peer, Err(e)),
+                Err(e) => return (range_idx, peer, started.elapsed(), Err(e)),
             };
-            let res = transport.fetch_range(&provider, &req).await;
-            (range_idx, peer, res)
+            let fetch = transport.fetch_range(&provider, &req);
+            let res = match timeout {
+                Some(limit) => match tokio::time::timeout(limit, fetch).await {
+                    Ok(res) => res,
+                    Err(_) => Err(DownloadError::Timeout {
+                        provider: peer.clone(),
+                    }),
+                },
+                None => fetch.await,
+            };
+            (range_idx, peer, started.elapsed(), res)
         })
     }
 
     /// Handle a completed range fetch: verify + write + mark done, or penalize the source + re-queue.
+    /// Every outcome — success, failure, or timeout — is reported to the selector via
+    /// [`SourceSelector::record`] so its learning loop sees the real measured result (`elapsed` is the
+    /// attempt's wall-clock).
     async fn handle_result(
         &mut self,
         idx: usize,
         peer: String,
+        elapsed: Duration,
         res: Result<FetchedRange, DownloadError>,
     ) -> Result<(), DownloadError> {
         if let Some(n) = self.inflight_per_source.get_mut(&peer) {
@@ -612,6 +768,7 @@ impl Job {
 
         match outcome {
             Ok(bytes) => {
+                let served = bytes.len() as u64;
                 self.sink.write_at(range.offset, &bytes).await?;
                 if let Some(hasher) = self.hasher.as_mut() {
                     hasher.feed(range.offset, bytes);
@@ -620,6 +777,7 @@ impl Job {
                 self.resume.mark_done(idx);
                 self.bytes_done = self.bytes_done.saturating_add(range.length);
                 self.tracker.record_success(&peer);
+                self.report_outcome(&peer, served, elapsed, RangeResult::Ok);
                 self.relocated_since_progress = false;
                 self.checkpoint().await?;
                 let progress = self.snapshot();
@@ -631,7 +789,9 @@ impl Job {
                 .await;
             }
             Err(e) => {
-                // Sink/state errors are terminal; transport/verify are recoverable (retry elsewhere).
+                // Sink/state errors are terminal; transport/verify/timeout are recoverable (retry
+                // elsewhere). A timeout is reported distinctly so the selector can down-rank a
+                // too-slow peer differently from a hard failure.
                 if !e.is_recoverable() {
                     self.emit(DownloadEvent::Failed {
                         reason: e.to_string(),
@@ -639,9 +799,15 @@ impl Job {
                     .await;
                     return Err(e);
                 }
+                let result = if matches!(e, DownloadError::Timeout { .. }) {
+                    RangeResult::TimedOut
+                } else {
+                    RangeResult::Failed
+                };
                 self.range_state[idx] = RangeState::Pending;
                 self.tracker.record_failure(&peer, Instant::now());
                 self.total_failures = self.total_failures.saturating_add(1);
+                self.report_outcome(&peer, 0, elapsed, result);
                 self.emit(DownloadEvent::RangeFailed {
                     range: idx,
                     provider: peer,
@@ -651,6 +817,16 @@ impl Job {
             }
         }
         Ok(())
+    }
+
+    /// Report one range fetch's measured outcome to the selector's learning loop.
+    fn report_outcome(&self, peer: &str, bytes: u64, elapsed: Duration, result: RangeResult) {
+        self.selector.record(&RangeOutcome {
+            peer_id: peer.to_string(),
+            bytes,
+            elapsed,
+            result,
+        });
     }
 
     /// Verify a fetched range against the commitment, returning its verified bytes or a
@@ -700,10 +876,18 @@ impl Job {
         Ok(confirmed)
     }
 
-    /// Re-run discovery to find MORE providers when the known set is exhausted; merge the new ones.
-    /// Returns how many new providers were added.
+    /// Re-run discovery to find MORE providers when the known set is exhausted, consuming one relocate
+    /// attempt from the budget. Delegates the merge to [`discover_more`](Self::discover_more).
     async fn relocate(&mut self) -> Result<usize, DownloadError> {
         self.relocate_attempts += 1;
+        self.discover_more().await
+    }
+
+    /// Re-run `find_providers` and merge any NEW holders into the candidate set (deduped by
+    /// `peer_id`), returning how many were added. Used both by the exhaustion-triggered
+    /// [`relocate`](Self::relocate) and by the periodic live-upgrade refresh — the latter does NOT
+    /// consume the relocate budget, so a healthy download keeps discovering faster peers indefinitely.
+    async fn discover_more(&mut self) -> Result<usize, DownloadError> {
         let more = self.locate_and_confirm().await?;
         let known: HashSet<String> = self
             .providers
@@ -788,20 +972,6 @@ impl Job {
         self.range_state
             .iter()
             .position(|s| matches!(s, RangeState::Pending))
-    }
-
-    /// Pick the healthiest schedulable source at `now`: available (not in backoff), under the
-    /// per-source in-flight cap, preferring the least-loaded.
-    fn pick_source(&self, now: Instant) -> Option<String> {
-        self.providers
-            .iter()
-            .map(|p| p.provider_peer_id.clone())
-            .filter(|peer| self.tracker.is_available(peer, now))
-            .filter(|peer| {
-                self.inflight_per_source.get(peer).copied().unwrap_or(0)
-                    < self.config.max_inflight_per_source
-            })
-            .min_by_key(|peer| self.inflight_per_source.get(peer).copied().unwrap_or(0))
     }
 
     /// The earliest backoff-expiry among sources that hold the content but are currently backed off

@@ -23,6 +23,15 @@ pub enum DownloadError {
         reason: String,
     },
 
+    /// A range fetch exceeded the configured per-range timeout (`DownloadConfig::range_timeout`) — a
+    /// too-slow or stalled source. **Recoverable**: the range is re-queued to another holder and the
+    /// slow source is backed off (its `TimedOut` outcome is reported to the selector).
+    #[error("range fetch from provider {provider} timed out")]
+    Timeout {
+        /// The provider `peer_id` (64-hex) whose fetch timed out.
+        provider: String,
+    },
+
     /// A fetched range failed integrity verification. **Recoverable**: the bad range is discarded and
     /// re-fetched from a different provider, and the serving provider is penalized.
     #[error("integrity failure: {0}")]
@@ -94,7 +103,9 @@ impl DownloadError {
     pub fn is_recoverable(&self) -> bool {
         matches!(
             self,
-            DownloadError::Transport { .. } | DownloadError::Verify(_)
+            DownloadError::Transport { .. }
+                | DownloadError::Verify(_)
+                | DownloadError::Timeout { .. }
         )
     }
 }
@@ -156,6 +167,16 @@ mod tests {
         }
         .into();
         assert!(e.is_recoverable());
+    }
+
+    #[test]
+    fn timeout_is_recoverable() {
+        let e = DownloadError::Timeout {
+            provider: "abcd".into(),
+        };
+        assert!(e.is_recoverable());
+        assert!(e.to_string().contains("abcd"));
+        assert!(e.to_string().contains("timed out"));
     }
 
     #[test]

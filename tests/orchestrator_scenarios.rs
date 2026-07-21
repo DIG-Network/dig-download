@@ -17,12 +17,12 @@ use std::time::Duration;
 
 use dig_download::testkit::{
     mock_content_id, mock_peer_hex, mock_provider, Behavior, MockContent, MockProviderLocator,
-    MockRangeTransport,
+    MockRangeTransport, MockSelector,
 };
 use dig_download::{
     DownloadConfig, DownloadError, DownloadEvent, DownloadOptions, Downloader, FileSink,
-    InMemorySink, InMemoryStateStore, MerkleVerifier, ProofVerifier, ProviderLocator,
-    RangeTransport, Sink, StateStore, Verifier,
+    InMemorySink, InMemoryStateStore, MerkleVerifier, ProofVerifier, ProviderLocator, RangeResult,
+    RangeTransport, Sink, SourceSelector, StateStore, Verifier,
 };
 
 /// A fast test config: tiny ranges (one chunk each) + short backoffs so retries + rebalancing run
@@ -37,6 +37,12 @@ fn test_config(window: u64) -> DownloadConfig {
         max_relocate_attempts: 4,
         max_range_attempts: 8,
         verify_whole_resource: true,
+        // Disable the per-range timeout + periodic refresh by default so the existing scenarios stay
+        // deterministic (individual tests below opt into them). Selection uses the default
+        // round-robin unless a test injects a selector.
+        selector: None,
+        range_timeout: None,
+        refresh_interval: None,
     }
 }
 
@@ -660,6 +666,319 @@ async fn bare_store_id_is_not_downloadable() {
     let sink = Arc::new(InMemorySink::new());
     let result = join_ok(dl.download(store_cid, sink, DownloadOptions::default())).await;
     assert!(matches!(result, Err(DownloadError::NotDownloadable)));
+}
+
+// ---- #1440 selector-seam delegation (dig-download owns NO ranking brain) --------------------------
+
+/// A downloader wired with an injected [`SourceSelector`] (else identical to `downloader`).
+fn downloader_with_selector(
+    transport: Arc<MockRangeTransport>,
+    locator: Arc<dyn ProviderLocator>,
+    selector: Arc<dyn SourceSelector>,
+    mut config: DownloadConfig,
+) -> Downloader {
+    config.selector = Some(selector);
+    Downloader::new(
+        locator,
+        transport as Arc<dyn RangeTransport>,
+        Arc::new(MerkleVerifier::insecure_structural_only()),
+        Arc::new(InMemoryStateStore::new()),
+        config,
+    )
+}
+
+#[tokio::test]
+async fn selection_is_delegated_to_the_injected_selector() {
+    // The download must consult the selector for peer choice (never rank internally) and report the
+    // measured outcome of EVERY successful range back to it.
+    let content = MockContent::even(30, 3);
+    let transport = Arc::new(MockRangeTransport::new(content.clone()));
+    let cid = mock_content_id();
+    let providers = vec![
+        mock_provider(1, &cid),
+        mock_provider(2, &cid),
+        mock_provider(3, &cid),
+    ];
+    let selector = MockSelector::new();
+    let dl = downloader_with_selector(
+        transport.clone(),
+        Arc::new(MockProviderLocator::fixed(providers)),
+        selector.clone(),
+        test_config(10),
+    );
+    let sink = Arc::new(InMemorySink::new());
+    join_ok(dl.download(cid, sink.clone(), DownloadOptions::default()))
+        .await
+        .unwrap();
+    assert_eq!(sink.contents().await, content.bytes);
+
+    // dig-download asked the selector to choose peers (proves no internal ranking).
+    assert!(
+        selector.select_call_count() >= 1,
+        "download must delegate peer choice to selector.select"
+    );
+    // It reported one Ok outcome per range (3 ranges), with correct bytes + non-empty peer id.
+    let outcomes = selector.outcomes();
+    let ok: Vec<_> = outcomes
+        .iter()
+        .filter(|o| o.result == RangeResult::Ok)
+        .collect();
+    assert_eq!(ok.len(), 3, "one Ok outcome recorded per range");
+    assert!(ok.iter().all(|o| o.bytes == 10 && !o.peer_id.is_empty()));
+}
+
+#[tokio::test]
+async fn selector_preference_order_is_honored() {
+    // With p1 the ONLY holder the selector prefers (and it's honest + can serve everything under a
+    // generous per-source cap), all ranges should be fetched from p1 even though p2/p3 are available.
+    let content = MockContent::even(30, 3);
+    let transport = Arc::new(MockRangeTransport::new(content.clone()));
+    let cid = mock_content_id();
+    let providers = vec![
+        mock_provider(1, &cid),
+        mock_provider(2, &cid),
+        mock_provider(3, &cid),
+    ];
+    // Prefer p1 first; give a per-source cap high enough that p1 alone can take every range.
+    let selector = MockSelector::with_order(vec![mock_peer_hex(1)]);
+    let mut cfg = test_config(10);
+    cfg.max_inflight_per_source = 8;
+    let dl = downloader_with_selector(
+        transport.clone(),
+        Arc::new(MockProviderLocator::fixed(providers)),
+        selector,
+        cfg,
+    );
+    let sink = Arc::new(InMemorySink::new());
+    join_ok(dl.download(cid, sink.clone(), DownloadOptions::default()))
+        .await
+        .unwrap();
+    assert_eq!(sink.contents().await, content.bytes);
+    // p1 serves the meta-probe + all 3 ranges; the non-preferred peers are never touched.
+    assert!(
+        transport.attempts_for(&mock_peer_hex(1)).await >= 3,
+        "the selector's preferred peer serves the ranges"
+    );
+    assert_eq!(transport.attempts_for(&mock_peer_hex(2)).await, 0);
+    assert_eq!(transport.attempts_for(&mock_peer_hex(3)).await, 0);
+}
+
+#[tokio::test]
+async fn bad_merkle_range_is_reported_failed_and_refetched() {
+    // p2 corrupts (right length, wrong bytes → fails the whole-resource root binding but NOT the
+    // per-range structural check; use a proof verifier that catches it). Simpler: Truncate → per-range
+    // length failure. The selector must see a Failed outcome for p2 and the range must still complete.
+    let content = MockContent::even(30, 3);
+    let transport = Arc::new(MockRangeTransport::new(content.clone()));
+    let cid = mock_content_id();
+    transport
+        .set_behavior(&mock_peer_hex(2), Behavior::Truncate)
+        .await;
+    let providers = vec![mock_provider(1, &cid), mock_provider(2, &cid)];
+    let selector = MockSelector::new();
+    let dl = downloader_with_selector(
+        transport.clone(),
+        Arc::new(MockProviderLocator::fixed(providers)),
+        selector.clone(),
+        test_config(10),
+    );
+    let sink = Arc::new(InMemorySink::new());
+    join_ok(dl.download(cid, sink.clone(), DownloadOptions::default()))
+        .await
+        .unwrap();
+    assert_eq!(sink.contents().await, content.bytes);
+    let outcomes = selector.outcomes();
+    assert!(
+        outcomes
+            .iter()
+            .any(|o| o.result == RangeResult::Failed && o.peer_id == mock_peer_hex(2)),
+        "the truncating peer's range must be reported Failed to the selector"
+    );
+}
+
+#[tokio::test]
+async fn slow_range_times_out_and_is_reported_timedout() {
+    // A single holder that delays every fetch beyond the per-range timeout: the fetch must time out,
+    // be reported TimedOut to the selector, and (with no other holder) the download exhausts.
+    let content = MockContent::even(20, 2);
+    let transport = Arc::new(MockRangeTransport::new(content.clone()));
+    transport.set_delay(Duration::from_millis(200)).await;
+    let cid = mock_content_id();
+    let providers = vec![mock_provider(1, &cid)];
+    let selector = MockSelector::new();
+    let mut cfg = test_config(10);
+    cfg.range_timeout = Some(Duration::from_millis(20)); // shorter than the 200ms serve delay
+    cfg.max_range_attempts = 2; // keep the exhaustion bound small so the test ends quickly
+    let dl = downloader_with_selector(
+        transport.clone(),
+        Arc::new(MockProviderLocator::fixed(providers)),
+        selector.clone(),
+        cfg,
+    );
+    let sink = Arc::new(InMemorySink::new());
+    let result = join_ok(dl.download(cid, sink, DownloadOptions::default())).await;
+    assert!(
+        matches!(result, Err(DownloadError::NoProviders { .. })),
+        "a single too-slow holder eventually exhausts the download"
+    );
+    let outcomes = selector.outcomes();
+    assert!(
+        outcomes.iter().any(|o| o.result == RangeResult::TimedOut),
+        "a timed-out range must be reported TimedOut to the selector"
+    );
+}
+
+#[tokio::test]
+async fn empty_candidate_set_falls_through_to_not_found() {
+    // #1426 fall-through preserved: no providers located → NotFound.
+    let content = MockContent::even(10, 1);
+    let transport = Arc::new(MockRangeTransport::new(content));
+    let cid = mock_content_id();
+    let selector = MockSelector::new();
+    let dl = downloader_with_selector(
+        transport,
+        Arc::new(MockProviderLocator::fixed(vec![])),
+        selector,
+        test_config(10),
+    );
+    let sink = Arc::new(InMemorySink::new());
+    let result = join_ok(dl.download(cid, sink, DownloadOptions::default())).await;
+    assert!(matches!(result, Err(DownloadError::NotFound { .. })));
+}
+
+#[tokio::test]
+async fn periodic_refresh_discovers_new_holders_mid_download() {
+    // Start with a holder that drops after one fetch; a periodic refresh must discover a fresh holder
+    // and complete the download (live upgrade). The scripted locator adds p2 on the 2nd call.
+    let content = MockContent::even(30, 3);
+    let transport = Arc::new(MockRangeTransport::new(content.clone()));
+    let cid = mock_content_id();
+    transport
+        .set_behavior(&mock_peer_hex(1), Behavior::DropAfter(1))
+        .await;
+    let locator = MockProviderLocator::scripted(vec![
+        vec![mock_provider(1, &cid)],
+        vec![mock_provider(1, &cid), mock_provider(2, &cid)],
+    ]);
+    let selector = MockSelector::new();
+    let mut cfg = test_config(10);
+    cfg.refresh_interval = Some(Duration::from_millis(5)); // frequent live-upgrade refresh
+    let dl = downloader_with_selector(transport.clone(), Arc::new(locator), selector, cfg);
+    let sink = Arc::new(InMemorySink::new());
+    join_ok(dl.download(cid, sink.clone(), DownloadOptions::default()))
+        .await
+        .unwrap();
+    assert_eq!(sink.contents().await, content.bytes);
+    assert!(
+        transport.attempts_for(&mock_peer_hex(2)).await > 0,
+        "the refresh-discovered holder p2 must serve at least one range"
+    );
+}
+
+// ---- #1435 req.1 bounded-FCFS download queue --------------------------------------------------------
+
+#[tokio::test]
+async fn queue_completes_all_submitted_downloads() {
+    use dig_download::DownloadQueue;
+    let content = MockContent::even(30, 3);
+    let transport = Arc::new(MockRangeTransport::new(content.clone()));
+    let cid = mock_content_id();
+    let dl = Arc::new(downloader(
+        transport,
+        Arc::new(MockProviderLocator::fixed(vec![mock_provider(1, &cid)])),
+        Arc::new(InMemoryStateStore::new()),
+        Arc::new(MerkleVerifier::insecure_structural_only()),
+        test_config(10),
+    ));
+    let queue = DownloadQueue::new(dl, 2);
+    let mut handles = Vec::new();
+    for _ in 0..5 {
+        let sink = Arc::new(InMemorySink::new());
+        handles.push((
+            queue.submit(cid, sink.clone(), DownloadOptions::default()),
+            sink,
+        ));
+    }
+    for (handle, sink) in handles {
+        let total = tokio::time::timeout(Duration::from_secs(10), handle.join())
+            .await
+            .expect("queued download finished in time")
+            .expect("queued download succeeded");
+        assert_eq!(total, 30);
+        assert_eq!(sink.contents().await, content.bytes);
+    }
+}
+
+#[tokio::test]
+async fn queue_with_defaults_uses_default_active_cap() {
+    use dig_download::{DownloadQueue, DEFAULT_MAX_ACTIVE_DOWNLOADS};
+    let content = MockContent::even(10, 1);
+    let transport = Arc::new(MockRangeTransport::new(content.clone()));
+    let cid = mock_content_id();
+    let dl = Arc::new(downloader(
+        transport,
+        Arc::new(MockProviderLocator::fixed(vec![mock_provider(1, &cid)])),
+        Arc::new(InMemoryStateStore::new()),
+        Arc::new(MerkleVerifier::insecure_structural_only()),
+        test_config(10),
+    ));
+    let queue = DownloadQueue::with_defaults(dl);
+    assert_eq!(queue.max_active(), DEFAULT_MAX_ACTIVE_DOWNLOADS);
+    let sink = Arc::new(InMemorySink::new());
+    let total = tokio::time::timeout(
+        Duration::from_secs(10),
+        queue
+            .submit(cid, sink.clone(), DownloadOptions::default())
+            .join(),
+    )
+    .await
+    .expect("finished")
+    .expect("ok");
+    assert_eq!(total, 10);
+    assert_eq!(sink.contents().await, content.bytes);
+}
+
+#[tokio::test]
+async fn queue_bounds_active_and_serves_fcfs() {
+    use dig_download::DownloadQueue;
+    // max_active = 1 serializes downloads; with a per-fetch delay they run strictly one at a time in
+    // submission order, so their completion order equals their submission order (FCFS, no starvation).
+    let content = MockContent::even(10, 1);
+    let transport = Arc::new(MockRangeTransport::new(content));
+    transport.set_delay(Duration::from_millis(20)).await;
+    let cid = mock_content_id();
+    let dl = Arc::new(downloader(
+        transport,
+        Arc::new(MockProviderLocator::fixed(vec![mock_provider(1, &cid)])),
+        Arc::new(InMemoryStateStore::new()),
+        Arc::new(MerkleVerifier::insecure_structural_only()),
+        test_config(10),
+    ));
+    let queue = DownloadQueue::new(dl, 1);
+    assert_eq!(queue.max_active(), 1);
+
+    let order = Arc::new(tokio::sync::Mutex::new(Vec::<u32>::new()));
+    let mut joins = Vec::new();
+    for i in 0..3u32 {
+        let sink = Arc::new(InMemorySink::new());
+        let handle = queue.submit(cid, sink, DownloadOptions::default());
+        let order = order.clone();
+        joins.push(tokio::spawn(async move {
+            handle.join().await.unwrap();
+            order.lock().await.push(i);
+        }));
+    }
+    for j in joins {
+        tokio::time::timeout(Duration::from_secs(10), j)
+            .await
+            .expect("queued download finished")
+            .unwrap();
+    }
+    assert_eq!(
+        *order.lock().await,
+        vec![0, 1, 2],
+        "downloads complete in submission order under a cap of 1"
+    );
 }
 
 fn temp_dir(tag: &str) -> std::path::PathBuf {

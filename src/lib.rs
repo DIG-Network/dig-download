@@ -80,9 +80,12 @@ pub mod locate;
 pub mod orchestrator;
 pub mod plan;
 pub mod progress;
+pub mod queue;
+pub mod select;
 pub mod sink;
 pub mod source;
 pub mod testkit;
+pub mod throttle;
 pub mod verify;
 
 // Re-export the content id from dig-dht so consumers use ONE `ContentId` type across locate +
@@ -92,16 +95,25 @@ pub use dig_dht::{ContentId, ProviderRecord};
 pub use error::{DownloadError, VerifyError};
 pub use gc::{ActiveDownloads, GcConfig, TmpGc};
 pub use locate::{DhtProviderLocator, ProviderLocator};
-pub use orchestrator::{download_key, DownloadConfig, DownloadHandle, DownloadOptions, Downloader};
+pub use orchestrator::{
+    download_key, DownloadConfig, DownloadHandle, DownloadOptions, Downloader,
+    DEFAULT_RANGE_TIMEOUT, DEFAULT_REFRESH_INTERVAL,
+};
 pub use plan::{plan_ranges, ChunkLayout, Range, RangeState};
 pub use progress::{
     DownloadEvent, DownloadProgress, DownloadState, FileStateStore, InMemoryStateStore, StateStore,
+};
+pub use queue::{DownloadQueue, QueuedHandle, DEFAULT_MAX_ACTIVE_DOWNLOADS};
+pub use select::{
+    CandidateRef, NullSelector, RangeOutcome, RangeResult, SelectPlan, SelectRequest,
+    SourceSelector,
 };
 pub use sink::{staging_path_for, FileSink, InMemorySink, Sink, STATE_SUFFIX, TMP_SUFFIX};
 pub use source::{
     assemble_range_stream, drain_trailer_bounded, FetchedRange, NatRangeTransport, RangeMeta,
     RangeTransport, SourceHealth, SourceTracker,
 };
+pub use throttle::FcfsRateLimiter;
 pub use verify::{
     MerkleVerifier, ProofVerifier, ResourceCommitment, ResourceHasher, StructuralOnlyProofVerifier,
     Verifier,
