@@ -4,6 +4,16 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.5.0] - 2026-07-21
+
+### Features
+- **dig-download:** Active download optimizer + selector-agnostic seam (#1435, #1440). Selection is now
+  DELEGATED to an injected `SourceSelector` (dig-download owns no ranking brain); adds a bounded-FCFS
+  `DownloadQueue`, an FCFS outbound `FcfsRateLimiter` (serve-side throttle), a per-range fetch timeout,
+  and a periodic `find_providers` refresh for live mid-download upgrade. `NullSelector` (round-robin)
+  keeps the crate usable standalone. Additive: `DownloadConfig` gains `selector` / `range_timeout` /
+  `refresh_interval`; new `DownloadError::Timeout`. Per-range merkle-proof binding (#1437) deferred.
+
 ## [0.4.0] - 2026-07-21
 
 ### Features

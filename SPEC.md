@@ -109,20 +109,39 @@ is NEVER re-fetched (the resume invariant).
 
 ## 6. Scheduling, retry, and termination
 
+- **Delegated selection (MUST — no second brain)** — peer CHOICE and ORDER are delegated to an injected
+  `SourceSelector` (§15); dig-download itself MUST NOT keep a throughput model / speed ranking /
+  cross-transfer learning of its own. On each scheduling pass the scheduler calls `select` with the
+  currently-live candidates (already filtered by liveness/backoff — see below) and assigns each pending
+  range to the first peer in the returned preference order that is under its `max_inflight_per_source`
+  cap (an explicit per-range pin in the plan wins when its peer has capacity). With no selector injected
+  a fair round-robin (`NullSelector`) is used, keeping the crate usable standalone.
+- **Outcome reporting (MUST)** — every range fetch's measured outcome MUST be reported to the selector
+  via `record(RangeOutcome { peer_id, bytes, elapsed, result })` where `result ∈ { Ok, Failed,
+  TimedOut }`. This is the selector's only learning signal; dig-download derives no ranking from it.
 - **Concurrency** — up to `max_concurrency` range fetches in flight globally, and at most
-  `max_inflight_per_source` to any one holder. The scheduler prefers the least-loaded available holder.
-- **Source health** — a holder that fails or serves a bad range is penalized with capped-exponential
-  backoff (`base_backoff` doubling per consecutive failure, capped at `max_backoff`); a success clears
-  its failures + backoff. A holder is never permanently banned.
-- **Rebalance** — a failed / dropped / unverifiable range is re-queued (state → `Pending`) and
-  re-fetched from another holder. When a still-needed range has no live holder, `find_providers`
-  re-runs (up to `max_relocate_attempts`) to discover more.
+  `max_inflight_per_source` to any one holder.
+- **Source liveness (backoff debounce, NOT ranking)** — a holder that fails, times out, or serves a bad
+  range is placed in a capped-exponential backoff window (`base_backoff` doubling per consecutive
+  failure, capped at `max_backoff`) during which it is not offered to the selector; a success clears its
+  failures + backoff. This is purely a liveness/availability debounce — it is NOT a throughput judgement
+  (that is the selector's job). A holder is never permanently banned.
+- **Per-range timeout (MUST when configured)** — when `range_timeout` is set, a range fetch exceeding it
+  is abandoned with `Timeout { provider }` (recoverable), re-queued elsewhere, the source backed off,
+  and the outcome reported to the selector as `TimedOut`. Default 30s; `None` disables it.
+- **Rebalance + live upgrade** — a failed / dropped / timed-out / unverifiable range is re-queued (state
+  → `Pending`) and re-fetched from another holder. When a still-needed range has no live holder,
+  `find_providers` re-runs (up to `max_relocate_attempts`) to discover more. Independently, when
+  `refresh_interval` is set (default 15s), `find_providers` re-runs PERIODICALLY during the download and
+  merges any newly-discovered holders into the candidate set (without consuming the relocate budget), so
+  the selector can rebalance onto a faster/fresher holder that appears mid-download — the "live
+  upgrade". No in-flight fetch is preempted; the new candidate is used for subsequent range assignments.
 - **Termination (MUST)** — the download MUST terminate. It ends with `NoProviders { needed }` when the
   provider set is exhausted (no live holder for a still-missing range, or the retry budget
   `ranges.len() × max_range_attempts` is exceeded), and with `Cancelled` on `cancel()`.
-- **Recoverable vs terminal** — `Transport` and `Verify` errors are recoverable per range (retry
-  elsewhere). `Sink`, `State`, `NoProviders`, `NotFound`, `NotDownloadable`, `Cancelled`, `TaskEnded`
-  are terminal for the download.
+- **Recoverable vs terminal** — `Transport`, `Verify`, and `Timeout` errors are recoverable per range
+  (retry elsewhere). `Sink`, `State`, `NoProviders`, `NotFound`, `NotDownloadable`, `Cancelled`,
+  `TaskEnded` are terminal for the download.
 
 ---
 
@@ -233,11 +252,72 @@ checkpointed); `cancel` ends the download with `Cancelled`.
 
 ## 12. Error catalogue (stable)
 
-`DownloadError`: `Transport { provider, reason }`, `Verify(VerifyError)`, `NoProviders { needed }`,
-`NotFound { content }`, `Cancelled`, `State(reason)`, `Sink(reason)`, `NotDownloadable`, `TaskEnded`.
-`Transport` and `Verify` are recoverable per range; the rest are terminal.
+`DownloadError`: `Transport { provider, reason }`, `Timeout { provider }`, `Verify(VerifyError)`,
+`NoProviders { needed }`, `NotFound { content }`, `Cancelled`, `State(reason)`, `Sink(reason)`,
+`NotDownloadable`, `TaskEnded`. `Transport`, `Timeout`, and `Verify` are recoverable per range; the
+rest are terminal.
 
 `VerifyError`: `Length { expected, actual }`, `Metadata(reason)`, `Alignment(reason)`, `Root`,
 `MissingMetadata(reason)`. Every `VerifyError` is recoverable at the range level (the source is
 penalized and the range re-fetched), except when it surfaces from the whole-resource backstop, which is
 terminal for the download.
+
+---
+
+## 13. Download queue (bounded, first-come-first-serve)
+
+Capsule downloads are QUEUED, not all launched at once (a cache-fill flywheel may enqueue many). The
+`DownloadQueue` wraps a `Downloader` and admits at most `max_active` downloads concurrently (default 3);
+the rest wait.
+
+- **Bound (MUST)** — at most `max_active` downloads run concurrently.
+- **FCFS (MUST)** — queued downloads START in submission order; no reordering, no starvation. (A job
+  leaves the queue only when a worker is free, and jobs are drained in submission order.)
+- **Transparent handle** — `submit` returns a `QueuedHandle` exposing the same live `DownloadEvent`
+  stream + terminal result as a direct `Downloader::download`, whether the download ran immediately or
+  waited for a slot. If the queue is dropped before a download runs, its `join` yields `TaskEnded`.
+
+---
+
+## 14. Outbound serve throttle (FCFS rate limiter)
+
+`FcfsRateLimiter` is the reusable primitive for the SERVE side (a node serving capsule bytes to
+requesting peers), so a node never overwhelms a single peer or its own uplink. A serve handler calls
+`acquire(conn_key, bytes)` before writing each chunk.
+
+- **Two caps (MUST)** — a GLOBAL byte-rate cap across all connections AND a PER-CONNECTION cap keyed by
+  an opaque connection key; both MUST be satisfied before bytes flow. A cap of `0` means unlimited for
+  that dimension.
+- **FCFS (MUST)** — admission is strictly arrival-order (a fair FIFO gate): a burst of large requests
+  MUST NOT starve a smaller request that arrived earlier.
+- **Token bucket** — each cap is a token bucket refilling at its byte-rate, holding at most one second's
+  burst. An oversized single request (larger than one second's capacity) is admitted (it cannot be
+  split) and its debt is repaid by the following callers' waits — it MUST NOT deadlock the limiter.
+
+---
+
+## 15. Source-selection seam (`SourceSelector`)
+
+The selection seam decouples "which peers, in what order" (a self-optimizing decision, owned by
+`dig-peer-selector`) from execution (owned by dig-download). dig-download defines the trait + its own
+minimal DTOs and DELEGATES to an injected implementation; it keeps no ranking model (§6).
+
+- **Layering (MUST)** — dig-download and dig-peer-selector are both level-30, so dig-download MUST NOT
+  depend on dig-peer-selector (reference-DOWN only). The trait + DTOs are therefore defined IN
+  dig-download; dig-peer-selector (or a dig-node adapter) implements it. dig-node's `Provenance` /
+  address book MUST NOT enter these types — a candidate carries only an opaque `tag` dig-download
+  round-trips but never interprets.
+- **Trait** — `SourceSelector { fn select(&SelectRequest) -> SelectPlan; fn record(&RangeOutcome); }`
+  (both `&self`, so one selector informs many concurrent downloads via interior mutability).
+- **DTOs** — `CandidateRef { peer_id, addrs, tag: Option<u64> }`; `SelectRequest { content_key,
+  candidates, ranges_needed, inflight }`; `SelectPlan { ordered: Vec<peer_id>, assignments:
+  Vec<(range_index, peer_id)> }` (assignments optional); `RangeOutcome { peer_id, bytes, elapsed,
+  result: RangeResult }`; `RangeResult ∈ { Ok, Failed, TimedOut }`.
+- **Default** — `NullSelector` is a fair round-robin that learns nothing, so dig-download standalone has
+  no hidden ranking brain.
+- **Candidate set** — the scheduler offers the selector only LIVE candidates (holders not in a
+  liveness/backoff window); the selector reasons about speed/preference, never liveness.
+
+> **Deferred (not in this version):** per-range merkle-proof binding on the wire (#1437, transport
+> lane) is not yet shipped; dig-download keeps the existing per-range length/alignment + whole-resource
+> root binding (§7/§8). Consuming a per-range proof is a separate additive increment once #1437 lands.

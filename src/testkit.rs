@@ -8,6 +8,8 @@
 //! refetch, mid-download source drop + rebalance, provider-set refresh, and pause/resume.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use dig_dht::{CandidateAddr, ContentId, PeerId, ProviderRecord};
@@ -16,6 +18,7 @@ use tokio::sync::Mutex;
 
 use crate::error::DownloadError;
 use crate::locate::ProviderLocator;
+use crate::select::{RangeOutcome, SelectPlan, SelectRequest, SourceSelector};
 use crate::source::{FetchedRange, RangeMeta, RangeTransport};
 
 /// The known "true" content the mock transport serves: the resource ciphertext + its chunk layout +
@@ -318,6 +321,75 @@ impl ProviderLocator for MockProviderLocator {
         let idx = (*calls).min(self.batches.len() - 1);
         *calls += 1;
         Ok(self.batches[idx].clone())
+    }
+}
+
+/// A recording mock [`SourceSelector`] — proves dig-download DELEGATES peer choice (calls `select`)
+/// and reports every range outcome (`record`), keeping NO ranking of its own.
+///
+/// By default it echoes the candidate set back in the order given (a pass-through order). A test can
+/// pin an explicit preference order via [`with_order`](Self::with_order) to assert dig-download honors
+/// the selector's choice, and inspect the recorded [`RangeOutcome`]s + `select` call count.
+#[derive(Default)]
+pub struct MockSelector {
+    select_calls: AtomicUsize,
+    // std (not tokio) mutex: `select`/`record` are SYNC trait methods invoked from async scheduler
+    // code, where a tokio `blocking_lock` would panic. The critical sections are trivial + non-await.
+    recorded: std::sync::Mutex<Vec<RangeOutcome>>,
+    forced_order: std::sync::Mutex<Option<Vec<String>>>,
+}
+
+impl MockSelector {
+    /// A pass-through selector (echoes the candidates in the order the scheduler offers them).
+    pub fn new() -> Arc<Self> {
+        Arc::new(MockSelector::default())
+    }
+
+    /// A selector that always prefers `order` (peer_ids best-first); any offered candidate absent from
+    /// `order` is appended after, so the plan still covers every live candidate.
+    pub fn with_order(order: Vec<String>) -> Arc<Self> {
+        let sel = MockSelector::default();
+        *sel.forced_order.lock().unwrap() = Some(order);
+        Arc::new(sel)
+    }
+
+    /// How many times [`SourceSelector::select`] has been called (proves dig-download consults the
+    /// selector rather than ranking internally).
+    pub fn select_call_count(&self) -> usize {
+        self.select_calls.load(Ordering::Relaxed)
+    }
+
+    /// A snapshot of every [`RangeOutcome`] reported so far (peer, bytes, elapsed, result).
+    pub fn outcomes(&self) -> Vec<RangeOutcome> {
+        self.recorded.lock().unwrap().clone()
+    }
+}
+
+impl SourceSelector for MockSelector {
+    fn select(&self, req: &SelectRequest) -> SelectPlan {
+        self.select_calls.fetch_add(1, Ordering::Relaxed);
+        let offered: Vec<String> = req.candidates.iter().map(|c| c.peer_id.clone()).collect();
+        match self.forced_order.lock().unwrap().as_ref() {
+            Some(order) => {
+                // Preferred peers that are actually offered, then any remaining offered peers.
+                let mut plan: Vec<String> = order
+                    .iter()
+                    .filter(|p| offered.contains(p))
+                    .cloned()
+                    .collect();
+                for p in &offered {
+                    if !plan.contains(p) {
+                        plan.push(p.clone());
+                    }
+                }
+                SelectPlan::ordered(plan)
+            }
+            None => SelectPlan::ordered(offered),
+        }
+    }
+
+    fn record(&self, outcome: &RangeOutcome) {
+        self.recorded.lock().unwrap().push(outcome.clone());
     }
 }
 
