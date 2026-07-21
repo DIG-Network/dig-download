@@ -20,7 +20,7 @@
 # by dig-node (see the implementers' note in the crate docs).
 [package]
 name = "dig-download"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.75.0"
 license = "Apache-2.0 OR MIT"
@@ -34,12 +34,14 @@ categories = ["network-programming"]
 # LOCATE — "which peers hold this content?" dig-download derives a `ContentId` (store / root /
 # capsule / resource) and asks dig-dht `find_providers` for the holders' `ProviderRecord`s.
 #
-# Sourcing: dig-dht resolves from crates.io (>= 0.3.0). dig-dht 0.3.0 has the SAME public API as 0.2.x —
-# its own bump was purely a dig-nat 0.7->0.8 dep move, additive-but-breaking-for-consumers (mirrored
-# here). dig-dht defines its OWN `PeerId`/`ProviderRecord` types (NOT re-exported from dig-nat), so
-# dig-download does not need dig-dht's own dig-nat dep to be the SAME dig-nat instance as its direct one
-# below — NC-7: prefer the crates.io release over bare-git.
-dig-dht = "0.3"
+# Sourcing: dig-dht resolves from crates.io (>= 0.4.0). dig-dht 0.4.0 keeps the SAME `find_providers`
+# public API this crate consumes (`DhtService::find_providers` — the true distributed iterative
+# lookup), adding auth-aware ingest/retract + `holders_of` for the flywheel provider store; those are
+# additive and not consumed here, so `DhtProviderLocator` keeps working unchanged. dig-dht 0.4 stays on
+# dig-nat ^0.8 (same major/minor as the direct dep below), so the tree still carries exactly ONE dig-nat
+# instance. dig-dht defines its OWN `PeerId`/`ProviderRecord` types (NOT re-exported from dig-nat).
+# NC-7: prefer the crates.io release over bare-git.
+dig-dht = "0.4"
 
 # REACH + FETCH — the mTLS peer transport the range fetch rides: `dig.getAvailability` +
 # `dig.fetchRange` over dig-nat mux streams, plus the wire shapes (`RangeRequest`, `RangeFrame`,
