@@ -20,7 +20,7 @@
 # by dig-node (see the implementers' note in the crate docs).
 [package]
 name = "dig-download"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.75.0"
 license = "Apache-2.0 OR MIT"
@@ -34,24 +34,24 @@ categories = ["network-programming"]
 # LOCATE — "which peers hold this content?" dig-download derives a `ContentId` (store / root /
 # capsule / resource) and asks dig-dht `find_providers` for the holders' `ProviderRecord`s.
 #
-# Sourcing: dig-dht resolves from crates.io (>= 0.2.1). dig-dht defines its OWN `PeerId`/`ProviderRecord`
-# types (NOT re-exported from dig-nat), so dig-download does not need dig-dht's own dig-nat dep to be
-# the SAME dig-nat instance as its direct one below — NC-7: prefer the crates.io release over bare-git.
-dig-dht = "0.2.1"
+# Sourcing: dig-dht resolves from crates.io (>= 0.3.0). dig-dht 0.3.0 has the SAME public API as 0.2.x —
+# its own bump was purely a dig-nat 0.7->0.8 dep move, additive-but-breaking-for-consumers (mirrored
+# here). dig-dht defines its OWN `PeerId`/`ProviderRecord` types (NOT re-exported from dig-nat), so
+# dig-download does not need dig-dht's own dig-nat dep to be the SAME dig-nat instance as its direct one
+# below — NC-7: prefer the crates.io release over bare-git.
+dig-dht = "0.3"
 
 # REACH + FETCH — the mTLS peer transport the range fetch rides: `dig.getAvailability` +
 # `dig.fetchRange` over dig-nat mux streams, plus the wire shapes (`RangeRequest`, `RangeFrame`,
 # `AvailabilityItem`/`Answer`/`Response`) and `PeerId`/`PeerTarget`/`NodeCert`/`connect`.
 #
-# Sourcing: the plain crates.io release "0.7" (the full NAT ladder — `connect_with_runtime`/
-# `NatRuntime` — added additively over 0.6; the 3-arg `connect` + all 0.6 API is unchanged). dig-nat
-# 0.7 consumes `dig-tls` for ALL cert/mTLS/peer_id/BLS-binding plumbing. dig-dht (above) currently
-# still deps dig-nat "0.6" internally, so this crate's Cargo.lock carries TWO dig-nat instances
-# (0.6.x behind dig-dht, 0.7.0 here) until dig-dht itself is bumped — harmless here because
-# dig-download never passes a dig-nat type across the dig-dht boundary (dig-dht's `PeerId`/
-# `ProviderRecord` are its own types, converted at the `provider_to_target` seam in `source.rs`).
-# NC-7: prefer the crates.io release over bare-git.
-dig-nat = "0.7"
+# Sourcing: the plain crates.io release "0.8" (§5.2 STUN happy-eyeballs reflexive discovery, added
+# additively over 0.7; all 0.7 API — `connect`/`connect_with_runtime`/`NatRuntime` — is unchanged).
+# dig-nat 0.8 consumes `dig-tls` for ALL cert/mTLS/peer_id/BLS-binding plumbing. dig-dht (above) is
+# now ALSO on dig-nat 0.8, so the final tree carries exactly ONE dig-nat instance — this bump is
+# additive-but-breaking-for-consumers of dig-download's own public API (single dig-nat + dig-dht
+# version in the tree). NC-7: prefer the crates.io release over bare-git.
+dig-nat = "0.8"
 
 # Async runtime for the orchestrator task + the concurrent range fan-out + backoff timers.
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync", "io-util"] }
