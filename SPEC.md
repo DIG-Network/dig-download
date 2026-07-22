@@ -204,7 +204,15 @@ lives with the store types). To prevent an accidentally fail-open verifier:
 
 ## 9. Transport resource bounds (MUST)
 
-The real `RangeTransport` over dig-nat MUST NOT let a peer exhaust client memory:
+The real `RangeTransport` (`NatRangeTransport`) reaches every holder through the shared `dig-peer`
+client (`DigPeer`) — the ONE DIG Network peer client — rather than driving `dig-nat` directly, so the
+whole ecosystem connects to peers ONE way (#1283). Every connection is established through a
+`PeerTarget` carrying the holder's `peer_id`, which `DigPeer::connect_with_runtime` PINS the mTLS
+handshake to: a caller meaning to reach holder X MUST NOT be answered by a different CA-valid peer (the
+impersonation footgun). Availability + range calls are public-read (merkle-verified content), so they
+ride the mTLS channel unsealed (§5.4 exemption); this transport configures no `SealingIdentity`.
+
+The transport MUST NOT let a peer exhaust client memory:
 
 - **Bounded range assembly** — range reassembly is bounded by the expected range length; a frame that
   would overflow the expected length is a transport error.
@@ -321,3 +329,34 @@ minimal DTOs and DELEGATES to an injected implementation; it keeps no ranking mo
 > **Deferred (not in this version):** per-range merkle-proof binding on the wire (#1437, transport
 > lane) is not yet shipped; dig-download keeps the existing per-range length/alignment + whole-resource
 > root binding (§7/§8). Consuming a per-range proof is a separate additive increment once #1437 lands.
+
+---
+
+## 16. Client→node read-ladder (`read_ladder`, §5.3)
+
+Reaching a specific, already-known holder is done by `peer_id`-pinned `PeerTarget` over the
+`RangeTransport` (§9). Reaching *a DIG node* — for a node-class client that has no particular peer in
+mind (a CLI, an SDK, a filesystem client holding a DIG identity key) — is a distinct concern and lives
+here at L30 (a fetch-client concern; previously carried in the dig-store CLI, #1283). `resolve_node`
+MUST select the endpoint in this fixed order, taking the FIRST tier that answers a cheap health probe
+within a short timeout:
+
+1. **Explicit override** — always wins, the ladder is not consulted. Precedence among override sources,
+   highest first: an explicit `--node` flag/argument > `$DIG_NODE_URL` > a persisted `node.url` config
+   value. A caller extracts these into `OverrideInputs` (this module performs no I/O).
+2. **`dig.local`** — the installed local node (the installer's hosts registration).
+3. **`localhost`** — a node on the loopback default read port (`DIG_NODE_PORT`, canonical 9778), when
+   `dig.local` does not resolve/respond.
+4. **`rpc.dig.net`** — the public gateway. FINAL fallback only; returned even if it does not itself
+   answer the probe (nowhere left to fall through to). MUST NEVER be hard-coded as the primary endpoint.
+
+- **Probe seam (MUST)** — resolution is transport-free: it takes a `HealthProbe` trait so the
+  fall-through ORDER is unit-testable without a network. The optional `HttpHealthProbe` (feature
+  `http-probe`) is a ready-made `GET {base}/health` probe that races the request against the
+  caller-supplied timeout and treats any non-2xx / transport error / elapsed timeout as "not reachable".
+- **Caching (MUST)** — the resolved choice is cached per invocation (`CachedResolver` resolves once);
+  a command needing the endpoint more than once MUST NOT re-probe the ladder.
+- **Transport mode (§5.3)** — a node-class client is required to speak mTLS to every tier, including
+  `rpc.dig.net` (dual-mode: mTLS for node-class clients, plain HTTPS+CORS for browsers). `TransportMode`
+  is the explicit-enum seam (`Https` default, `Mtls`) that flips the transport to mTLS once the
+  gateway's mTLS endpoint exists — an additive change, not a break to the ladder logic.
