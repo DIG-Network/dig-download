@@ -40,18 +40,18 @@ jobs:
         run: cargo fmt --all --check
 
       - name: Check clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
 
       # nextest retries a failing test up to 2x and reports failed-then-passed as flaky (surfaced in
       # the run summary) rather than hiding it (flaky-test management #489).
       - name: Run tests
-        run: cargo nextest run --all --retries 2
+        run: cargo nextest run --locked --all --retries 2
 
       - name: Build (release)
-        run: cargo build --release
+        run: cargo build --locked --release
 
       - name: Check documentation
-        run: cargo doc --no-deps
+        run: cargo doc --locked --no-deps
 
   coverage:
     name: Coverage (>=80% lines)
@@ -84,7 +84,7 @@ jobs:
       # (flaky-test management #489).
       - name: Run tests with coverage (gate >=80% lines)
         run: >-
-          cargo llvm-cov nextest --all
+          cargo llvm-cov nextest --locked --all
           --retries 2
           --fail-under-lines 80
           --lcov --output-path lcov.info
