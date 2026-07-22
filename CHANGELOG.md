@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.6.0] - 2026-07-22
+
+### Chores
+- **deps:** Adopt dig-nat 0.10 + dig-dht 0.5 (cascade #1494) — release 0.6.0 (#10)
+
 ## [0.5.1] - 2026-07-22
 
 ### CI
