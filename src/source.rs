@@ -237,7 +237,7 @@ type PooledConn = Arc<tokio::sync::Mutex<DigPeer>>;
 /// # Why DigPeer (#1283)
 ///
 /// dig-download talks to peers through the shared [`DigPeer`] client rather than driving
-/// [`dig_nat`](dig_nat) directly, so the whole ecosystem reaches peers ONE way. Every connection is
+/// [`dig_nat`] directly, so the whole ecosystem reaches peers ONE way. Every connection is
 /// established through a [`PeerTarget`](dig_nat::PeerTarget) carrying the provider's `peer_id`, which
 /// [`DigPeer::connect`] PINS the mTLS handshake to: a caller that means to reach provider X cannot be
 /// answered by a different CA-valid peer (the impersonation footgun). The availability + range calls
@@ -250,7 +250,7 @@ type PooledConn = Arc<tokio::sync::Mutex<DigPeer>>;
 /// content byte-download must too, or a fully-NAT'd peer would DISCOVER a provider it can never FETCH
 /// from (a non-Direct-reachable holder reachable only via hole-punch/relay). This transport connects
 /// via [`DigPeer::connect_with_runtime`], composing exactly the tiers whose live handles the injected
-/// [`NatRuntime`] carries: an empty runtime ([`new`](Self::new)) is Direct-only; a node's real runtime
+/// [`NatRuntime`](dig_nat::NatRuntime) carries: an empty runtime ([`new`](Self::new)) is Direct-only; a node's real runtime
 /// ([`new_with_runtime`](Self::new_with_runtime)) unlocks hole-punch + relay. dig-node builds the SAME
 /// shared `NatRuntime` it uses for the DHT-side dial and hands it here.
 ///
@@ -264,7 +264,7 @@ type PooledConn = Arc<tokio::sync::Mutex<DigPeer>>;
 /// The network dial is the only part not exercised by the in-memory tests (it needs real sockets +
 /// certs); the reassembly + provider→target mapping are pure and unit-tested. dig-node constructs one
 /// of these with its [`NodeCert`](dig_nat::NodeCert) (its CA-signed mTLS identity, minted by dig-tls's
-/// `NodeCert::load_or_generate`) + [`NatConfig`](dig_nat::NatConfig) + its live [`NatRuntime`] and
+/// `NodeCert::load_or_generate`) + [`NatConfig`](dig_nat::NatConfig) + its live [`NatRuntime`](dig_nat::NatRuntime) and
 /// hands it to the [`Downloader`](crate::Downloader) — see the implementers' note in the crate docs.
 pub struct NatRangeTransport {
     node: std::sync::Arc<dig_nat::NodeCert>,
@@ -283,7 +283,7 @@ impl NatRangeTransport {
     /// Build a transport that dials providers on `network_id`, presenting `node` (this peer's
     /// CA-signed mTLS identity) and using `config` to select the traversal methods + timeouts.
     ///
-    /// This uses an EMPTY [`NatRuntime`], so the dial composes the **Direct** tier only — suitable for
+    /// This uses an EMPTY [`NatRuntime`](dig_nat::NatRuntime), so the dial composes the **Direct** tier only — suitable for
     /// a fully-reachable node or a test. A NAT'd node that must reach non-Direct providers over
     /// hole-punch/relay MUST use [`new_with_runtime`](Self::new_with_runtime) with its live runtime.
     pub fn new(
