@@ -31,6 +31,12 @@ keywords = ["download", "multisource", "p2p", "content", "dig"]
 categories = ["network-programming"]
 
 [dependencies]
+# Canonical §5.3 endpoint literals (`RPC_DIG_NET_URL`, `DIG_LOCAL_HOST`, `DIG_NODE_PORT`) — the
+# ecosystem SSOT (#1283). The §5.3 read-ladder re-exports these rather than re-deriving the values,
+# so there is exactly ONE source of truth for the endpoints across the ecosystem. Foundation-level
+# (L00), zero DIG deps. NC-7: prefer the crates.io release over bare-git.
+dig-constants = "0.8"
+
 # LOCATE — "which peers hold this content?" dig-download derives a `ContentId` (store / root /
 # capsule / resource) and asks dig-dht `find_providers` for the holders' `ProviderRecord`s.
 #

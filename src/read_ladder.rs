@@ -35,15 +35,25 @@
 
 use std::time::Duration;
 
+// The §5.3 endpoint literals are canonical and live in ONE place — `dig-constants` (the ecosystem
+// SSOT, #1283). dig-download re-exports them under the names its ladder + public API have always
+// used, so there is a single source of truth for the values while downstream consumers see no
+// source break (§5.1 additive):
+//   RPC_DIG_NET             ← dig_constants::RPC_DIG_NET_URL  ("https://rpc.dig.net")
+//   DIG_LOCAL_HOST          ← dig_constants::DIG_LOCAL_HOST   ("dig.local")
+//   DEFAULT_LOCAL_NODE_PORT ← dig_constants::DIG_NODE_PORT    (9778)
+
 /// The public gateway base URL — FINAL fallback tier, never the primary/hard-coded endpoint
-/// (`CLAUDE.md` §5.3).
-pub const RPC_DIG_NET: &str = "https://rpc.dig.net";
+/// (`CLAUDE.md` §5.3). Re-exported from the `dig-constants` SSOT.
+pub use dig_constants::RPC_DIG_NET_URL as RPC_DIG_NET;
 
-/// The installed local node's hosts-file registration (installer-managed).
-pub const DIG_LOCAL_HOST: &str = "dig.local";
+/// The installed local node's hosts-file registration (installer-managed). Re-exported from the
+/// `dig-constants` SSOT.
+pub use dig_constants::DIG_LOCAL_HOST;
 
-/// A node's default loopback read port (`dig-node/SPEC.md` §1.1, `DIG_NODE_PORT` — canonical 9778).
-pub const DEFAULT_LOCAL_NODE_PORT: u16 = 9778;
+/// A node's default loopback read port (`dig-node/SPEC.md` §1.1, canonical 9778). Re-exported from
+/// the `dig-constants` SSOT (`DIG_NODE_PORT`).
+pub use dig_constants::DIG_NODE_PORT as DEFAULT_LOCAL_NODE_PORT;
 
 /// Default per-tier probe timeout: fast enough that a dead tier does not stall the caller, generous
 /// enough for a loopback / local-LAN round trip under load.
