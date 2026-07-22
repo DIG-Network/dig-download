@@ -81,6 +81,7 @@ pub mod orchestrator;
 pub mod plan;
 pub mod progress;
 pub mod queue;
+pub mod read_ladder;
 pub mod select;
 pub mod sink;
 pub mod source;
@@ -104,6 +105,13 @@ pub use progress::{
     DownloadEvent, DownloadProgress, DownloadState, FileStateStore, InMemoryStateStore, StateStore,
 };
 pub use queue::{DownloadQueue, QueuedHandle, DEFAULT_MAX_ACTIVE_DOWNLOADS};
+pub use read_ladder::{
+    local_urls, override_source, resolve_node, CachedResolver, HealthProbe, OverrideInputs,
+    OverrideSource, ResolvedNode, ResolvedTier, TransportMode, DEFAULT_LOCAL_NODE_PORT,
+    DEFAULT_PROBE_TIMEOUT, DIG_LOCAL_HOST, RPC_DIG_NET,
+};
+#[cfg(feature = "http-probe")]
+pub use read_ladder::HttpHealthProbe;
 pub use select::{
     CandidateRef, NullSelector, RangeOutcome, RangeResult, SelectPlan, SelectRequest,
     SourceSelector,

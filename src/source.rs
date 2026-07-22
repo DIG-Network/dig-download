@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use dig_dht::ProviderRecord;
 use dig_nat::{AvailabilityItem, AvailabilityResponse, RangeFrame, RangeRequest};
+use dig_peer::DigPeer;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::error::DownloadError;
@@ -223,32 +224,42 @@ pub async fn drain_trailer_bounded<R: AsyncRead + Unpin>(reader: &mut R, cap: u6
     drained
 }
 
-/// A pooled per-peer mTLS connection, shared behind a mutex so many range fetches to the SAME peer
+/// A pooled per-peer [`DigPeer`] client, shared behind a mutex so many range fetches to the SAME peer
 /// reuse ONE mTLS session (opening a cheap fresh yamux stream each) instead of re-handshaking per
-/// request.
-type PooledConn = Arc<tokio::sync::Mutex<dig_nat::PeerConnection>>;
+/// request. The `&mut self` [`DigPeer`] RPC receivers are serialized by the mutex.
+type PooledConn = Arc<tokio::sync::Mutex<DigPeer>>;
 
-/// The real [`RangeTransport`] over dig-nat: connects to a provider over the FULL NAT-traversal ladder
-/// (`dig_nat::connect_with_runtime` — direct → UPnP/NAT-PMP/PCP → hole-punch → relay), **reuses the
-/// connection via a per-peer pool**, and runs `dig.getAvailability` / `dig.fetchRange` over the mux'd
-/// mTLS stream.
+/// The real [`RangeTransport`] over [`dig-peer`](dig_peer): connects to a provider as a
+/// [`DigPeer`] — the one DIG Network peer client — over the FULL NAT-traversal ladder (direct →
+/// UPnP/NAT-PMP/PCP → hole-punch → relay, IPv6-first), **reuses the client via a per-peer pool**, and
+/// runs `dig.getAvailability` / `dig.fetchRange` over the mux'd mTLS session.
+///
+/// # Why DigPeer (#1283)
+///
+/// dig-download talks to peers through the shared [`DigPeer`] client rather than driving
+/// [`dig_nat`](dig_nat) directly, so the whole ecosystem reaches peers ONE way. Every connection is
+/// established through a [`PeerTarget`](dig_nat::PeerTarget) carrying the provider's `peer_id`, which
+/// [`DigPeer::connect`] PINS the mTLS handshake to: a caller that means to reach provider X cannot be
+/// answered by a different CA-valid peer (the impersonation footgun). The availability + range calls
+/// are public-read (merkle-verified content), so they ride the mTLS channel unsealed (§5.4 exemption);
+/// this transport therefore configures no [`SealingIdentity`](dig_peer::SealingIdentity).
 ///
 /// # The NAT ladder on the fetch leg (#1305)
 ///
 /// Discovery (dig-dht lookups) already rides the full ladder via a live [`dig_nat::NatRuntime`]; the
 /// content byte-download must too, or a fully-NAT'd peer would DISCOVER a provider it can never FETCH
-/// from (a non-Direct-reachable holder reachable only via hole-punch/relay). This transport dials with
-/// [`dig_nat::connect_with_runtime`], composing exactly the tiers whose live handles the injected
+/// from (a non-Direct-reachable holder reachable only via hole-punch/relay). This transport connects
+/// via [`DigPeer::connect_with_runtime`], composing exactly the tiers whose live handles the injected
 /// [`NatRuntime`] carries: an empty runtime ([`new`](Self::new)) is Direct-only; a node's real runtime
 /// ([`new_with_runtime`](Self::new_with_runtime)) unlocks hole-punch + relay. dig-node builds the SAME
-/// shared `NatRuntime` it uses for the DHT-side dial and hands it here (see its `dig_peer` seam).
+/// shared `NatRuntime` it uses for the DHT-side dial and hands it here.
 ///
 /// A download fans many ranges across a few providers; without pooling every range fetch paid a full
-/// NAT-traversal + mTLS handshake (LOW #179). The pool keeps one [`dig_nat::PeerConnection`] per
-/// `peer_id` and opens a new mux stream per request over the reused mTLS session; a connection that
-/// errors is evicted so the next request re-dials. For `fetch_range` the per-peer lock is held only
-/// while opening the (owned) range stream, then released before the bytes are read, so concurrent
-/// ranges to the same peer still stream in parallel.
+/// NAT-traversal + mTLS handshake (LOW #179). The pool keeps one [`DigPeer`] per `peer_id` and opens a
+/// new mux stream per request over the reused mTLS session; a client that errors is evicted so the
+/// next request re-dials. For `fetch_range` the per-peer lock is held only while opening the (owned)
+/// range stream, then released before the bytes are read, so concurrent ranges to the same peer still
+/// stream in parallel.
 ///
 /// The network dial is the only part not exercised by the in-memory tests (it needs real sockets +
 /// certs); the reassembly + provider→target mapping are pure and unit-tested. dig-node constructs one
@@ -336,15 +347,15 @@ impl NatRangeTransport {
         }
     }
 
-    /// Connect to a provider (fresh mTLS connection over the FULL NAT-traversal ladder). Composes
-    /// exactly the tiers whose live handles this transport's [`NatRuntime`](dig_nat::NatRuntime)
-    /// carries — Direct always, plus hole-punch/relay when the node injected them (#1305).
-    async fn connect(
-        &self,
-        provider: &ProviderRecord,
-    ) -> Result<dig_nat::PeerConnection, DownloadError> {
+    /// Connect to a provider as a [`DigPeer`] (fresh `peer_id`-pinned mTLS connection over the FULL
+    /// NAT-traversal ladder). Composes exactly the tiers whose live handles this transport's
+    /// [`NatRuntime`](dig_nat::NatRuntime) carries — Direct always, plus hole-punch/relay when the node
+    /// injected them (#1305). The [`PeerTarget`](dig_nat::PeerTarget) carries the provider's `peer_id`,
+    /// which [`DigPeer::connect_with_runtime`] pins so a different CA-valid peer cannot impersonate the
+    /// intended provider (#1283).
+    async fn connect(&self, provider: &ProviderRecord) -> Result<DigPeer, DownloadError> {
         let target = self.provider_to_target(provider)?;
-        dig_nat::connect_with_runtime(&target, &self.node, &self.config, &self.runtime)
+        DigPeer::connect_with_runtime(&target, &self.node, &self.config, &self.runtime)
             .await
             .map_err(|e| DownloadError::transport(&provider.provider_peer_id, e))
     }
@@ -380,7 +391,7 @@ impl RangeTransport for NatRangeTransport {
         let conn = self.pooled_conn(provider).await?;
         let res = {
             let mut guard = conn.lock().await;
-            guard.query_availability(items).await
+            guard.get_availability(items).await
         };
         match res {
             Ok(resp) => Ok(resp),
@@ -402,7 +413,7 @@ impl RangeTransport for NatRangeTransport {
         // release it before reading frames so concurrent ranges to the same peer stream in parallel.
         let stream = {
             let mut guard = conn.lock().await;
-            guard.open_range_stream(req).await
+            guard.fetch_range(req).await
         };
         let mut stream = match stream {
             Ok(s) => s,

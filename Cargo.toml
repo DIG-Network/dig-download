@@ -54,6 +54,14 @@ dig-dht = "0.5"
 # version in the tree). NC-7: prefer the crates.io release over bare-git.
 dig-nat = "0.10"
 
+# REACH + FETCH via the shared client — dig-download talks to peers through `DigPeer`, the one DIG
+# Network peer client (#1283), rather than driving dig-nat directly: `DigPeer::connect_with_runtime`
+# (peer_id-PINNED mTLS over the full NAT ladder) + `get_availability` / `fetch_range`. dig-peer 0.4
+# re-exports the SAME dig-nat 0.10 / dig-tls 0.3 shapes this crate already uses (`PeerTarget`,
+# `RangeRequest`, `AvailabilityItem`/`AvailabilityResponse`, `NodeCert`, `PeerId`), so the tree still
+# carries exactly ONE dig-nat + dig-tls instance. NC-7: prefer the crates.io release over bare-git.
+dig-peer = "0.4"
+
 # Async runtime for the orchestrator task + the concurrent range fan-out + backoff timers.
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync", "io-util"] }
 async-trait = "0.1"
@@ -71,9 +79,20 @@ serde_json = "1"
 # merkle-proofs) — the whole-resource commitment a reassembled resource is verified against.
 sha2 = "0.10"
 
+# OPTIONAL — the ready-made HTTP `HealthProbe` for the §5.3 read-ladder (`HttpHealthProbe`, feature
+# `http-probe`). The core ladder resolution is transport-free (trait-based); consumers that want the
+# out-of-the-box `GET {base}/health` probe opt into reqwest via this feature, keeping the default
+# dependency tree lean (the crate's "small tree" philosophy).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"], optional = true }
+
 # Structured errors + observability.
 thiserror = "2"
 tracing = "0.1"
+
+[features]
+# The ready-made HTTP health probe for the §5.3 read-ladder. Off by default (keeps reqwest out of the
+# tree unless a consumer wants the built-in probe); the trait-based ladder works without it.
+http-probe = ["dep:reqwest"]
 
 [dev-dependencies]
 # The in-memory harness spins up mock providers + mock range sources + an in-memory sink/state store
