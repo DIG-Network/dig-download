@@ -7,13 +7,7 @@ This project adheres to [Semantic Versioning](https://semver.org) and
 ## [0.7.0] - 2026-07-22
 
 ### Features
-- **dig-download:** Adopt the shared `dig-peer` 0.4 client for the range transport + add the §5.3
-  client→node read-ladder (#1283). `NatRangeTransport` now reaches holders via
-  `DigPeer::connect_with_runtime` (peer_id-pinned mTLS over the full NAT ladder, per-peer connection
-  pool) behind the unchanged `RangeTransport` trait; the new `read_ladder` module carries the §5.3
-  node-endpoint resolution order (override > dig.local > localhost > rpc.dig.net) with a `HealthProbe`
-  seam, optional `HttpHealthProbe` (feature `http-probe`), `CachedResolver`, and a `TransportMode` mTLS
-  seam.
+- **dig-download:** Adopt DigPeer transport + §5.3 read-ladder (#1283) (#11)
 
 ## [0.6.0] - 2026-07-22
 
