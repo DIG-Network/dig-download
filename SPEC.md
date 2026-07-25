@@ -61,7 +61,10 @@ An implementation MUST perform, in order:
 1. **Guard** — reject a bare `Store` content id (`NotDownloadable`).
 2. **Discover** — `ProviderLocator::find_providers(content)` returns candidate holders.
 3. **Confirm** — `dig.getAvailability` per candidate; keep only confirmed holders. Zero confirmed
-   holders after discovery ⇒ `DownloadError::NotFound`.
+   holders after discovery ⇒ `DownloadError::NotFound`. A `NotFound`'s `content` MUST name the step
+   that failed — `no providers located for …` (discovery/confirm found nobody) versus
+   `could not read resource metadata for … — the metadata probe failed on all N confirmed holder(s)`
+   (§4) — so a probe failure is never reported as a discovery miss.
 4. **Establish the commitment** (§4) — unless resumed from persisted state.
 5. **Plan** (§5) — partition the resource into chunk-aligned ranges; mark resume-done ranges done.
 6. **Schedule** (§6) — fan ranges across holders concurrently, verify (§7) each, retry/rebalance.
