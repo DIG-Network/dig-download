@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.7.2] - 2026-07-25
+
+### Bug Fixes
+- **orchestrator:** Name the failing step in NotFound + trace locate/probe (#1586) (#14)
+
 ## [0.7.1] - 2026-07-23
 
 ### Chores
