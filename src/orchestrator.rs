@@ -409,9 +409,9 @@ impl Job {
         // 1–2. Discover + confirm holders.
         self.providers = self.locate_and_confirm().await?;
         if self.providers.is_empty() {
-            let reason = format!("{:?}", self.content);
+            let reason = format!("no providers located for {:?}", self.content);
             self.emit(DownloadEvent::Failed {
-                reason: format!("no providers for {reason}"),
+                reason: reason.clone(),
             })
             .await;
             return Err(DownloadError::NotFound { content: reason });
@@ -861,7 +861,7 @@ impl Job {
         let found = self.locator.find_providers(&self.content).await?;
         let item = self.availability_item()?;
         let mut confirmed = Vec::new();
-        for p in found {
+        for p in found.iter().cloned() {
             match self
                 .transport
                 .query_availability(&p, vec![item.clone()])
@@ -873,6 +873,21 @@ impl Job {
                 _ => {}
             }
         }
+        // The provider-index key the locate actually queried, beside what came back. A read that ends
+        // with an empty candidate set is otherwise indistinguishable from one whose holders were all
+        // dropped at the confirm step — the ambiguity that repeatedly sent #1586 hunting a phantom
+        // key mismatch. Printing the key makes a real key divergence visible at a glance.
+        tracing::debug!(
+            content = ?self.content,
+            content_key = %self.content.to_key().to_hex(),
+            located = found.len(),
+            confirmed = confirmed.len(),
+            providers = ?confirmed
+                .iter()
+                .map(|p| p.provider_peer_id.as_str())
+                .collect::<Vec<_>>(),
+            "locate_and_confirm: holders for this content key"
+        );
         Ok(confirmed)
     }
 
@@ -917,7 +932,19 @@ impl Job {
         let want_root = self.content_root_hex();
         for provider in &providers {
             let req = self.range_request(0, 1)?;
-            if let Ok(f) = self.transport.fetch_range(provider, &req).await {
+            let probe = self.transport.fetch_range(provider, &req).await;
+            if let Err(e) = &probe {
+                // The meta-probe is where a reachable, confirmed holder still fails to seed the
+                // download (a wire/format mismatch, a truncated frame, a refused dial). Name the
+                // provider + the reason: without it the download's terminal error looks like a
+                // discovery miss and the real fault stays invisible (#1586).
+                tracing::debug!(
+                    peer = %provider.provider_peer_id,
+                    error = %e,
+                    "establish_commitment: metadata probe failed on this holder"
+                );
+            }
+            if let Ok(f) = probe {
                 // Bind the ground truth to the CALLER's request, not to whichever peer answers
                 // first: reject a peer whose reported generation root differs from the content-id's
                 // root before adopting anything it says (HIGH #179). Without this, a single peer
@@ -944,9 +971,16 @@ impl Job {
                 }
             }
         }
-        let reason = format!("{:?}", self.content);
+        // Say WHICH step failed. Holders WERE located and confirmed; not one could answer the
+        // metadata probe. The bare content id here reads as "discovery found nobody" and cost four
+        // separate #1586 investigations — the message now names the step that actually failed.
+        let reason = format!(
+            "could not read resource metadata for {:?} — the metadata probe failed on all {}              confirmed holder(s)",
+            self.content,
+            providers.len()
+        );
         self.emit(DownloadEvent::Failed {
-            reason: format!("could not read resource metadata for {reason}"),
+            reason: reason.clone(),
         })
         .await;
         Err(DownloadError::NotFound { content: reason })

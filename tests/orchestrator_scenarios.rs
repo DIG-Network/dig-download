@@ -993,3 +993,43 @@ fn temp_dir(tag: &str) -> std::path::PathBuf {
     std::fs::create_dir_all(&d).unwrap();
     d
 }
+
+/// #1586 diagnosability: the two ways a download can end with "nothing to fetch from" MUST be
+/// DISTINGUISHABLE in the error text.
+///
+/// `establish_commitment` failing (holders WERE located + confirmed, but none could answer the
+/// metadata probe) previously produced the SAME "no providers located for …" message as a genuinely
+/// empty locate. That single ambiguous string sent four separate read-leg investigations hunting a
+/// non-existent provider-key mismatch while the real fault sat in the meta-probe. The messages are
+/// now distinct: an empty locate says "no providers", a failed probe says "metadata".
+#[tokio::test]
+async fn a_failed_metadata_probe_does_not_claim_no_providers_were_located() {
+    let content = MockContent::even(20, 2);
+    let cid = mock_content_id();
+    let transport = Arc::new(MockRangeTransport::new(content.clone()));
+    // The holder is located AND confirms availability, but every fetch fails — so the metadata probe
+    // (not the locate) is what ends the download.
+    transport
+        .set_behavior(&mock_peer_hex(1), Behavior::DropAfter(0))
+        .await;
+    let dl = downloader(
+        transport.clone(),
+        Arc::new(MockProviderLocator::fixed(vec![mock_provider(1, &cid)])),
+        Arc::new(InMemoryStateStore::new()),
+        Arc::new(MerkleVerifier::insecure_structural_only()),
+        test_config(10),
+    );
+    let sink = Arc::new(InMemorySink::new());
+    let err = join_ok(dl.download(cid, sink, DownloadOptions::default()))
+        .await
+        .expect_err("the probe fails on the only holder");
+    let text = err.to_string();
+    assert!(
+        text.contains("metadata"),
+        "a failed metadata probe must SAY so; got {text}"
+    );
+    assert!(
+        !text.contains("no providers located"),
+        "a failed metadata probe must NOT claim locate found nobody; got {text}"
+    );
+}

@@ -46,11 +46,14 @@ pub enum DownloadError {
         needed: usize,
     },
 
-    /// The content could not be located at all — `find_providers` returned no holders and no plan
-    /// metadata could be obtained. Terminal.
-    #[error("content not found: no providers located for {content}")]
+    /// The content could not be fetched at all — either `find_providers` returned no holders, or
+    /// no located holder could answer the metadata probe. Terminal.
+    ///
+    /// `content` names the content id AND which of those two steps failed: the message must never
+    /// blame discovery for a probe failure (that ambiguity cost four #1586 investigations).
+    #[error("content not found: {content}")]
     NotFound {
-        /// A short description of the content id that could not be located.
+        /// The content id that could not be fetched, plus the step that failed.
         content: String,
     },
 
