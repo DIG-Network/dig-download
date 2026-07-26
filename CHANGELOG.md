@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.10.0] - 2026-07-26
+
+### Features
+- **dig-download:** Bind resumed reads to the chain root + promote only verified bytes (#18)
+
 ## [0.8.1] - 2026-07-26
 
 ### Chores
