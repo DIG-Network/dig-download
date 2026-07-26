@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.8.0] - 2026-07-26
+
+### Features
+- **dig-download:** ModuleDownloader — fail-closed whole-.dig peer pull (#1576) (#13)
+
 ## [0.7.4] - 2026-07-26
 
 ### Bug Fixes
