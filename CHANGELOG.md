@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.7.3] - 2026-07-26
+
+### Bug Fixes
+- **source:** Parse provider host as IpAddr + try all candidates v6->v4 (#836) (#15)
+
 ## [0.7.2] - 2026-07-25
 
 ### Bug Fixes
