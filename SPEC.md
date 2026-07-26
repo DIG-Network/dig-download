@@ -393,3 +393,98 @@ within a short timeout:
   `rpc.dig.net` (dual-mode: mTLS for node-class clients, plain HTTPS+CORS for browsers). `TransportMode`
   is the explicit-enum seam (`Https` default, `Mtls`) that flips the transport to mTLS once the
   gateway's mTLS endpoint exists — an additive change, not a break to the ladder logic.
+
+---
+
+## 17. Whole-`.dig`-module pull (`module`, the reshare leg)
+
+`ModuleDownloader` pulls the ENTIRE `.dig` module blob for one `(store_id, root)` generation from
+PEERS, so a node that read one resource can become a complete resharer of the capsule. It delivers
+**whole-module semantics over the ranged transport** — the same multi-source, resumable, per-source
+attributable machinery as §§5–10, addressed at the module blob rather than a resource within it.
+
+### 17.1 Injection seams (MUST)
+
+- **`ModuleTransport`** — the two peer calls, and the ONLY network the engine performs:
+  - `get_module_info(provider_peer_id, store_id, root) -> ModuleInfo` (`dig.getModuleInfo`).
+  - `fetch_module_range(provider_peer_id, store_id, root, offset, length) -> Vec<u8>`
+    (`dig.fetchModuleRange`).
+- **`ModuleAnchorVerifier`** — `verify_module_anchor(module, store_id, root) -> bool`, binding an
+  assembled blob to its on-chain generation root. There is **NO fail-open production default**: the only
+  implementation this crate ships is the `#[doc(hidden)]`, named `AcceptAnyModuleAnchor`, which a caller
+  must ask for by name. A production caller MUST inject a real chain-anchored verifier.
+
+`ModuleInfo` (`total_size`, `module_hash`, `chunk_hashes`, `chunk_lens`) is the **dig-rpc-protocol**
+wire type, re-exported unchanged — this crate MUST NOT declare a second copy of the descriptor.
+
+### 17.2 Normative order
+
+1. **Locate** holders via `ProviderLocator::find_providers` on the capsule `ContentId`
+   (`ContentId::root(store_id, root)`). An empty holder set is `NotFound`.
+2. **Describe** — `get_module_info` against each holder until one answers; the descriptor is validated
+   into a chunk plan (§17.3).
+3. **Load** the resume checkpoint under the module-scoped key `module:<store_id>:<root>`, which MUST NOT
+   collide with the resource `download_key` keyspace. A checkpoint whose `chunk_lens` differ from the
+   current descriptor is discarded whole, never partially reused.
+4. **Rehydrate** each checkpointed chunk from staging, re-attributing it (§17.5).
+5. **Fetch** every still-missing chunk in ascending order, round-robin across holders from a per-chunk
+   starting offset, attributing each on arrival (§17.4). Each accepted chunk is written to the sink and
+   checkpointed before the next is requested.
+6. **Gate, then finalize** (§17.6).
+
+### 17.3 Descriptor validation (MUST — before allocation)
+
+A `ModuleInfo` is rejected with `Verify(Metadata)` unless ALL hold, checked in this order:
+
+- `total_size <= max_module_size` (`DEFAULT_MAX_MODULE_SIZE` = 8 GiB). The descriptor is UNTRUSTED and
+  `total_size` sizes the assembly buffer, so this bound MUST be checked **before any allocation** — an
+  unbounded declared size is a one-message memory-exhaustion attack.
+- `chunk_lens` is non-empty (without it no byte→chunk mapping, hence no per-chunk check, exists).
+- `chunk_lens.len() == chunk_hashes.len()`.
+- `chunk_lens` sums exactly to `total_size`.
+
+### 17.4 Per-chunk attribution (MUST — fail-closed)
+
+A returned range is accepted only if, after clipping, it fills the requested window AND its SHA-256
+equals `chunk_hashes[index]`. Otherwise it is discarded and the next holder tried.
+
+- **Clip, do not reject (MUST)** — a frame that OVERSHOOTS the requested window is truncated to the
+  window and then attributed. Holders legitimately answer at their own chunk granularity (§2.2); treating
+  an over-long answer as a violation would make every such holder unusable. A range that is SHORT after
+  clipping is a failure for that holder.
+- **Surface every reason (MUST)** — each holder's rejection reason (`transport: …`, `timed out after …`,
+  `short range: …`, `chunk hash mismatch`) is recorded and traced as it happens, and the terminal error
+  names the failing STEP (`getModuleInfo` / `fetchModuleRange`), the chunk, its byte window, and every
+  per-holder reason. A swallowed reason resurfacing as an unrelated message is a defect, not a nicety.
+- **Sentinel untrusted identifiers (MUST)** — a `provider_peer_id` and the descriptor's hashes are
+  free-form peer-supplied strings. Any such value reaching a log or an error message is rendered as
+  lowercase 64-hex only when it IS canonical 64-hex, else as `<non-canonical-{label}>`. A log an attacker
+  can write is not evidence.
+- **Relocate once** — when every known holder has failed one chunk, `find_providers` is re-queried and
+  newly-discovered holders appended before the pull gives up on that chunk.
+
+### 17.5 Resume (MUST NOT trust staging)
+
+A checkpointed chunk is read back from the sink and **re-attributed against `chunk_hashes` exactly like a
+freshly-fetched one**. The staging file survives crashes, other processes, and bit-rot, so it is not a
+trusted input. A chunk that cannot be read back, reads short, or fails its hash is left NOT done, is
+re-fetched, and the checkpoint is corrected to match. Resume is an OPTIMIZATION and MUST NEVER be a
+correctness dependency, and MUST NEVER skip the §17.6 gates.
+
+### 17.6 Final gates (MUST — fail-closed, both, every time)
+
+Before `Sink::finalize`, on EVERY pull including a resumed one:
+
+1. The reassembled blob's SHA-256 equals the descriptor's `module_hash`.
+2. `ModuleAnchorVerifier::verify_module_anchor(blob, store_id, root)` returns `true`.
+
+If either fails, the pull returns `Verify(Metadata)`, the sink is **NOT finalized** (the staging file is
+never promoted, so nothing is served or announced), and the checkpoint is left in place. There is no path
+by which a module is finalized without both gates passing — an unanchored module is a clean miss, never a
+serve. This is what makes reshare safe: only chain-anchored bytes can ever be re-announced.
+
+### 17.7 Implementation status
+
+This crate ships the ENGINE and the two seams. The production `ModuleTransport` adapter over the peer
+client is wired by dig-node once module client methods exist on the shared peer client; the in-memory
+`testkit::MockModuleTransport` is the reference double.

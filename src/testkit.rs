@@ -409,6 +409,18 @@ pub fn mock_peer_hex(n: u8) -> String {
     PeerId::from_bytes([n; 32]).to_hex()
 }
 
+/// Build a mock provider record carrying an ARBITRARY `provider_peer_id` string, bypassing the
+/// [`ProviderRecord::new`] canonicalization the way a record deserialized straight off the wire does.
+///
+/// `ProviderRecord::provider_peer_id` is a plain `String`, so a hostile peer can publish any text it
+/// likes there. Tests use this to prove that peer-supplied text never reaches a log/error verbatim
+/// (#1603).
+pub fn mock_provider_with_peer_id(peer_id: &str, content: &ContentId) -> ProviderRecord {
+    let mut record = mock_provider(1, content);
+    record.provider_peer_id = peer_id.to_string();
+    record
+}
+
 /// A throwaway content id (resource granularity) for tests. Its generation `root` is `[0xAB; 32]`
 /// (hex `"ab".repeat(32)`) so it MATCHES the root [`MockContent`] reports in each range's first
 /// frame — the orchestrator cross-checks the peer-reported root against the content-id root
@@ -435,6 +447,8 @@ pub struct MockModuleTransport {
     chunk_size: usize,
     tamper_peer: Option<String>,
     corrupt_module_hash: bool,
+    overserve: bool,
+    declared_total_size: Option<u64>,
     budget: Option<Arc<AtomicUsize>>,
     fetches: Mutex<Vec<(String, u64)>>,
 }
@@ -450,9 +464,28 @@ impl MockModuleTransport {
             chunk_size,
             tamper_peer: None,
             corrupt_module_hash: false,
+            overserve: false,
+            declared_total_size: None,
             budget: None,
             fetches: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Every `fetchModuleRange` answers with MORE bytes than the requested window (the whole enclosing
+    /// chunk plus the following one, where the blob allows it) — the legitimate chunk-granular server
+    /// of the §2.2 clip contract, NOT a liar. A puller must CLIP to the requested window and keep
+    /// using this holder (#836 / dig-download 0.7.4).
+    pub fn overserving(mut self) -> Self {
+        self.overserve = true;
+        self
+    }
+
+    /// `getModuleInfo` declares `total_size` (and a matching final `chunk_lens` entry) far larger than
+    /// the bytes actually served — models a hostile descriptor whose declared size would drive the
+    /// puller's assembly buffer allocation.
+    pub fn declaring_total_size(mut self, total_size: u64) -> Self {
+        self.declared_total_size = Some(total_size);
+        self
     }
 
     /// This holder serves corrupted bytes for every chunk (flips the first byte) — models a lying
@@ -494,8 +527,17 @@ impl MockModuleTransport {
         } else {
             hex_sha256(&self.blob)
         };
+        // An inflated `total_size` is reported with a matching inflated FINAL chunk length, so the
+        // descriptor stays internally self-consistent and the puller's size guard — not its
+        // consistency check — is what has to catch it.
+        let mut total_size = self.blob.len() as u64;
+        if let Some(inflated) = self.declared_total_size {
+            let last = chunk_lens.last_mut().expect("blob yields >= 1 chunk");
+            *last += inflated.saturating_sub(total_size);
+            total_size = inflated;
+        }
         ModuleInfo {
-            total_size: self.blob.len() as u64,
+            total_size,
             module_hash,
             chunk_hashes,
             chunk_lens,
@@ -538,7 +580,12 @@ impl crate::module::ModuleTransport for MockModuleTransport {
             .push((provider_peer_id.to_string(), offset));
 
         let start = offset as usize;
-        let end = (start + length as usize).min(self.blob.len());
+        let mut window = length as usize;
+        if self.overserve {
+            // Answer at chunk granularity beyond the request — the legitimate over-long frame.
+            window += self.chunk_size.max(1);
+        }
+        let end = (start + window).min(self.blob.len());
         let mut bytes = self.blob[start..end].to_vec();
         if self.tamper_peer.as_deref() == Some(provider_peer_id) && !bytes.is_empty() {
             bytes[0] ^= 0xFF;

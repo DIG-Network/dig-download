@@ -15,13 +15,19 @@
 //! 2. **Handshake** `dig.getModuleInfo` against a holder ([`ModuleTransport::get_module_info`]) →
 //!    [`ModuleInfo`] (`total_size`, `module_hash`, per-chunk `chunk_hashes` + `chunk_lens`). This is
 //!    the transfer descriptor: it defines the chunk plan AND the per-chunk + whole-blob checks.
-//! 3. **Fan** the chunks across the located holders concurrently
-//!    ([`ModuleTransport::fetch_module_range`], `dig.fetchModuleRange`), each chunk one range.
+//! 3. **Spread** the chunks across the located holders ([`ModuleTransport::fetch_module_range`],
+//!    `dig.fetchModuleRange`), each chunk one range, round-robin from a per-chunk starting holder so a
+//!    multi-holder set is genuinely pulled from multiple sources. Chunks are pulled in ascending order
+//!    (one in flight); parallel in-flight chunks are a later optimization, not a contract.
 //! 4. **Attribute** each returned range against `chunk_hashes[i]` the instant it arrives — a tampered
-//!    or mis-sized range is REJECTED and re-fetched from another holder, and the serving holder is
-//!    penalized (per-source attribution, fail-closed before assembly).
-//! 5. **Resume** across pause / crash via the injected [`StateStore`]: a chunk already verified is
-//!    recorded and NEVER re-fetched.
+//!    or short range is REJECTED, its reason recorded against the serving holder, and the chunk
+//!    re-fetched from the next holder (per-source attribution, fail-closed before assembly). A frame
+//!    that OVERSHOOTS the requested window is clipped, not rejected: answering at chunk granularity is
+//!    legitimate (the §2.2 clip contract, #836).
+//! 5. **Resume** across pause / crash via the injected [`StateStore`]: a checkpointed chunk is read
+//!    back from staging and RE-ATTRIBUTED against `chunk_hashes` rather than trusted, so it is skipped
+//!    when still intact and re-fetched when the staging file has been corrupted since (#1605). A
+//!    resumed pull always ends in the same two final gates below — resume can never bypass them.
 //! 6. **Assemble** verified chunks in order into the [`Sink`]'s staging area, then run the two
 //!    fail-closed final gates BEFORE finalize — (a) the reassembled blob hashes to `module_hash`
 //!    (whole-blob integrity), and (b) the reassembled blob verifies against its chain-anchored `root`
@@ -121,18 +127,29 @@ impl ModuleAnchorVerifier for AcceptAnyModuleAnchor {
     }
 }
 
+/// The default [`ModuleDownloadConfig::max_module_size`] — 8 GiB, comfortably above any real `.dig`
+/// capsule while still bounding what one lying `getModuleInfo` can make a node allocate.
+pub const DEFAULT_MAX_MODULE_SIZE: u64 = 8 * 1024 * 1024 * 1024;
+
 /// Tunables for a module pull.
 #[derive(Debug, Clone)]
 pub struct ModuleDownloadConfig {
     /// Per-range fetch timeout — a holder that does not return a chunk within this window is treated
     /// as a failed source for that chunk and the next holder is tried.
     pub range_timeout: std::time::Duration,
+
+    /// Upper bound on the `total_size` a [`ModuleInfo`] may declare. The descriptor comes from an
+    /// UNTRUSTED holder and sizes the puller's assembly buffer, so without this bound a single lying
+    /// `getModuleInfo` would make the node allocate arbitrarily much memory. A descriptor above the
+    /// bound is refused before any allocation. Defaults to [`DEFAULT_MAX_MODULE_SIZE`].
+    pub max_module_size: u64,
 }
 
 impl Default for ModuleDownloadConfig {
     fn default() -> Self {
         ModuleDownloadConfig {
             range_timeout: std::time::Duration::from_secs(30),
+            max_module_size: DEFAULT_MAX_MODULE_SIZE,
         }
     }
 }
@@ -194,7 +211,7 @@ impl ModuleDownloader {
 
         // 2. HANDSHAKE getModuleInfo from the first responsive holder → the transfer descriptor.
         let info = self.fetch_module_info(&providers, store_id, root).await?;
-        let layout = ChunkPlan::from_info(&info)?;
+        let layout = ChunkPlan::from_info(&info, self.config.max_module_size)?;
 
         // 3. Load resume state; a checkpoint for a DIFFERENT generation shape is discarded (never
         //    mixed) so a resume re-plans identically to the original.
@@ -206,7 +223,7 @@ impl ModuleDownloader {
         //    rather than re-fetched; a sink that can't read back re-fetches them (still fail-closed).
         let mut blob = vec![0u8; layout.total_size as usize];
         let mut done: Vec<bool> = vec![false; layout.chunk_count()];
-        self.rehydrate_done_chunks(sink, &layout, &state, &mut blob, &mut done)
+        self.rehydrate_done_chunks(sink, &info, &layout, &mut state, &mut blob, &mut done)
             .await;
 
         // 5. FETCH + ATTRIBUTE every still-missing chunk, fanned round-robin across the holders.
@@ -230,7 +247,7 @@ impl ModuleDownloader {
         if assembled_hash != info.module_hash {
             return Err(DownloadError::Verify(VerifyError::Metadata(format!(
                 "assembled module_hash {assembled_hash} != declared {}",
-                info.module_hash
+                hex64_or_sentinel(&info.module_hash, "module-hash")
             ))));
         }
         if !self.anchor.verify_module_anchor(&blob, store_id, root) {
@@ -246,30 +263,40 @@ impl ModuleDownloader {
 
     /// Try each holder's `dig.getModuleInfo` until one answers; the descriptor is content-addressed so
     /// any honest holder returns the same shape (a lie is caught by the whole-blob + anchor gates).
+    ///
+    /// If every holder fails, the terminal error names the STEP (`getModuleInfo`) and carries each
+    /// holder's own reason — a swallowed reason resurfacing as an unrelated message cost six blind
+    /// diagnosis rounds on the read leg (#836).
     async fn fetch_module_info(
         &self,
         providers: &[dig_dht::ProviderRecord],
         store_id: &str,
         root: &str,
     ) -> Result<ModuleInfo, DownloadError> {
+        let mut reasons = HolderReasons::default();
         for provider in providers {
-            match self
-                .transport
-                .get_module_info(&provider.provider_peer_id, store_id, root)
-                .await
-            {
+            let peer = &provider.provider_peer_id;
+            match self.transport.get_module_info(peer, store_id, root).await {
                 Ok(info) => return Ok(info),
-                Err(e) if e.is_recoverable() => continue,
+                Err(e) if e.is_recoverable() => reasons.record(peer, e),
                 Err(e) => return Err(e),
             }
         }
-        Err(DownloadError::NoProviders { needed: 1 })
+        Err(DownloadError::NotFound {
+            content: format!(
+                "getModuleInfo failed on all {} located holder(s) for module {} — {reasons}",
+                providers.len(),
+                module_download_key(store_id, root),
+            ),
+        })
     }
 
     /// Fetch chunk `index` from the holders, verifying each returned range against
-    /// `chunk_hashes[index]` for per-source attribution: a tampered/mis-sized range is rejected and
-    /// the next holder tried. Fetching cycles the holders starting at `index` (round-robin spread), so
-    /// a multi-holder set is pulled from multiple sources; one re-locate is attempted before giving up.
+    /// `chunk_hashes[index]` for per-source attribution: a tampered range is rejected and the next
+    /// holder tried. Fetching cycles the holders starting at `index` (round-robin spread), so a
+    /// multi-holder set is pulled from multiple sources; one re-locate is attempted before giving up.
+    ///
+    /// Every rejection reason is recorded per holder and reported in the terminal error (#836).
     async fn fetch_verified_chunk(
         &self,
         providers: &mut Vec<dig_dht::ProviderRecord>,
@@ -281,32 +308,30 @@ impl ModuleDownloader {
     ) -> Result<Vec<u8>, DownloadError> {
         let (offset, len) = layout.chunk_span(index);
         let expected_hash = &info.chunk_hashes[index];
+        let mut reasons = HolderReasons::default();
 
         let mut relocated = false;
         loop {
             let count = providers.len();
             for step in 0..count {
-                let provider = &providers[(index + step) % count];
-                let peer = &provider.provider_peer_id;
-                let fetched = tokio::time::timeout(
-                    self.config.range_timeout,
-                    self.transport
-                        .fetch_module_range(peer, store_id, root, offset, len),
-                )
-                .await;
-                match fetched {
-                    Ok(Ok(bytes))
-                        if bytes.len() as u64 == len && &sha256_hex(&bytes) == expected_hash =>
-                    {
-                        return Ok(bytes);
-                    }
-                    // Wrong length, wrong hash, transport error, or timeout — this holder is not a
-                    // trustworthy source for this chunk; try the next.
-                    _ => continue,
+                let peer = providers[(index + step) % count].provider_peer_id.clone();
+                match self
+                    .fetch_chunk_from(&peer, store_id, root, offset, len, expected_hash)
+                    .await
+                {
+                    Ok(bytes) => return Ok(bytes),
+                    Err(reason) => reasons.record(&peer, reason),
                 }
             }
             if relocated {
-                return Err(DownloadError::NoProviders { needed: 1 });
+                return Err(DownloadError::NotFound {
+                    content: format!(
+                        "fetchModuleRange failed for chunk {index} ([{offset}, {}) of module {}) on \
+                         all {count} known holder(s) — {reasons}",
+                        offset + len,
+                        module_download_key(store_id, root),
+                    ),
+                });
             }
             // Every known holder failed this chunk — ask the DHT for more before giving up.
             let content =
@@ -315,6 +340,50 @@ impl ModuleDownloader {
             merge_new_providers(providers, refreshed);
             relocated = true;
         }
+    }
+
+    /// Fetch and attribute ONE chunk from ONE holder, returning either the verified bytes or a named
+    /// reason this holder could not serve it.
+    ///
+    /// A frame that overshoots the requested window is CLIPPED to it, never rejected: a holder
+    /// legitimately answers at its own chunk granularity (the §2.2 clip contract,
+    /// [`assemble_range_stream`](crate::source::assemble_range_stream), #836). Only bytes that both
+    /// fill the window and hash to `expected_hash` are accepted.
+    async fn fetch_chunk_from(
+        &self,
+        peer: &str,
+        store_id: &str,
+        root: &str,
+        offset: u64,
+        len: u64,
+        expected_hash: &str,
+    ) -> Result<Vec<u8>, String> {
+        let fetched = tokio::time::timeout(
+            self.config.range_timeout,
+            self.transport
+                .fetch_module_range(peer, store_id, root, offset, len),
+        )
+        .await;
+
+        let mut bytes = match fetched {
+            Ok(Ok(bytes)) => bytes,
+            Ok(Err(e)) => return Err(format!("transport: {e}")),
+            Err(_) => return Err(format!("timed out after {:?}", self.config.range_timeout)),
+        };
+
+        if bytes.len() as u64 > len {
+            bytes.truncate(len as usize); // CLIP — a chunk-granular holder is legitimate.
+        }
+        if bytes.len() as u64 != len {
+            return Err(format!(
+                "short range: wanted {len} bytes, got {}",
+                bytes.len()
+            ));
+        }
+        if sha256_hex(&bytes) != expected_hash {
+            return Err("chunk hash mismatch".to_string());
+        }
+        Ok(bytes)
     }
 
     /// Load the resume checkpoint for `key`, or a fresh one if none exists / the persisted generation
@@ -336,29 +405,83 @@ impl ModuleDownloader {
         }
     }
 
-    /// Read each already-verified chunk back from the sink's staging area into `blob`, marking it
-    /// `done` so it is not re-fetched. A sink that cannot read back (or a short read) leaves the chunk
-    /// NOT done, so it is re-fetched — resume is an optimization, never a correctness dependency.
+    /// Read each already-checkpointed chunk back from the sink's staging area into `blob`, marking it
+    /// `done` so it is not re-fetched.
+    ///
+    /// A staged chunk is RE-ATTRIBUTED against `chunk_hashes` exactly like a freshly-fetched one: the
+    /// staging file is not a trusted input (it survives a crash, another process, and bit-rot), so a
+    /// resumed pull must not inherit corruption it can no longer localize. A chunk that cannot be read
+    /// back, reads short, or fails its hash is left NOT done and simply re-fetched, and the checkpoint
+    /// is corrected to match — resume is an optimization, never a correctness dependency (#1605).
     async fn rehydrate_done_chunks(
         &self,
         sink: &dyn Sink,
+        info: &ModuleInfo,
         layout: &ChunkPlan,
-        state: &DownloadState,
+        state: &mut DownloadState,
         blob: &mut [u8],
         done: &mut [bool],
     ) {
-        for &index in &state.done_ranges {
+        for index in std::mem::take(&mut state.done_ranges) {
             if index >= layout.chunk_count() {
                 continue;
             }
             let (offset, len) = layout.chunk_span(index);
-            if let Ok(bytes) = sink.read_at(offset, len).await {
-                if bytes.len() as u64 == len {
-                    blob[offset as usize..(offset + len) as usize].copy_from_slice(&bytes);
-                    done[index] = true;
-                }
+            let Ok(bytes) = sink.read_at(offset, len).await else {
+                continue;
+            };
+            if bytes.len() as u64 != len || sha256_hex(&bytes) != info.chunk_hashes[index] {
+                tracing::warn!(
+                    chunk = index,
+                    offset,
+                    "staged chunk failed re-attribution on resume; re-fetching"
+                );
+                continue;
             }
+            blob[offset as usize..(offset + len) as usize].copy_from_slice(&bytes);
+            done[index] = true;
+            state.mark_done(index);
         }
+    }
+}
+
+/// Why each holder could not serve a step, accumulated so the terminal error explains the failure
+/// instead of swallowing it (#836). Holder ids are sentinelled — a `provider_peer_id` is free-form
+/// text off the wire, and a log an attacker can write is not evidence (#1603).
+#[derive(Debug, Default)]
+struct HolderReasons(Vec<String>);
+
+impl HolderReasons {
+    /// Record `reason` against `peer`, and trace it as it happens (per-holder visibility even when a
+    /// later holder succeeds and no error is ever returned).
+    fn record(&mut self, peer: &str, reason: impl std::fmt::Display) {
+        let peer = hex64_or_sentinel(peer, "peer-id");
+        tracing::debug!(%peer, %reason, "module pull: holder rejected");
+        self.0.push(format!("{peer}: {reason}"));
+    }
+}
+
+impl std::fmt::Display for HolderReasons {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.0.is_empty() {
+            return f.write_str("no holder reasons recorded");
+        }
+        write!(f, "reasons: [{}]", self.0.join("; "))
+    }
+}
+
+/// Render an untrusted identifier for a log or an error message: the lowercase 64-hex value if it IS
+/// canonical 64-hex, else `<non-canonical-{label}>`.
+///
+/// Peer ids and the descriptor's hashes are peer-supplied free-form strings. Echoing them verbatim
+/// lets a hostile holder inject newlines, markup, or forged log lines into the node's own diagnostics
+/// — so a non-canonical value never reaches the output (#1603).
+fn hex64_or_sentinel(value: &str, label: &str) -> String {
+    let canonical = value.len() == 64 && value.chars().all(|c| c.is_ascii_hexdigit());
+    if canonical {
+        value.to_ascii_lowercase()
+    } else {
+        format!("<non-canonical-{label}>")
     }
 }
 
@@ -372,10 +495,20 @@ struct ChunkPlan {
 
 impl ChunkPlan {
     /// Validate a [`ModuleInfo`] and derive its chunk plan. The descriptor MUST carry `chunk_lens`
-    /// (required for the byte→chunk mapping), have one length per `chunk_hashes` entry, and have the
-    /// lengths sum to `total_size` — otherwise the per-chunk fail-closed check is unimplementable and
-    /// the descriptor is rejected.
-    fn from_info(info: &ModuleInfo) -> Result<Self, DownloadError> {
+    /// (required for the byte→chunk mapping), have one length per `chunk_hashes` entry, have the
+    /// lengths sum to `total_size` — otherwise the per-chunk fail-closed check is unimplementable —
+    /// and declare no more than `max_module_size` bytes.
+    ///
+    /// The size bound is checked FIRST and before any allocation: the descriptor comes from an
+    /// untrusted holder and `total_size` sizes the puller's assembly buffer, so an unbounded declared
+    /// size is a one-message memory-exhaustion attack.
+    fn from_info(info: &ModuleInfo, max_module_size: u64) -> Result<Self, DownloadError> {
+        if info.total_size > max_module_size {
+            return Err(DownloadError::Verify(VerifyError::Metadata(format!(
+                "declared module total_size {} exceeds the maximum {max_module_size}",
+                info.total_size
+            ))));
+        }
         let chunk_lens = info.chunk_lens.clone();
         if chunk_lens.is_empty() {
             return Err(DownloadError::Verify(VerifyError::Metadata(
@@ -562,7 +695,10 @@ mod tests {
             .download(&store_id, &root, &sink)
             .await
             .expect_err("interrupted pull fails before finalize");
-        assert!(matches!(err, DownloadError::NoProviders { .. }));
+        assert!(
+            matches!(err, DownloadError::NotFound { .. }),
+            "exhaustion is terminal and names its step: {err}"
+        );
         assert!(
             !sink.is_finalized().await,
             "an incomplete pull is never finalized"
@@ -661,7 +797,10 @@ mod tests {
             .download(&store_id, &root, &sink)
             .await
             .unwrap_err();
-        assert!(matches!(err, DownloadError::NoProviders { .. }));
+        assert!(
+            matches!(err, DownloadError::NotFound { .. }),
+            "no honest source left is terminal: {err}"
+        );
         assert!(
             !sink.is_finalized().await,
             "tampered content is never written through"
@@ -751,6 +890,267 @@ mod tests {
         assert!(matches!(err, DownloadError::NotFound { .. }));
     }
 
+    /// §2.2 CLIP CONTRACT — a holder that answers at CHUNK granularity returns MORE bytes than the
+    /// requested window. That is legitimate (dig-download 0.7.4, #836), so the puller must clip the
+    /// frame to the window and keep using the holder — NOT reject it as a length liar. Rejecting here
+    /// would make every chunk-granular server unusable and starve the pull.
+    #[tokio::test]
+    async fn an_over_long_range_is_clipped_not_rejected() {
+        let store_id = hex_id(0xD1);
+        let root = hex_id(0xD2);
+        let module = b"a chunk-granular holder overserves every window".to_vec();
+
+        let transport = Arc::new(
+            MockModuleTransport::serving(&store_id, &root, module.clone(), 8).overserving(),
+        );
+        let downloader = ModuleDownloader::new(
+            locator_with(1, &store_id, &root),
+            transport,
+            Arc::new(AcceptAnyModuleAnchor),
+            Arc::new(InMemoryStateStore::new()),
+            ModuleDownloadConfig::default(),
+        );
+        let sink = InMemorySink::new();
+
+        let len = downloader
+            .download(&store_id, &root, &sink)
+            .await
+            .expect("an over-long frame is clipped, so the pull completes");
+        assert_eq!(len, module.len() as u64);
+        assert_eq!(
+            sink.contents().await,
+            module,
+            "clipped to exactly the requested window — no bleed-through of the extra bytes"
+        );
+        assert!(sink.is_finalized().await);
+    }
+
+    /// #836 — a swallowed transport reason re-surfacing as an unrelated message cost six blind
+    /// diagnosis iterations. When the holder set is exhausted the terminal error MUST name the failing
+    /// STEP and carry the per-holder reasons, so the log alone explains the failure.
+    #[tokio::test]
+    async fn exhausted_holders_name_the_failing_step_and_the_reasons() {
+        let store_id = hex_id(0xE1);
+        let root = hex_id(0xE2);
+        let peer1 = crate::testkit::mock_peer_hex(1);
+        let transport = Arc::new(
+            MockModuleTransport::serving(
+                &store_id,
+                &root,
+                b"nobody serves this honestly".to_vec(),
+                8,
+            )
+            .tampering(&peer1),
+        );
+        let downloader = ModuleDownloader::new(
+            locator_with(1, &store_id, &root),
+            transport,
+            Arc::new(AcceptAnyModuleAnchor),
+            Arc::new(InMemoryStateStore::new()),
+            ModuleDownloadConfig::default(),
+        );
+        let sink = InMemorySink::new();
+
+        let message = downloader
+            .download(&store_id, &root, &sink)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            message.contains("fetchModuleRange"),
+            "names the step that failed: {message}"
+        );
+        assert!(
+            message.contains("chunk 0"),
+            "names the chunk that could not be fetched: {message}"
+        );
+        assert!(
+            message.contains("chunk hash mismatch"),
+            "carries the per-holder reason instead of swallowing it: {message}"
+        );
+        assert!(
+            message.contains(&peer1),
+            "attributes the reason to a holder"
+        );
+    }
+
+    /// A hostile `getModuleInfo` descriptor declares a `total_size` the puller would allocate an
+    /// assembly buffer for. Without a bound, one lying holder can OOM the node — so the declared size
+    /// is refused against a configured cap BEFORE any allocation.
+    #[tokio::test]
+    async fn an_oversized_declared_module_is_refused_before_allocation() {
+        let store_id = hex_id(0xF1);
+        let root = hex_id(0xF2);
+        let transport = Arc::new(
+            MockModuleTransport::serving(&store_id, &root, b"small blob, huge lie".to_vec(), 8)
+                .declaring_total_size(64 * 1024 * 1024 * 1024),
+        );
+        let downloader = ModuleDownloader::new(
+            locator_with(1, &store_id, &root),
+            transport,
+            Arc::new(AcceptAnyModuleAnchor),
+            Arc::new(InMemoryStateStore::new()),
+            ModuleDownloadConfig {
+                max_module_size: 1024,
+                ..ModuleDownloadConfig::default()
+            },
+        );
+        let sink = InMemorySink::new();
+
+        let err = downloader
+            .download(&store_id, &root, &sink)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, DownloadError::Verify(_)),
+            "an over-cap descriptor is a verify failure: {err}"
+        );
+        assert!(
+            err.to_string().contains("exceeds the maximum"),
+            "names the bound it broke: {err}"
+        );
+        assert!(!sink.is_finalized().await);
+    }
+
+    /// #1605 — a crash-RESUMED pull must not trust its own staging bytes. A chunk read back from
+    /// staging is re-attributed against `chunk_hashes` exactly like a freshly-fetched one, so a
+    /// staging file corrupted between runs is RE-FETCHED and the pull still completes correctly
+    /// (rather than assembling corruption and dying at the whole-blob gate with no way forward).
+    #[tokio::test]
+    async fn a_corrupted_staged_chunk_is_re_fetched_on_resume() {
+        let store_id = hex_id(0xA1);
+        let root = hex_id(0xA2);
+        let module = (0u8..40).collect::<Vec<u8>>(); // 40 bytes / 8 = 5 chunks
+        let state_store = Arc::new(InMemoryStateStore::new());
+        let sink = InMemorySink::new();
+
+        // First pass: 2 chunks land, then the source starves.
+        let interrupted = Arc::new(
+            MockModuleTransport::serving(&store_id, &root, module.clone(), 8)
+                .with_success_budget(2),
+        );
+        ModuleDownloader::new(
+            locator_with(1, &store_id, &root),
+            interrupted,
+            Arc::new(AcceptAnyModuleAnchor),
+            state_store.clone(),
+            ModuleDownloadConfig::default(),
+        )
+        .download(&store_id, &root, &sink)
+        .await
+        .expect_err("interrupted pull fails before finalize");
+
+        // Corrupt the staged bytes of chunk 0 behind the puller's back (bit-rot / tampering with the
+        // staging file between runs).
+        sink.write_at(0, &[0xFF; 8])
+            .await
+            .expect("staging is writable");
+
+        let healthy = Arc::new(MockModuleTransport::serving(
+            &store_id,
+            &root,
+            module.clone(),
+            8,
+        ));
+        let len = ModuleDownloader::new(
+            locator_with(1, &store_id, &root),
+            healthy.clone(),
+            Arc::new(AcceptAnyModuleAnchor),
+            state_store,
+            ModuleDownloadConfig::default(),
+        )
+        .download(&store_id, &root, &sink)
+        .await
+        .expect("resume detects the corrupt staged chunk and re-fetches it");
+
+        assert_eq!(len, module.len() as u64);
+        assert_eq!(
+            sink.contents().await,
+            module,
+            "the corrupted staged chunk was replaced with honest bytes"
+        );
+        let refetched: BTreeSet<u64> = healthy
+            .fetches()
+            .await
+            .into_iter()
+            .map(|(_, o)| o)
+            .collect();
+        assert!(
+            refetched.contains(&0),
+            "the corrupt chunk was re-fetched: {refetched:?}"
+        );
+        assert!(
+            !refetched.contains(&8),
+            "the still-valid staged chunk was NOT re-fetched: {refetched:?}"
+        );
+    }
+
+    /// #1603 — `ProviderRecord::provider_peer_id` is free-form text off the wire, so a hostile holder
+    /// can publish arbitrary content there. It must never reach an error/log verbatim; a non-canonical
+    /// id is replaced by a sentinel. A log an attacker can write is not evidence.
+    #[tokio::test]
+    async fn a_non_canonical_peer_id_is_sentinelled_not_echoed() {
+        let store_id = hex_id(0xB1);
+        let root = hex_id(0xB2);
+        let hostile = "not-hex <script>alert(1)</script>\n[FATAL] forged log line";
+        let content = module_content_id(&store_id, &root).unwrap();
+        let locator = Arc::new(MockProviderLocator::fixed(vec![
+            crate::testkit::mock_provider_with_peer_id(hostile, &content),
+        ]));
+
+        // The transport rejects everything, so every failure reason mentions the holder.
+        let transport = Arc::new(MockModuleTransport::serving(
+            "unrelated-store",
+            &root,
+            vec![1, 2, 3],
+            8,
+        ));
+        let downloader = ModuleDownloader::new(
+            locator,
+            transport,
+            Arc::new(AcceptAnyModuleAnchor),
+            Arc::new(InMemoryStateStore::new()),
+            ModuleDownloadConfig::default(),
+        );
+        let sink = InMemorySink::new();
+
+        let message = downloader
+            .download(&store_id, &root, &sink)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            !message.contains("<script>") && !message.contains("[FATAL]"),
+            "peer-supplied text is never echoed: {message}"
+        );
+        assert!(
+            message.contains("non-canonical-peer-id"),
+            "a sentinel stands in for it: {message}"
+        );
+    }
+
+    /// A peer-supplied hash from the descriptor is equally untrusted text and equally sentinelled when
+    /// it is reported in the whole-blob mismatch message.
+    #[test]
+    fn untrusted_hex_is_sentinelled() {
+        let canonical = "ab".repeat(32);
+        assert_eq!(hex64_or_sentinel(&canonical, "peer-id"), canonical);
+        assert_eq!(
+            hex64_or_sentinel("AB".repeat(32).as_str(), "peer-id"),
+            "ab".repeat(32),
+            "canonical form is lowercase"
+        );
+        assert_eq!(
+            hex64_or_sentinel("short", "peer-id"),
+            "<non-canonical-peer-id>"
+        );
+        assert_eq!(
+            hex64_or_sentinel("zz".repeat(32).as_str(), "hash"),
+            "<non-canonical-hash>"
+        );
+    }
+
     #[test]
     fn malformed_ids_are_not_downloadable() {
         assert!(module_content_id("too-short", &hex_id(1)).is_none());
@@ -773,7 +1173,7 @@ mod tests {
             chunk_hashes: vec!["cd".repeat(32)],
             chunk_lens: vec![5],
         };
-        assert!(ChunkPlan::from_info(&bad).is_err());
+        assert!(ChunkPlan::from_info(&bad, DEFAULT_MAX_MODULE_SIZE).is_err());
 
         // missing chunk_lens
         let no_lens = ModuleInfo {
@@ -782,7 +1182,7 @@ mod tests {
             chunk_hashes: vec!["cd".repeat(32)],
             chunk_lens: vec![],
         };
-        assert!(ChunkPlan::from_info(&no_lens).is_err());
+        assert!(ChunkPlan::from_info(&no_lens, DEFAULT_MAX_MODULE_SIZE).is_err());
 
         // chunk_hashes / chunk_lens length disagree
         let mismatched = ModuleInfo {
@@ -791,6 +1191,6 @@ mod tests {
             chunk_hashes: vec!["cd".repeat(32), "ef".repeat(32)],
             chunk_lens: vec![5],
         };
-        assert!(ChunkPlan::from_info(&mismatched).is_err());
+        assert!(ChunkPlan::from_info(&mismatched, DEFAULT_MAX_MODULE_SIZE).is_err());
     }
 }

@@ -43,3 +43,33 @@ frames it. Clip an over-long frame to the window and stop once the window is ful
 protects memory); reserve the error for a frame starting at or beyond the window, whose bytes cannot
 belong to the range at all. Any request/response boundary where the two sides have different natural
 granularity wants the same shape.
+
+## A resume that trusts its own staging file inherits corruption it can no longer localize
+
+The obvious resume is: read the already-verified chunks back from the staging file, mark them done, fetch
+only the rest. That treats staging as a trusted input — and it is not one. It outlives the process, is
+reachable by anything else on the host, and is subject to plain bit-rot; the whole reason it exists is
+that the pull was interrupted.
+
+If a staged chunk is corrupted between runs, a trusting resume assembles the corruption, and the only
+thing that notices is the whole-blob gate at the very end. That gate is fail-closed, so nothing bad is
+SERVED — but the pull can never succeed again either, because the engine has no idea WHICH chunk is bad
+and re-fetches nothing. Every subsequent resume fails identically. A fail-closed check that cannot
+localize its failure turns transient corruption into a permanent dead download.
+
+The fix is cheap because the descriptor already carries per-chunk hashes: re-attribute a rehydrated chunk
+against `chunk_hashes` exactly like a freshly-fetched one, and on mismatch simply leave it not-done and
+correct the checkpoint. Resume stays a pure optimization. Rule: a resume path may skip WORK, never a
+CHECK — and the check it must keep is the one fine-grained enough to say what to redo.
+
+## An untrusted descriptor that sizes a buffer is an allocation primitive for an attacker
+
+`ModuleInfo.total_size` arrives from one peer over `getModuleInfo` and is exactly what the puller
+allocates its assembly buffer from. With no bound, a single well-formed RPC reply naming 2^40 bytes makes
+the node allocate until the OS kills it — no bytes transferred, no crypto broken, one message. The
+descriptor's own self-consistency checks do not help: a liar makes the final `chunk_lens` entry match.
+
+Any field that crosses a trust boundary and then feeds `Vec::with_capacity` / `vec![0; n]` / a
+pre-allocated file needs a configured ceiling checked BEFORE the allocation, not a sanity check after it.
+The bound belongs in config (callers legitimately differ) with a documented default sized to the real
+artifact — here 8 GiB against capsules measured in megabytes.
