@@ -94,6 +94,18 @@ impl ResourceHasher {
     }
 }
 
+/// The default ceiling on a peer-DECLARED resource `total_length` — 512 MiB, the resource-side
+/// counterpart of [`DEFAULT_MAX_MODULE_SIZE`](crate::module::DEFAULT_MAX_MODULE_SIZE).
+///
+/// The first frame's declared length sizes everything downstream of it (the plan, and the assembler's
+/// per-range buffer), and it arrives from a peer that has proven nothing yet, so it MUST be bounded
+/// before it is believed. Like the module bound, it is deliberately sized to what a modest host can
+/// actually hold rather than to the largest conceivable resource: a ceiling above real host memory
+/// bounds nothing. A deployment that genuinely reads larger resources raises
+/// [`DownloadConfig::max_resource_size`](crate::DownloadConfig::max_resource_size) explicitly, having
+/// sized the host for it.
+pub const DEFAULT_MAX_RESOURCE_SIZE: u64 = 512 * 1024 * 1024;
+
 /// The trusted per-resource metadata a download verifies every range against: the chunk boundaries,
 /// the total length, the chain-anchored generation `root`, and (for a resource, not a capsule) the
 /// whole-resource `inclusion_proof`.
@@ -116,15 +128,59 @@ pub struct ResourceCommitment {
 }
 
 impl ResourceCommitment {
-    /// Build a commitment from first-frame verification metadata. Validates that `chunk_lens` sums to
-    /// `total_length` (a peer that reports inconsistent metadata is rejected up front).
+    /// Build a commitment from first-frame verification metadata, bounded by
+    /// [`DEFAULT_MAX_RESOURCE_SIZE`].
+    ///
+    /// Equivalent to [`from_first_frame_bounded`](Self::from_first_frame_bounded) with the default
+    /// ceiling — see it for what the bound defends against.
     pub fn from_first_frame(
         total_length: u64,
         chunk_lens: Vec<u64>,
         root: Option<String>,
         inclusion_proof: Option<String>,
     ) -> Result<Self, VerifyError> {
-        let layout = ChunkLayout::new(chunk_lens);
+        Self::from_first_frame_bounded(
+            total_length,
+            chunk_lens,
+            root,
+            inclusion_proof,
+            DEFAULT_MAX_RESOURCE_SIZE,
+        )
+    }
+
+    /// Build a commitment from first-frame verification metadata, refusing a declared
+    /// `total_length` above `max_resource_size`.
+    ///
+    /// Validates that `chunk_lens` sums to `total_length` with CHECKED arithmetic (a peer reporting
+    /// inconsistent metadata is rejected up front) — and, BEFORE that, that the declared length is
+    /// within the ceiling.
+    ///
+    /// The ceiling is load-bearing, not hygiene. `total_length` and the individual `chunk_lens` come
+    /// from the first frame of a peer that has not proven anything yet, and they SIZE the download: a
+    /// single chunk becomes at least one whole [`Range`](crate::plan::Range) regardless of the window,
+    /// and the range assembler then buffers up to that length. So an unbounded declared length is a
+    /// one-frame memory-exhaustion primitive: a peer answering the metadata probe with
+    /// `total_length: 2^40, chunk_lens: [2^40]` makes the client try to buffer a terabyte. Bounding it
+    /// here — before any layout or plan exists — is what keeps that a rejection instead of an
+    /// allocation. (The range assembler's own reservation is additionally FALLIBLE, so even a
+    /// within-ceiling length that this host cannot hold is a recoverable error rather than an
+    /// uncatchable abort.)
+    pub fn from_first_frame_bounded(
+        total_length: u64,
+        chunk_lens: Vec<u64>,
+        root: Option<String>,
+        inclusion_proof: Option<String>,
+        max_resource_size: u64,
+    ) -> Result<Self, VerifyError> {
+        if total_length > max_resource_size {
+            return Err(VerifyError::Metadata(format!(
+                "declared total_length {total_length} exceeds the maximum {max_resource_size}"
+            )));
+        }
+        // The lengths came off the wire, so the layout is built with the CHECKED, bounded, fallible
+        // constructor: a saturating sum would let `[1, u64::MAX]` match a declared `u64::MAX` total and
+        // pass the consistency check below as if it were a real resource (#1608).
+        let layout = ChunkLayout::try_new(chunk_lens)?;
         if layout.total_length() != total_length {
             return Err(VerifyError::Metadata(format!(
                 "chunk_lens sum {} != total_length {}",
@@ -320,7 +376,14 @@ impl Verifier for MerkleVerifier {
                 actual: bytes.len() as u64,
             });
         }
-        let start = first_chunk_index as usize;
+        // EXPLICIT conversion, not `as usize`: on a 32-bit target a truncating cast maps an absurd
+        // chunk index onto a VALID one, turning a rejection into a check against the wrong chunk. A
+        // library cannot delegate this to a profile flag (#1608).
+        let start = usize::try_from(first_chunk_index).map_err(|_| {
+            VerifyError::Alignment(format!(
+                "chunk_index {first_chunk_index} does not fit this platform's address space"
+            ))
+        })?;
         let layout = &commitment.layout;
         if start >= layout.chunk_count() {
             return Err(VerifyError::Alignment(format!(
@@ -501,14 +564,45 @@ mod tests {
                 actual: 10
             })
         ));
-        // A too-LONG boundary-aligned range (extra whole chunk) is likewise rejected on length.
-        assert!(matches!(
-            v.verify_range(&c, 0, 10, &[0u8; 30]),
-            Err(VerifyError::Length {
-                expected: 10,
-                actual: 30
-            })
-        ));
+    }
+
+    /// The #836 class, one layer up: an over-long chunk-granular answer is a holder's LEGITIMATE
+    /// granularity (§2.2), not a protocol violation — asserting otherwise is what defended the read-leg
+    /// defect through six investigations.
+    ///
+    /// [`Verifier::verify_range`] receives bytes that [`assemble_range_stream`] has already CLIPPED to
+    /// the requested window, so its exact-length check is a check on the ASSEMBLED range, not a verdict
+    /// on what the holder streamed. This asserts the property that actually matters, at the layer that
+    /// owns the freedom: a 30-byte answer to a 10-byte window, once clipped, VERIFIES. `RangeTransport`
+    /// is a public trait and dig-node injects its own verifier, so any feeder that clips first must find
+    /// this path open.
+    #[tokio::test]
+    async fn an_over_long_chunk_granular_answer_verifies_once_clipped() {
+        let c = commitment(vec![10, 20, 5]);
+        let v = MerkleVerifier::insecure_structural_only();
+
+        // A chunk-granular holder answers a 10-byte window with a whole 30-byte span.
+        let over_long = dig_nat::RangeFrame {
+            offset: 0,
+            length: 30,
+            bytes: vec![0u8; 30],
+            complete: true,
+            total_length: Some(35),
+            chunk_lens: Some(vec![10, 20, 5]),
+            chunk_index: Some(0),
+            root: None,
+            inclusion_proof: None,
+        };
+        let mut stream = std::io::Cursor::new(over_long.encode());
+        let (clipped, _meta) = crate::source::assemble_range_stream(&mut stream, 10)
+            .await
+            .expect("an over-long frame is clipped, never rejected");
+
+        assert_eq!(clipped.len(), 10, "clipped to the requested window");
+        assert!(
+            v.verify_range(&c, 0, 10, &clipped).is_ok(),
+            "a clipped chunk-granular answer verifies — the holder's granularity is not a violation"
+        );
     }
 
     #[test]
@@ -595,5 +689,53 @@ mod tests {
         let leaf = MerkleVerifier::resource_leaf(b"hello");
         let expect: [u8; 32] = Sha256::digest(b"hello").into();
         assert_eq!(leaf, expect);
+    }
+
+    /// #1608 — a library's own `[profile.release] overflow-checks` protects NOTHING (only the ROOT
+    /// package's profile applies), so a validator that leans on wrapping/saturating arithmetic for
+    /// hostile-input safety is silently unsound in a consumer build. Here the hostile descriptor is
+    /// `{ total_length: u64::MAX, chunk_lens: [1, u64::MAX] }`: a SATURATING sum lands on exactly
+    /// u64::MAX, equals the declared total, and the commitment is ACCEPTED — the plan then covers
+    /// spans no resource can have. The arithmetic must be CHECKED and the overflow a typed rejection.
+    #[test]
+    fn a_saturating_chunk_len_sum_cannot_pass_as_a_consistent_commitment() {
+        // Bounded with a ceiling ABOVE the declared total, so the size bound cannot be what rejects it
+        // and the CHECKED arithmetic is the thing under test.
+        let err = ResourceCommitment::from_first_frame_bounded(
+            u64::MAX,
+            vec![1, u64::MAX],
+            None,
+            None,
+            u64::MAX,
+        )
+        .expect_err("an overflowing chunk layout is refused");
+        assert!(
+            err.to_string().contains("overflow"),
+            "names the arithmetic it broke: {err}"
+        );
+        // And under the DEFAULT ceiling the same descriptor is refused on size, before any arithmetic.
+        let err = ResourceCommitment::from_first_frame(u64::MAX, vec![1, u64::MAX], None, None)
+            .expect_err("an absurd declared total_length is refused");
+        assert!(
+            err.to_string().contains("exceeds the maximum"),
+            "names the bound it broke: {err}"
+        );
+    }
+
+    /// The declared chunk COUNT sizes the layout's own vectors, so it is bounded before allocation —
+    /// the same one-message allocation attack as an absurd declared length.
+    #[test]
+    fn an_absurd_resource_chunk_count_is_refused() {
+        let err = ResourceCommitment::from_first_frame(
+            0,
+            vec![0; crate::plan::MAX_RESOURCE_CHUNK_COUNT + 1],
+            None,
+            None,
+        )
+        .expect_err("an over-cap chunk count is refused");
+        assert!(
+            err.to_string().contains("exceeds the maximum"),
+            "names the bound it broke: {err}"
+        );
     }
 }

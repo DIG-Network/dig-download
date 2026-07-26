@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use tokio::sync::Mutex;
+use std::sync::Mutex;
 
 use crate::error::DownloadError;
 use crate::sink::{STATE_SUFFIX, TMP_SUFFIX};
@@ -27,6 +27,8 @@ use crate::sink::{STATE_SUFFIX, TMP_SUFFIX};
 /// its GC sweep.
 ///
 /// [`Downloader`]: crate::Downloader
+/// The lock is held only for a `HashSet` operation and NEVER across an `await`, so it is a plain
+/// synchronous mutex. That is what lets a claim be released from `Drop` (below), which cannot await.
 #[derive(Debug, Default)]
 pub struct ActiveDownloads {
     protected: Mutex<HashSet<PathBuf>>,
@@ -38,30 +40,82 @@ impl ActiveDownloads {
         ActiveDownloads::default()
     }
 
+    /// The protected set. A POISONED lock is recovered rather than propagated: a panic elsewhere must not
+    /// turn this registry into a permanent per-target denial (every claim would fail forever).
+    fn protected(&self) -> std::sync::MutexGuard<'_, HashSet<PathBuf>> {
+        self.protected.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Mark `path` as belonging to an active/paused-resumable download (GC will skip it).
+    ///
+    /// Idempotent and silent about collisions — protection only. A caller that needs EXCLUSIVITY (the
+    /// normal case for a download) uses [`claim`](Self::claim).
     pub async fn register(&self, path: impl Into<PathBuf>) {
-        self.protected.lock().await.insert(path.into());
+        self.protected().insert(path.into());
+    }
+
+    /// Claim `path` EXCLUSIVELY for as long as the returned [`StagingClaim`] lives, or `None` if a live
+    /// download already holds it.
+    ///
+    /// A staging area is written by absolute offset and shared by nothing else, so two concurrent
+    /// downloads of one target write over each other, share one resume checkpoint, and can `truncate`
+    /// each other's bytes away; since per-range verification is structural, a sibling's right-length
+    /// bytes are indistinguishable from this download's own. So a download CLAIMS its staging path and
+    /// refuses to start rather than share it.
+    ///
+    /// The claim is an RAII guard because a LEAKED claim is itself a denial primitive: the path would
+    /// stay GC-exempt AND un-downloadable forever. A guard releases on every exit — including an
+    /// unwinding panic, which `tokio::spawn` would otherwise absorb while leaving the claim behind.
+    pub fn claim(self: &Arc<Self>, path: impl Into<PathBuf>) -> Option<StagingClaim> {
+        let path = path.into();
+        if !self.protected().insert(path.clone()) {
+            return None;
+        }
+        Some(StagingClaim {
+            registry: Arc::clone(self),
+            path,
+        })
     }
 
     /// Release `path` — it is no longer protected and becomes GC-eligible once stale (called on
-    /// finalize or deliberate abandonment).
+    /// finalize or deliberate abandonment). A [`StagingClaim`] does this on drop.
     pub async fn unregister(&self, path: &Path) {
-        self.protected.lock().await.remove(path);
+        self.protected().remove(path);
     }
 
     /// Whether `path` is currently protected.
     pub async fn is_protected(&self, path: &Path) -> bool {
-        self.protected.lock().await.contains(path)
+        self.protected().contains(path)
     }
 
     /// The number of currently-protected staging paths.
     pub async fn len(&self) -> usize {
-        self.protected.lock().await.len()
+        self.protected().len()
     }
 
     /// Whether the registry is empty.
     pub async fn is_empty(&self) -> bool {
-        self.protected.lock().await.is_empty()
+        self.protected().is_empty()
+    }
+}
+
+/// An exclusive hold on one staging path, released on drop — see [`ActiveDownloads::claim`].
+#[derive(Debug)]
+pub struct StagingClaim {
+    registry: Arc<ActiveDownloads>,
+    path: PathBuf,
+}
+
+impl StagingClaim {
+    /// The claimed staging path.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for StagingClaim {
+    fn drop(&mut self) {
+        self.registry.protected().remove(&self.path);
     }
 }
 
@@ -293,6 +347,61 @@ mod tests {
         assert_eq!(
             sidecar_state_path(&tmp),
             PathBuf::from("/data/x.dig.download.tmp.state")
+        );
+    }
+
+    /// A claim releases on EVERY exit, including an unwinding PANIC.
+    ///
+    /// `tokio::spawn` absorbs a panic, so a manual register/unregister pair would leave the claim behind:
+    /// that staging path would be permanently GC-exempt AND permanently un-downloadable, since every
+    /// later download hits the exclusivity refusal. The guard turning into the denial it prevents is why
+    /// this is RAII.
+    #[tokio::test]
+    async fn a_claim_is_released_even_when_its_holder_panics() {
+        let registry = Arc::new(ActiveDownloads::new());
+        let path = PathBuf::from("/downloads/resource.dig.download.tmp");
+
+        let holder = registry.clone();
+        let claimed = path.clone();
+        let panicked = tokio::spawn(async move {
+            let _claim = holder.claim(claimed).expect("the first claim succeeds");
+            panic!("the download task dies mid-flight");
+        })
+        .await;
+        assert!(panicked.is_err(), "the task really did panic");
+
+        assert!(
+            !registry.is_protected(&path).await,
+            "the claim was released by unwinding, so GC is not blocked forever"
+        );
+        assert!(
+            registry.claim(path).is_some(),
+            "and the target is downloadable again — a leaked claim would deny it permanently"
+        );
+    }
+
+    /// A claim is EXCLUSIVE while it lives, and re-claimable once dropped.
+    #[tokio::test]
+    async fn a_claim_is_exclusive_while_held_and_reusable_after() {
+        let registry = Arc::new(ActiveDownloads::new());
+        let path = PathBuf::from("/downloads/x.dig.download.tmp");
+
+        let first = registry.claim(&path).expect("claimed");
+        assert_eq!(first.path(), path.as_path());
+        assert!(
+            registry.claim(&path).is_none(),
+            "a live claim excludes a second download"
+        );
+        assert!(
+            registry.is_protected(&path).await,
+            "and protects it from GC"
+        );
+
+        drop(first);
+        assert!(!registry.is_protected(&path).await);
+        assert!(
+            registry.claim(&path).is_some(),
+            "re-claimable once released"
         );
     }
 }

@@ -53,6 +53,31 @@ jobs:
       - name: Check documentation
         run: cargo doc --locked --no-deps
 
+  # A library's own `[profile.release] overflow-checks` protects NOTHING — only the ROOT package's
+  # profile applies to a build (#1608). So every validator here must be total over hostile input BY
+  # CONSTRUCTION (checked_add / try_fold / usize::try_from), and this job proves it: with the checks
+  # explicitly DISABLED, an arithmetic guard that only ever "worked" because a panic fired is no longer
+  # a guard, and the hostile-descriptor tests that assert a typed REJECTION fail loudly instead.
+  overflow-checks-off:
+    name: Tests with overflow-checks DISABLED
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -C overflow-checks=off -D warnings
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run tests without overflow checks
+        run: cargo test --locked --all
+
   coverage:
     name: Coverage (>=80% lines)
     runs-on: ubuntu-latest

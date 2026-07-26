@@ -71,7 +71,7 @@ use crate::error::{
 };
 use crate::locate::ProviderLocator;
 use crate::progress::{DownloadState, StateStore};
-use crate::sink::Sink;
+use crate::sink::{promote_verified, Sink};
 
 /// The two peer calls the module pull needs, abstracted for testability (in-memory
 /// [`MockModuleTransport`](crate::testkit) in tests; the real dig-nat/dig-peer adapter is wired by
@@ -111,9 +111,35 @@ pub trait ModuleTransport: Send + Sync {
 /// root of trust of the module pull (NC-9). dig-node injects the digstore verifier; this crate ships
 /// only the explicitly-opt-in, fail-OPEN [`AcceptAnyModuleAnchor`] for tests.
 pub trait ModuleAnchorVerifier: Send + Sync {
-    /// Return `true` iff `module` is the genuine `.dig` container committed on-chain under
-    /// `(store_id, root)` (i.e. its embedded generation root equals the `getAnchoredRoot` value).
-    fn verify_module_anchor(&self, module: &[u8], store_id: &str, root: &str) -> bool;
+    /// Whether `module` is the genuine `.dig` container committed on-chain under `(store_id, root)`
+    /// (i.e. its embedded generation root equals the `getAnchoredRoot` value).
+    ///
+    /// An implementation that consults the chain MUST report [`ModuleAnchor::Unavailable`] when it
+    /// could not reach an answer, NEVER [`ModuleAnchor::NotAnchored`]. The two are acted on very
+    /// differently: `NotAnchored` is EVIDENCE against the holder that supplied the descriptor and earns
+    /// it a durable demotion, while `Unavailable` is this node's own failure and is terminal for the
+    /// pull. Collapsing them lets a chain-source blip brand every honest holder tried (see
+    /// [`ModuleAnchor`]).
+    fn verify_module_anchor(&self, module: &[u8], store_id: &str, root: &str) -> ModuleAnchor;
+}
+
+/// The three answers a [`ModuleAnchorVerifier`] can give — the reason this is not a `bool`.
+///
+/// A two-valued answer forces an implementation that cannot reach the chain to say "not anchored",
+/// which is a claim about the HOLDER. That mislabels an honest holder serving a correct blob during a
+/// chain-source outage, and the resulting durable verdict then INVERTS the node's descriptor preference
+/// for the whole reputation TTL: remembered honest holders are skipped and unremembered peers — which
+/// is what a sybil is — are asked first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModuleAnchor {
+    /// The blob IS the module committed on-chain under `(store_id, root)`.
+    Anchored,
+    /// The blob is definitively NOT that module — evidence against the descriptor's source.
+    NotAnchored,
+    /// The check could not be completed (chain source unreachable, timeout, malformed local state).
+    /// Says NOTHING about the holder: terminal for the pull, never a verdict. Carries a short reason
+    /// for the terminal error.
+    Unavailable(String),
 }
 
 /// A **fail-OPEN** [`ModuleAnchorVerifier`] that accepts any blob without checking the chain — for
@@ -131,8 +157,8 @@ pub struct AcceptAnyModuleAnchor;
 
 #[cfg(any(test, feature = "testkit"))]
 impl ModuleAnchorVerifier for AcceptAnyModuleAnchor {
-    fn verify_module_anchor(&self, _module: &[u8], _store_id: &str, _root: &str) -> bool {
-        true
+    fn verify_module_anchor(&self, _module: &[u8], _store_id: &str, _root: &str) -> ModuleAnchor {
+        ModuleAnchor::Anchored
     }
 }
 
@@ -243,46 +269,79 @@ impl ModuleDownloader {
         //    WRONG survives every per-chunk check and only dies at the final gates — so its SOURCE is
         //    demoted and the next holder's descriptor tried, rather than the pull going terminal. One
         //    holder winning the `getModuleInfo` race must not be able to deny a capsule's reshare.
-        let mut demoted: Vec<String> = Vec::new();
+        let key = module_download_key(store_id, root);
+        let mut exclusions = DescriptorExclusions::new(self.remembered_verdicts(&key).await);
+        let mut attempts = 0usize;
         loop {
+            // Reputation is consulted, never obeyed to the point of denial: the moment excluding the
+            // remembered holders would leave NOBODY to ask, the memory is dropped for the rest of this
+            // call and every located holder becomes askable again (#1611). This covers the case where
+            // some honest holders are remembered and the liar is not — excluding them, demoting the
+            // liar, and then finding "no usable holder" would deny a pull the network can serve.
+            if exclusions.usable_holders(&providers) == 0 && exclusions.stop_trusting_memory() {
+                tracing::warn!(
+                    holders = providers.len(),
+                    "no holder is left to ask for a descriptor once past verdicts are honoured; \
+                     re-asking every holder rather than letting reputation deny the pull"
+                );
+                continue;
+            }
             let (source, info) = self
-                .fetch_module_info(&providers, &demoted, store_id, root)
+                .fetch_module_info(&providers, &exclusions.excluded(), store_id, root)
                 .await?;
-            match self
+            attempts += 1;
+            let failure = match self
                 .pull_with_descriptor(&info, store_id, root, sink, &mut providers)
                 .await
             {
                 Ok(len) => return Ok(len),
+                // A LOCAL failure — this node's memory, sink, state store, or an anchor check it could
+                // not COMPLETE — ends the pull and attributes nothing to any holder.
                 Err(PullFailure::Terminal(e)) => return Err(e),
-                Err(PullFailure::BadDescriptor(e)) => {
-                    tracing::warn!(
-                        peer = %hex64_or_sentinel(&source, "peer-id"),
-                        error = %e,
-                        "module pull: descriptor source failed a final gate; demoting it and \
-                         re-handshaking with another holder"
-                    );
-                    demoted.push(source);
-                    // Give up when the attempt budget is spent OR no un-demoted holder is left. The
-                    // returned error is the DESCRIPTOR failure, never a "not found": blaming discovery
-                    // for a descriptor lie is exactly the ambiguity that cost four #1586 rounds.
-                    let usable = providers
-                        .iter()
-                        .filter(|p| !demoted.contains(&p.provider_peer_id))
-                        .count();
-                    if demoted.len() >= MAX_DESCRIPTOR_ATTEMPTS || usable == 0 {
-                        return Err(e);
-                    }
-                    // The whole plan came from the demoted holder, so its partial progress is not
-                    // resumable against the next descriptor — drop the checkpoint AND the bytes it
-                    // staged. A demoted plan may have been LONGER than the next one, and a staging
-                    // area is never shortened by writing, so leaving it would let the demoted
-                    // holder's tail survive into a later promotion.
-                    self.state_store
-                        .clear(&module_download_key(store_id, root))
-                        .await?;
-                    sink.truncate(0).await?;
+                Err(failure) => failure,
+            };
+            let proven_false = failure.is_proven_false();
+            tracing::warn!(
+                peer = %hex64_or_sentinel(&source, "peer-id"),
+                error = %failure.error(),
+                proven_false,
+                "module pull: descriptor attempt failed; demoting this source and re-handshaking \
+                 with another holder"
+            );
+            // Only a PROVEN-false descriptor earns a durable verdict. Chunk exhaustion demotes for
+            // this call (that is #1613's point) but carries no evidence the descriptor was false —
+            // the bytes may simply be unavailable, and the peers refusing them need not be the peer
+            // that supplied the descriptor. Persisting it would let sybils that refuse their assigned
+            // chunks brand an HONEST holder for 24 h, per capsule, until only attacker-supplied
+            // descriptors are ever asked for (#1611 security finding).
+            if proven_false {
+                if let Err(store_err) = self.state_store.record_bad_descriptor(&key, &source).await
+                {
+                    tracing::debug!(error = %store_err, "could not persist a bad-descriptor verdict");
                 }
             }
+            exclusions.demote(source);
+            // Give up when THIS call's attempt budget is spent OR no askable holder is left (the
+            // memory has already been dropped above if it was what exhausted them). The budget counts
+            // attempts made here, not the exclusion set — which also carries remembered verdicts that
+            // cost this call nothing. The returned error is the DESCRIPTOR failure, never a "not
+            // found": blaming discovery for a descriptor lie is exactly the ambiguity that cost four
+            // #1586 rounds.
+            if attempts >= MAX_DESCRIPTOR_ATTEMPTS
+                || (exclusions.usable_holders(&providers) == 0 && !exclusions.trusts_memory())
+            {
+                return Err(match failure {
+                    PullFailure::BadDescriptor(e) | PullFailure::UnsatisfiableDescriptor(e) => e,
+                    PullFailure::Terminal(e) => e,
+                });
+            }
+            // The whole plan came from the demoted holder, so its partial progress is not resumable
+            // against the next descriptor — drop the checkpoint AND the bytes it staged. A demoted
+            // plan may have been LONGER than the next one, and a staging area is never shortened by
+            // writing, so leaving it would let the demoted holder's tail survive into a later
+            // promotion.
+            self.state_store.clear(&key).await?;
+            sink.truncate(0).await?;
         }
     }
 
@@ -298,8 +357,7 @@ impl ModuleDownloader {
         sink: &dyn Sink,
         providers: &mut Vec<dig_dht::ProviderRecord>,
     ) -> Result<u64, PullFailure> {
-        let layout = ChunkPlan::from_info(info, self.config.max_module_size)
-            .map_err(PullFailure::BadDescriptor)?;
+        let layout = ChunkPlan::from_info(info, self.config.max_module_size)?;
 
         // Load resume state; a checkpoint for a DIFFERENT generation shape is discarded (never mixed)
         // so a resume re-plans identically to the original.
@@ -318,7 +376,7 @@ impl ModuleDownloader {
         // Assemble into an in-memory blob (the final whole-blob-hash + chain-anchor gate needs the
         // complete bytes). The size is attacker-DECLARED, so the allocation is FALLIBLE: exhaustion
         // must be a `DownloadError`, never the uncatchable abort an infallible `vec![0; n]` produces.
-        let mut blob = try_zeroed_blob(layout.total_size).map_err(PullFailure::BadDescriptor)?;
+        let mut blob = try_zeroed_blob(layout.total_size)?;
         let mut done: Vec<bool> = vec![false; layout.chunk_count()];
         self.rehydrate_done_chunks(sink, info, &layout, &mut state, &mut blob, &mut done)
             .await;
@@ -337,7 +395,16 @@ impl ModuleDownloader {
                 .await
             {
                 Ok(bytes) => bytes,
-                Err(e) => return Err(classify_chunk_exhaustion(e, any_chunk_verified)),
+                // Exhaustion is attributed to the DESCRIPTOR whether or not a chunk has verified: a
+                // liar can buy credibility for one byte, so only the attempt budget may bound the
+                // retry (#1613). A non-recoverable failure (a sink/state fault) stays terminal — it
+                // is the local node failing, not a holder lying.
+                Err(e) if e.is_recoverable() || matches!(e, DownloadError::NotFound { .. }) => {
+                    return Err(PullFailure::UnsatisfiableDescriptor(
+                        describe_chunk_exhaustion(e, any_chunk_verified),
+                    ))
+                }
+                Err(e) => return Err(PullFailure::Terminal(e)),
             };
             any_chunk_verified = true;
             sink.write_at(offset, &bytes).await?;
@@ -357,46 +424,53 @@ impl ModuleDownloader {
                 )),
             )));
         }
-        if !self.anchor.verify_module_anchor(&blob, store_id, root) {
-            return Err(PullFailure::BadDescriptor(DownloadError::Verify(
-                VerifyError::Metadata(format!(
-                    "assembled module is not chain-anchored under ({store_id}, {root})"
-                )),
-            )));
+        match self.anchor.verify_module_anchor(&blob, store_id, root) {
+            ModuleAnchor::Anchored => {}
+            ModuleAnchor::NotAnchored => {
+                return Err(PullFailure::BadDescriptor(DownloadError::Verify(
+                    VerifyError::Metadata(format!(
+                        "assembled module is not chain-anchored under ({store_id}, {root})"
+                    )),
+                )))
+            }
+            // The gate could not reach an answer. That is THIS node's failure, so it is terminal and
+            // earns the holder nothing: branding an honest holder for a chain-source blip would invert
+            // the node's descriptor preference toward unremembered (i.e. sybil) peers for the whole
+            // reputation TTL.
+            ModuleAnchor::Unavailable(reason) => {
+                return Err(PullFailure::Terminal(DownloadError::state(format!(
+                    "cannot verify the chain anchor for ({store_id}, {root}): {}",
+                    sanitize_untrusted_text(&reason, MAX_ERROR_REASON_CHARS)
+                ))))
+            }
         }
 
-        self.promote_verified_module(sink, layout.total_size)
-            .await?;
+        // A promotion refusal is fail-closed AND recoverable: the checkpoint that led here is dropped
+        // with the bytes it describes, so a later pull re-fetches instead of failing identically forever
+        // (a checkpoint can outlive its staging file — GC reaps the `.download.tmp` while the
+        // `StateStore` keeps its record elsewhere). Best-effort: the promotion error is what the caller
+        // must see.
+        if let Err(e) = promote_verified(sink, layout.total_size).await {
+            let _ = self.state_store.clear(&key).await;
+            let _ = sink.truncate(0).await;
+            return Err(PullFailure::Terminal(e));
+        }
         self.state_store.clear(&key).await?;
         Ok(layout.total_size)
     }
 
-    /// Promote the staging area, having PROVEN it holds exactly the bytes the gates above verified.
-    ///
-    /// The gates verify the assembled `blob`; finalize promotes the STAGING AREA — and the two are only
-    /// the same artifact if nothing longer was ever staged. A staging area is written by offset and
-    /// never shortened, so a demoted longer descriptor (or a leftover file from another shape) leaves a
-    /// tail the verified blob does not contain. Promoting that would cache a `.dig` whose SHA-256 is
-    /// not `module_hash` while reporting success — the node would then re-announce itself as a holder
-    /// of content every downstream peer rejects.
-    ///
-    /// So the staging area is SHORTENED to the verified length and the reduction is then CONFIRMED: a
-    /// readable byte at `verified_len` means bytes past the verified end survive, which is fail-closed
-    /// (never promoted). A sink that cannot read back reports "unsupported" here exactly as it does
-    /// elsewhere, in which case the shortening above is the enforcement.
-    async fn promote_verified_module(
-        &self,
-        sink: &dyn Sink,
-        verified_len: u64,
-    ) -> Result<(), DownloadError> {
-        sink.truncate(verified_len).await?;
-        if sink.read_at(verified_len, 1).await.is_ok() {
-            return Err(DownloadError::Verify(VerifyError::Metadata(format!(
-                "staging area holds bytes past the verified length {verified_len}; refusing to \
-                 promote an artifact that is not the verified one"
-            ))));
+    /// The holders this node has already caught supplying a PROVEN-false descriptor for `key` — the
+    /// [`StateStore`]'s remembered reputation, used to start a pull with the known liars already
+    /// demoted instead of re-discovering them (#1611). An unreadable store simply yields none:
+    /// reputation is advisory and must never fail a pull.
+    async fn remembered_verdicts(&self, key: &str) -> Vec<String> {
+        match self.state_store.bad_descriptor_peers(key).await {
+            Ok(peers) => peers,
+            Err(e) => {
+                tracing::debug!(error = %e, "could not read remembered descriptor verdicts");
+                Vec::new()
+            }
         }
-        sink.finalize().await
     }
 
     /// Try each not-yet-demoted holder's `dig.getModuleInfo` until one answers, returning the
@@ -409,7 +483,7 @@ impl ModuleDownloader {
     async fn fetch_module_info(
         &self,
         providers: &[dig_dht::ProviderRecord],
-        demoted: &[String],
+        excluded: &[String],
         store_id: &str,
         root: &str,
     ) -> Result<(String, ModuleInfo), DownloadError> {
@@ -417,8 +491,8 @@ impl ModuleDownloader {
         let mut tried = 0usize;
         for provider in providers {
             let peer = &provider.provider_peer_id;
-            if demoted.iter().any(|d| d == peer) {
-                continue; // this holder's descriptor already failed a final gate
+            if excluded.iter().any(|d| d == peer) {
+                continue; // demoted in this call, or carrying a remembered verdict
             }
             tried += 1;
             match self.transport.get_module_info(peer, store_id, root).await {
@@ -431,7 +505,7 @@ impl ModuleDownloader {
             content: format!(
                 "getModuleInfo failed on all {tried} usable holder(s) ({} demoted) for module {} — \
                  {reasons}",
-                demoted.len(),
+                excluded.len(),
                 module_download_key(store_id, root),
             ),
         })
@@ -614,31 +688,121 @@ struct Resume {
 /// capsule. Chunk exhaustion is AMBIGUOUS and classified by [`classify_chunk_exhaustion`]: unavailable
 /// bytes and an unsatisfiable descriptor look identical from inside one attempt.
 enum PullFailure {
-    /// The assembled blob failed the whole-blob-hash or chain-anchor gate, the descriptor itself was
-    /// unusable, or no chunk ever verified under it — attributable to the holder that supplied the
-    /// descriptor, which is demoted.
+    /// The descriptor was PROVEN false: the assembled blob failed the whole-blob-hash or chain-anchor
+    /// gate, or the descriptor was structurally unusable. Attributable to the holder that supplied it,
+    /// which is demoted for this call AND recorded durably.
     BadDescriptor(DownloadError),
-    /// Any other failure (bytes genuinely unavailable under a credible descriptor, sink/state error) —
-    /// terminal for the pull.
+    /// The descriptor could not be SATISFIED — the chunks it declares could not be fetched from any
+    /// holder. Its source is demoted for this call so another descriptor is tried (#1613), but nothing
+    /// here proves the descriptor was false: the bytes may be genuinely unavailable, and the holders
+    /// refusing them need not be the holder that supplied the descriptor. So it earns NO durable
+    /// verdict — see [`DescriptorEvidence`].
+    UnsatisfiableDescriptor(DownloadError),
+    /// Any other failure (a local sink/state fault) — terminal for the pull.
     Terminal(DownloadError),
 }
 
-/// Classify a chunk-level exhaustion: is the DESCRIPTOR unsatisfiable, or are the BYTES unavailable?
+/// Which holders a pull will not ask for a descriptor, and whether it is still honouring the
+/// [`StateStore`]'s remembered verdicts.
 ///
-/// A holder that fabricates `chunk_hashes` (rather than `module_hash`) is the cheapest reshare-denial
-/// attack there is — it serves ZERO bytes, and since no holder can satisfy hashes of nothing, the pull
-/// exhausts its holders on the first chunk and never reaches a final gate. Treating that as terminal
-/// lets one such holder deny a capsule's reshare permanently.
+/// Two sources of exclusion with DIFFERENT authority: holders demoted in THIS call (a failed attempt
+/// happened here — always excluded) and holders remembered from a past call (advisory, and droppable).
+/// Keeping them apart is what lets reputation be dropped without also forgiving a liar caught seconds
+/// ago — the bug of a single flat list.
+struct DescriptorExclusions {
+    demoted_here: Vec<String>,
+    remembered: Vec<String>,
+    trusts_memory: bool,
+}
+
+impl DescriptorExclusions {
+    fn new(remembered: Vec<String>) -> Self {
+        let trusts_memory = !remembered.is_empty();
+        DescriptorExclusions {
+            demoted_here: Vec::new(),
+            remembered,
+            trusts_memory,
+        }
+    }
+
+    /// The peers not to ask right now.
+    fn excluded(&self) -> Vec<String> {
+        let mut excluded = self.demoted_here.clone();
+        if self.trusts_memory {
+            excluded.extend(self.remembered.iter().cloned());
+        }
+        excluded
+    }
+
+    /// How many located holders are still askable for a descriptor.
+    fn usable_holders(&self, providers: &[dig_dht::ProviderRecord]) -> usize {
+        let excluded = self.excluded();
+        providers
+            .iter()
+            .filter(|p| !excluded.contains(&p.provider_peer_id))
+            .count()
+    }
+
+    /// Record that `peer` failed an attempt in THIS call (never droppable).
+    fn demote(&mut self, peer: String) {
+        self.demoted_here.push(peer);
+    }
+
+    /// Stop honouring the remembered verdicts, returning whether that actually changed anything (i.e.
+    /// whether the memory was what left nobody to ask).
+    fn stop_trusting_memory(&mut self) -> bool {
+        let was_trusting = self.trusts_memory;
+        self.trusts_memory = false;
+        was_trusting && !self.remembered.is_empty()
+    }
+
+    fn trusts_memory(&self) -> bool {
+        self.trusts_memory
+    }
+}
+
+/// Explain a chunk-level exhaustion: were the BYTES unavailable under a credible descriptor, or was
+/// the DESCRIPTOR itself unsatisfiable?
 ///
-/// The honest bound is whether ANY chunk has verified under this descriptor: if one has, the descriptor
-/// is credible and the exhaustion really is missing bytes (terminal — re-handshaking would only replay
-/// the same fetches). If none ever has, the descriptor is the suspect, so its source is demoted and
-/// another holder's descriptor tried (bounded by [`MAX_DESCRIPTOR_ATTEMPTS`]).
-fn classify_chunk_exhaustion(e: DownloadError, any_chunk_verified: bool) -> PullFailure {
-    if any_chunk_verified {
-        PullFailure::Terminal(e)
+/// This is DIAGNOSIS, not control flow. Exhaustion always demotes the descriptor source and re-tries
+/// another holder's descriptor (bounded by [`MAX_DESCRIPTOR_ATTEMPTS`] and the un-demoted holder set),
+/// because "did any chunk verify?" is not a bound an attacker respects: a holder declaring
+/// `chunk_lens = [1, rest]` serves that ONE byte — matching its own fabricated first hash — and then
+/// refuses everything, so a retry gated on the flag never happens and one liar denies the capsule's
+/// reshare for the price of a single byte (#1613). The attempt budget alone guarantees termination.
+///
+/// Whether a chunk verified is still worth SAYING: exhaustion after real progress is more likely
+/// genuine unavailability, exhaustion with none more likely a fabricated descriptor, and an operator
+/// reading the log should not have to guess which.
+fn describe_chunk_exhaustion(e: DownloadError, any_chunk_verified: bool) -> DownloadError {
+    let diagnosis = if any_chunk_verified {
+        "some chunk(s) had already verified under this descriptor, so the missing bytes are more \
+         likely genuinely unavailable than fabricated"
     } else {
-        PullFailure::BadDescriptor(e)
+        "no chunk ever verified under this descriptor, so it is more likely fabricated than the \
+         bytes unavailable"
+    };
+    match e {
+        DownloadError::NotFound { content } => DownloadError::NotFound {
+            content: format!("{content} — {diagnosis}"),
+        },
+        other => other,
+    }
+}
+
+impl PullFailure {
+    /// The underlying error, whatever the attribution.
+    fn error(&self) -> &DownloadError {
+        match self {
+            PullFailure::BadDescriptor(e)
+            | PullFailure::UnsatisfiableDescriptor(e)
+            | PullFailure::Terminal(e) => e,
+        }
+    }
+
+    /// Whether this failure PROVES the descriptor false, and so may be remembered against its source.
+    fn is_proven_false(&self) -> bool {
+        matches!(self, PullFailure::BadDescriptor(_))
     }
 }
 
@@ -648,22 +812,34 @@ impl From<DownloadError> for PullFailure {
     }
 }
 
-/// Allocate the `total_size`-byte assembly buffer FALLIBLY.
+/// Allocate the `total_size`-byte assembly buffer FALLIBLY, attributing the two ways it can fail
+/// DIFFERENTLY.
 ///
 /// `total_size` is attacker-declared (bounded only by [`ModuleDownloadConfig::max_module_size`]), and
-/// `vec![0u8; n]` aborts the process via `handle_alloc_error` when the allocation fails — an
-/// uncatchable death a hostile descriptor must never be able to cause. `try_reserve` turns exhaustion
-/// into an ordinary rejected-descriptor error.
-fn try_zeroed_blob(total_size: u64) -> Result<Vec<u8>, DownloadError> {
+/// `vec![0u8; n]` aborts the process via `handle_alloc_error` when the allocation fails — an uncatchable
+/// death a hostile descriptor must never be able to cause. So the reservation is fallible. What it fails
+/// AS then decides two INDEPENDENT things — who is blamed, and what happens next — and both have to be
+/// chosen deliberately:
+///
+/// - a size that does not fit this platform's address space is a claim that cannot describe any real
+///   resource ⇒ the DESCRIPTOR is proven false: blame its source, durably.
+/// - a reservation this host cannot satisfy says nothing about the holder ⇒ blame NOBODY, but still try
+///   the next holder's descriptor. It is [`PullFailure::UnsatisfiableDescriptor`], not `Terminal`:
+///   `Terminal` would kill the pull outright, and a ~100-byte self-consistent descriptor with an inflated
+///   `total_size` is then all it takes to make a capsule permanently undownloadable on this node — the
+///   one-message reshare denial the whole descriptor-retry budget exists to bound. The declared size is
+///   also remotely inducible pressure (every concurrent pull reserves up to `max_module_size`), which is
+///   an argument for routing AROUND it, not for surrendering to it.
+fn try_zeroed_blob(total_size: u64) -> Result<Vec<u8>, PullFailure> {
     let len = usize::try_from(total_size).map_err(|_| {
-        DownloadError::Verify(VerifyError::Metadata(format!(
+        PullFailure::BadDescriptor(DownloadError::Verify(VerifyError::Metadata(format!(
             "declared module total_size {total_size} does not fit this platform's address space"
-        )))
+        ))))
     })?;
     let mut blob: Vec<u8> = Vec::new();
     blob.try_reserve_exact(len).map_err(|e| {
-        DownloadError::Verify(VerifyError::Metadata(format!(
-            "cannot allocate the {len}-byte assembly buffer a descriptor declared: {e}"
+        PullFailure::UnsatisfiableDescriptor(DownloadError::sink(format!(
+            "this host cannot allocate the {len}-byte module assembly buffer this descriptor declares:              {e}"
         )))
     })?;
     blob.resize(len, 0); // within the reservation above — no further allocation
@@ -720,32 +896,38 @@ impl ChunkPlan {
     /// The size bound is checked FIRST and before any allocation: the descriptor comes from an
     /// untrusted holder and `total_size` sizes the puller's assembly buffer, so an unbounded declared
     /// size is a one-message memory-exhaustion attack.
-    fn from_info(info: &ModuleInfo, max_module_size: u64) -> Result<Self, DownloadError> {
+    fn from_info(info: &ModuleInfo, max_module_size: u64) -> Result<Self, PullFailure> {
+        // Every rejection below is a statement about the DESCRIPTOR, so it is attributable to the holder
+        // that supplied it. The one exception is the allocation further down, which is a local outcome —
+        // see its comment.
+        let false_descriptor = |reason: String| {
+            PullFailure::BadDescriptor(DownloadError::Verify(VerifyError::Metadata(reason)))
+        };
         if info.total_size > max_module_size {
-            return Err(DownloadError::Verify(VerifyError::Metadata(format!(
+            return Err(false_descriptor(format!(
                 "declared module total_size {} exceeds the maximum {max_module_size}",
                 info.total_size
-            ))));
+            )));
         }
         if info.chunk_lens.is_empty() {
-            return Err(DownloadError::Verify(VerifyError::Metadata(
+            return Err(false_descriptor(
                 "ModuleInfo carries no chunk_lens (cannot map ranges to chunk hashes)".into(),
-            )));
+            ));
         }
         // Bound the declared COUNT before cloning it: the count sizes the plan's own vectors, so an
         // absurd one is the same one-message allocation attack as an absurd `total_size`.
         if info.chunk_lens.len() > MAX_MODULE_CHUNK_COUNT {
-            return Err(DownloadError::Verify(VerifyError::Metadata(format!(
+            return Err(false_descriptor(format!(
                 "declared chunk_lens count {} exceeds the maximum {MAX_MODULE_CHUNK_COUNT}",
                 info.chunk_lens.len()
-            ))));
+            )));
         }
         if info.chunk_lens.len() != info.chunk_hashes.len() {
-            return Err(DownloadError::Verify(VerifyError::Metadata(format!(
+            return Err(false_descriptor(format!(
                 "chunk_lens ({}) != chunk_hashes ({})",
                 info.chunk_lens.len(),
                 info.chunk_hashes.len()
-            ))));
+            )));
         }
         // CHECKED arithmetic, both here and for the offsets below. Unchecked, a descriptor of
         // `{ total_size: 0, chunk_lens: [1, u64::MAX] }` WRAPS to a sum of 0, matches its declared
@@ -758,21 +940,23 @@ impl ChunkPlan {
             .iter()
             .try_fold(0u64, |acc, &len| acc.checked_add(len))
             .ok_or_else(|| {
-                DownloadError::Verify(VerifyError::Metadata(
-                    "chunk_lens sum overflows u64 (hostile descriptor)".into(),
-                ))
+                false_descriptor("chunk_lens sum overflows u64 (hostile descriptor)".into())
             })?;
         if sum != info.total_size {
-            return Err(DownloadError::Verify(VerifyError::Metadata(format!(
+            return Err(false_descriptor(format!(
                 "chunk_lens sum {sum} != total_size {}",
                 info.total_size
-            ))));
+            )));
         }
         let chunk_lens = info.chunk_lens.clone();
         let mut offsets = Vec::new();
+        // Not descriptor evidence — the count is already bounded above, so a refusal here is this host
+        // running out of memory and must brand nobody. But it is still UNSATISFIABLE rather than
+        // terminal: another holder's descriptor deserves a try (see `try_zeroed_blob` for why the two
+        // axes — blame and next-step — are chosen separately).
         offsets.try_reserve_exact(chunk_lens.len()).map_err(|e| {
-            DownloadError::Verify(VerifyError::Metadata(format!(
-                "cannot allocate a {}-entry chunk plan: {e}",
+            PullFailure::UnsatisfiableDescriptor(DownloadError::sink(format!(
+                "this host cannot allocate the {}-entry chunk plan this descriptor declares: {e}",
                 chunk_lens.len()
             )))
         })?;
@@ -780,9 +964,7 @@ impl ChunkPlan {
         for &len in &chunk_lens {
             offsets.push(acc);
             acc = acc.checked_add(len).ok_or_else(|| {
-                DownloadError::Verify(VerifyError::Metadata(
-                    "chunk offsets overflow u64 (hostile descriptor)".into(),
-                ))
+                false_descriptor("chunk offsets overflow u64 (hostile descriptor)".into())
             })?;
         }
         Ok(ChunkPlan {
@@ -1569,6 +1751,11 @@ mod tests {
         let err = ChunkPlan::from_info(&hostile, DEFAULT_MAX_MODULE_SIZE)
             .expect_err("a wrapping descriptor is refused");
         assert!(
+            err.is_proven_false(),
+            "a hostile descriptor is attributable to the holder that supplied it"
+        );
+        let err = err.error();
+        assert!(
             matches!(err, DownloadError::Verify(_)),
             "a hostile descriptor is a verify failure: {err}"
         );
@@ -1591,6 +1778,8 @@ mod tests {
         };
         let err = ChunkPlan::from_info(&hostile, DEFAULT_MAX_MODULE_SIZE)
             .expect_err("an over-count descriptor is refused");
+        assert!(err.is_proven_false(), "attributable to its source");
+        let err = err.error();
         assert!(
             err.to_string().contains("chunk_lens"),
             "names the bound it broke: {err}"
@@ -1757,6 +1946,11 @@ mod tests {
         async fn truncate(&self, _len: u64) -> Result<(), DownloadError> {
             Ok(()) // models a staging area that cannot shrink: claims success but never truncates
         }
+        // Read-back WORKS here, so the refusal below can only come from the length proof itself — not
+        // from the "cannot observe my staging area" refusal that guards an unproven sink.
+        fn supports_read_back(&self) -> bool {
+            true
+        }
         async fn read_at(&self, offset: u64, len: u64) -> Result<Vec<u8>, DownloadError> {
             self.0.read_at(offset, len).await
         }
@@ -1801,7 +1995,7 @@ mod tests {
     /// A sink implementing ONLY `write_at` + `finalize` — BOTH `truncate` and `read_at` left on the
     /// trait's defaults. This is the TWO-DEFAULT combination that used to fail OPEN: the old
     /// `truncate` default silently no-op'd (nothing ever shortened) while `read_at`'s default already
-    /// failed closed, so `promote_verified_module`'s "bytes past the verified end" probe read that
+    /// failed closed, so [`promote_verified`]'s "bytes past the verified end" probe read that
     /// failure as "nothing past the end" and promoted a longer, un-truncated, poisoned artifact.
     /// Delegates storage + finalized-tracking to an inner [`InMemorySink`]; everything else is the
     /// plain trait default — this is exactly the shape of a pre-existing external `Sink` that never
@@ -1818,11 +2012,18 @@ mod tests {
         }
     }
 
-    /// The TWO-DEFAULT case, proven previously fail-OPEN: an external sink on both the `truncate` AND
-    /// `read_at` defaults must never promote a longer, un-truncated tail behind a shorter verified
-    /// artifact — the pull errors and the sink is never finalized.
+    /// A sink on BOTH the `truncate` and `read_at` defaults fails closed — at the FIRST place it is
+    /// asked to shorten anything, which is the abandoned-plan reset, long before promotion.
+    ///
+    /// Named for what it actually proves. It was previously named for the promotion tail and asserted
+    /// only `DownloadError::Sink(_)`, which this pull produces without reaching `promote_verified` at
+    /// all: `pull_with_descriptor` resets a non-resuming staging area first, the fail-closed `truncate`
+    /// default rejects that, and the pull dies before any liar tail is staged. It therefore passed with
+    /// the entire promotion proof deleted. The promotion path for a defaulted `read_at` is covered by
+    /// `the_documented_whole_commit_sink_recipe_cannot_promote_unproven_bytes`; this cell covers the
+    /// reset, and asserts the MESSAGE so it cannot silently start proving something else.
     #[tokio::test]
-    async fn a_sink_on_both_truncate_and_read_at_defaults_never_promotes_a_poisoned_tail() {
+    async fn a_sink_on_both_truncate_and_read_at_defaults_fails_closed_at_the_first_reset() {
         let store_id = hex_id(0xE9);
         let root = hex_id(0xEA);
         let honest = b"honest!!".to_vec();
@@ -1845,9 +2046,11 @@ mod tests {
             .download(&store_id, &root, &sink)
             .await
             .expect_err("a sink on both defaults must fail closed, never promote blind");
+        // The MESSAGE, not just the variant: this pull dies at the abandoned-plan reset, and asserting
+        // only `Sink(_)` passed even with the whole promotion proof deleted.
         assert!(
-            matches!(err, DownloadError::Sink(_)),
-            "the fail-closed truncate default refuses rather than promoting blind: {err}"
+            err.to_string().contains("truncation unsupported"),
+            "it is the fail-closed truncate DEFAULT that refuses, at the plan reset: {err}"
         );
         assert!(!sink.0.is_finalized().await, "and it never finalized");
     }
@@ -1890,6 +2093,513 @@ mod tests {
         assert!(
             handshakes.len() >= 2 && handshakes[1] != liar,
             "the fabricating source was demoted and another holder re-handshaked: {handshakes:?}"
+        );
+    }
+
+    /// #1613 — a descriptor retry gated on "did ANY chunk verify?" is bypassable for ONE BYTE.
+    ///
+    /// The liar declares `chunk_lens = [1, rest]` with an honest hash for the first byte and a
+    /// fabricated one for the rest, serves that single byte, then refuses everything. Under the old
+    /// bound the first verified chunk flipped the pull into "the descriptor is credible", so the
+    /// inevitable exhaustion on chunk 1 was Terminal — no demotion, no re-handshake — and the pull died
+    /// with two honest holders standing right there. Cost to the attacker: one byte.
+    ///
+    /// The attempt budget, not the flag, is what bounds termination: exhaustion always demotes the
+    /// descriptor source and tries the next holder's descriptor while the budget allows.
+    #[tokio::test]
+    async fn a_liar_that_serves_one_byte_then_refuses_is_still_demoted() {
+        let store_id = hex_id(0x5A);
+        let root = hex_id(0x5B);
+        let module = b"an honest module blob of some length".to_vec();
+        let liar = crate::testkit::mock_peer_hex(1);
+
+        let transport = Arc::new(
+            MockModuleTransport::serving(&store_id, &root, module.clone(), 8)
+                .serving_one_byte_then_refusing_from(&liar),
+        );
+        let downloader = ModuleDownloader::new(
+            locator_with(3, &store_id, &root),
+            transport.clone(),
+            Arc::new(AcceptAnyModuleAnchor),
+            Arc::new(InMemoryStateStore::new()),
+            ModuleDownloadConfig::default(),
+        );
+        let sink = InMemorySink::new();
+
+        let len = downloader
+            .download(&store_id, &root, &sink)
+            .await
+            .expect("an honest holder's descriptor completes the pull");
+
+        assert_eq!(len, module.len() as u64);
+        assert_eq!(sink.contents().await, module, "only honest bytes promoted");
+        let handshakes = transport.module_info_calls().await;
+        assert!(
+            handshakes.len() > 1,
+            "the one-byte liar was demoted and another holder's descriptor tried: {handshakes:?}"
+        );
+        assert!(
+            handshakes.len() <= MAX_DESCRIPTOR_ATTEMPTS + 1,
+            "descriptor retries stay bounded by the attempt budget: {handshakes:?}"
+        );
+    }
+
+    /// The exhaustion DIAGNOSIS still distinguishes the two cases even though the control flow no
+    /// longer does: exhaustion after some chunk verified is more likely genuine unavailability, and
+    /// exhaustion with none verified more likely a fabricated descriptor. That is a message, not a gate.
+    #[test]
+    fn exhaustion_diagnosis_names_whether_any_chunk_had_verified() {
+        let base = DownloadError::NotFound {
+            content: "fetchModuleRange failed for chunk 3".into(),
+        };
+        let with_progress = describe_chunk_exhaustion(base, true).to_string();
+        let without_progress = describe_chunk_exhaustion(
+            DownloadError::NotFound {
+                content: "fetchModuleRange failed for chunk 3".into(),
+            },
+            false,
+        )
+        .to_string();
+        assert!(
+            with_progress.contains("chunk 3"),
+            "keeps the original reason: {with_progress}"
+        );
+        assert_ne!(
+            with_progress, without_progress,
+            "the two exhaustion cases read differently"
+        );
+    }
+
+    /// #1611 — a liar caught in ONE call must not be re-asked as a descriptor source in the NEXT.
+    ///
+    /// Demotion used to live in a local `Vec` inside `download()`, so a fresh call re-asked the same
+    /// liars from scratch and paid up to `MAX_DESCRIPTOR_ATTEMPTS` full pull attempts again. The verdict
+    /// is now persisted in the `StateStore`, so the second call skips the known liar's handshake
+    /// entirely — while still fetching CHUNKS from it (chunk bytes are hash-attributed, so excluding it
+    /// there would cost availability for no integrity gain).
+    #[tokio::test]
+    async fn a_liar_demoted_in_one_call_is_not_re_asked_in_the_next() {
+        let store_id = hex_id(0x6A);
+        let root = hex_id(0x6B);
+        let module = b"an honest module across chunks".to_vec();
+        let liar = crate::testkit::mock_peer_hex(1);
+        let state_store = Arc::new(InMemoryStateStore::new());
+
+        // Call 1: the liar wins the handshake race, fails the whole-blob gate, and is demoted.
+        let first_transport = Arc::new(
+            MockModuleTransport::serving(&store_id, &root, module.clone(), 8)
+                .lying_descriptor_from(&liar),
+        );
+        let first = ModuleDownloader::new(
+            locator_with(3, &store_id, &root),
+            first_transport.clone(),
+            Arc::new(AcceptAnyModuleAnchor),
+            state_store.clone(),
+            ModuleDownloadConfig::default(),
+        );
+        first
+            .download(&store_id, &root, &InMemorySink::new())
+            .await
+            .expect("an honest holder completes call 1");
+        assert!(
+            first_transport.module_info_calls().await.contains(&liar),
+            "call 1 did ask the liar (that is how it learned)"
+        );
+
+        // Call 2: the SAME state store, so the verdict is remembered.
+        let second_transport = Arc::new(
+            MockModuleTransport::serving(&store_id, &root, module.clone(), 8)
+                .lying_descriptor_from(&liar),
+        );
+        let second = ModuleDownloader::new(
+            locator_with(3, &store_id, &root),
+            second_transport.clone(),
+            Arc::new(AcceptAnyModuleAnchor),
+            state_store.clone(),
+            ModuleDownloadConfig::default(),
+        );
+        let len = second
+            .download(&store_id, &root, &InMemorySink::new())
+            .await
+            .expect("call 2 completes");
+
+        assert_eq!(len, module.len() as u64);
+        assert!(
+            !second_transport.module_info_calls().await.contains(&liar),
+            "the remembered liar is never asked for a descriptor again: {:?}",
+            second_transport.module_info_calls().await
+        );
+        assert_eq!(
+            second_transport.module_info_calls().await.len(),
+            1,
+            "and exactly one honest handshake was needed"
+        );
+        assert!(
+            second_transport
+                .fetches()
+                .await
+                .iter()
+                .any(|(peer, _)| peer == &liar),
+            "a demoted descriptor source is still used for CHUNK fetches"
+        );
+        assert_eq!(
+            state_store
+                .bad_descriptor_peers(&module_download_key(&store_id, &root))
+                .await
+                .unwrap(),
+            vec![liar],
+            "the verdict is what the store persisted"
+        );
+    }
+
+    /// Reputation must not be able to deny a pull: when EVERY located holder carries a past verdict the
+    /// memory is ignored for that attempt (a verdict is evidence about a moment, and holders get fixed).
+    #[tokio::test]
+    async fn reputation_never_denies_a_pull_when_every_holder_is_remembered() {
+        let store_id = hex_id(0x6C);
+        let root = hex_id(0x6D);
+        let module = b"honest bytes from a once-bad holder".to_vec();
+        let key = module_download_key(&store_id, &root);
+        let state_store = Arc::new(InMemoryStateStore::new());
+        // The only holder is remembered as a past liar — but it serves honestly now.
+        state_store
+            .record_bad_descriptor(&key, &crate::testkit::mock_peer_hex(1))
+            .await
+            .unwrap();
+
+        let downloader = ModuleDownloader::new(
+            locator_with(1, &store_id, &root),
+            Arc::new(MockModuleTransport::serving(
+                &store_id,
+                &root,
+                module.clone(),
+                8,
+            )),
+            Arc::new(AcceptAnyModuleAnchor),
+            state_store,
+            ModuleDownloadConfig::default(),
+        );
+        let sink = InMemorySink::new();
+        let len = downloader
+            .download(&store_id, &root, &sink)
+            .await
+            .expect("a remembered holder is still asked when it is the only one");
+        assert_eq!(len, module.len() as u64);
+        assert_eq!(sink.contents().await, module);
+    }
+
+    /// GATE #1, the PARTIAL case — reputation must not deny a pull the network can serve.
+    ///
+    /// Verdicts on the two HONEST holders and none on the liar: honouring the memory excludes the honest
+    /// holders from the descriptor role, the liar wins the handshake, fails a final gate, is demoted —
+    /// and `usable == 0`, so the pull returned the descriptor error with honest holders sitting right
+    /// there. `demoted` started empty before #1611, so that was a regression, and the total-case test
+    /// (`reputation_never_denies_a_pull_when_every_holder_is_remembered`) never reached it. The escape
+    /// now triggers on "no usable holder remains", not on "all holders remembered".
+    #[tokio::test]
+    async fn reputation_never_denies_a_pull_when_only_the_honest_holders_are_remembered() {
+        let store_id = hex_id(0x7A);
+        let root = hex_id(0x7B);
+        let module = b"honest bytes the network can still serve".to_vec();
+        let key = module_download_key(&store_id, &root);
+        let liar = crate::testkit::mock_peer_hex(1);
+        let state_store = Arc::new(InMemoryStateStore::new());
+        // The HONEST holders carry the verdicts; the liar does not.
+        for honest in [
+            crate::testkit::mock_peer_hex(2),
+            crate::testkit::mock_peer_hex(3),
+        ] {
+            state_store
+                .record_bad_descriptor(&key, &honest)
+                .await
+                .unwrap();
+        }
+
+        let downloader = ModuleDownloader::new(
+            locator_with(3, &store_id, &root),
+            Arc::new(
+                MockModuleTransport::serving(&store_id, &root, module.clone(), 8)
+                    .lying_descriptor_from(&liar),
+            ),
+            Arc::new(AcceptAnyModuleAnchor),
+            state_store,
+            ModuleDownloadConfig::default(),
+        );
+        let sink = InMemorySink::new();
+
+        let len = downloader
+            .download(&store_id, &root, &sink)
+            .await
+            .expect("remembered HONEST holders are re-asked rather than denying the pull");
+        assert_eq!(len, module.len() as u64);
+        assert_eq!(sink.contents().await, module);
+    }
+
+    /// GATE #1(b) — chunk exhaustion must NOT leave a durable verdict against the descriptor source.
+    ///
+    /// DHT provider announcement is unauthenticated, so if unsatisfied chunks were durable evidence,
+    /// sybil holders could refuse their assigned chunks and get an HONEST descriptor source blacklisted
+    /// on the victim for 24 h — per capsule, repeatably — until only attacker-supplied descriptors were
+    /// ever asked for. Exhaustion still demotes for THIS call (#1613); it just earns no memory.
+    #[tokio::test]
+    async fn chunk_exhaustion_demotes_for_this_call_but_records_no_durable_verdict() {
+        let store_id = hex_id(0x7C);
+        let root = hex_id(0x7D);
+        let key = module_download_key(&store_id, &root);
+        let state_store = Arc::new(InMemoryStateStore::new());
+
+        // The only holder answers `getModuleInfo` honestly and then serves nothing: the chunks cannot be
+        // fetched, so the pull exhausts and fails — with no evidence its descriptor was false.
+        let downloader = ModuleDownloader::new(
+            locator_with(1, &store_id, &root),
+            Arc::new(
+                MockModuleTransport::serving(&store_id, &root, b"unavailable bytes".to_vec(), 8)
+                    .with_success_budget(0),
+            ),
+            Arc::new(AcceptAnyModuleAnchor),
+            state_store.clone(),
+            ModuleDownloadConfig::default(),
+        );
+        let sink = InMemorySink::new();
+
+        downloader
+            .download(&store_id, &root, &sink)
+            .await
+            .expect_err("unavailable chunks fail the pull");
+        assert!(
+            state_store
+                .bad_descriptor_peers(&key)
+                .await
+                .unwrap()
+                .is_empty(),
+            "no durable verdict from mere unavailability — else sybils can brand an honest holder"
+        );
+        assert!(!sink.is_finalized().await);
+    }
+
+    /// GATE #4 — the sink recipe this crate's own docs give MUST NOT fail open.
+    ///
+    /// `truncate` overridden to `Ok(())` (the blessed "I commit whole" opt-in) with `read_at` left on its
+    /// default was the one untested combination: nothing is shortened, the past-the-end probe's
+    /// "read-back unsupported" reads as "nothing there", and an unproven artifact promotes. Promotion now
+    /// requires `supports_read_back`, so a sink that cannot show its staged bytes is refused.
+    #[tokio::test]
+    async fn the_documented_whole_commit_sink_recipe_cannot_promote_unproven_bytes() {
+        /// `truncate` → `Ok(())` exactly as the [`Sink::truncate`] doc's opt-in shows, `read_at` left on
+        /// the trait default. The shape a real store-write sink following that recipe would have.
+        struct RecipeSink(InMemorySink);
+
+        #[async_trait]
+        impl Sink for RecipeSink {
+            async fn write_at(&self, offset: u64, bytes: &[u8]) -> Result<(), DownloadError> {
+                self.0.write_at(offset, bytes).await
+            }
+            async fn truncate(&self, _len: u64) -> Result<(), DownloadError> {
+                Ok(()) // "this sink commits whole, so there is never a tail to shrink"
+            }
+            async fn finalize(&self) -> Result<(), DownloadError> {
+                self.0.finalize().await
+            }
+        }
+
+        let store_id = hex_id(0x7E);
+        let root = hex_id(0x7F);
+        let honest = b"honest!!".to_vec();
+        let liar = crate::testkit::mock_peer_hex(1);
+
+        // The liar stages a LONGER fabrication first, then the honest, shorter module is pulled — so the
+        // staging area holds a tail the verified bytes do not contain.
+        let downloader = ModuleDownloader::new(
+            locator_with(3, &store_id, &root),
+            Arc::new(
+                MockModuleTransport::serving(&store_id, &root, honest.clone(), 8)
+                    .serving_alternate_module_from(&liar, vec![0xAA; 32]),
+            ),
+            Arc::new(crate::testkit::OnlyThisModuleAnchor::new(honest)),
+            Arc::new(InMemoryStateStore::new()),
+            ModuleDownloadConfig::default(),
+        );
+        let sink = RecipeSink(InMemorySink::new());
+
+        let err = downloader
+            .download(&store_id, &root, &sink)
+            .await
+            .expect_err("a sink that cannot prove its staged length is never promoted");
+        assert!(
+            err.to_string().contains("cannot read back"),
+            "names WHY it refused — an unprovable promotion, not a length verdict: {err}"
+        );
+        assert!(!sink.0.is_finalized().await, "and it never finalized");
+    }
+
+    /// GATE — a failed allocation blames NOBODY and still routes to the next descriptor.
+    ///
+    /// Two independent axes, and this failure needs a deliberate answer on each. WHO failed: this host,
+    /// so nothing durable may be recorded against the holder (the pressure is remotely inducible — every
+    /// concurrent pull reserves up to `max_module_size` for an attacker-declared size). WHAT NEXT: try
+    /// another holder's descriptor, because `Terminal` would let a ~100-byte self-consistent descriptor
+    /// with an inflated `total_size` make a capsule permanently undownloadable. `UnsatisfiableDescriptor`
+    /// is the arm that says both; asserting only "not proven false" or only "terminal" pins half of it.
+    ///
+    /// An ~18 EiB reservation fails on every host without touching a page, so this is deterministic.
+    #[test]
+    fn a_failed_allocation_brands_nobody_and_still_allows_another_descriptor() {
+        let err = try_zeroed_blob(u64::MAX).expect_err("this host cannot reserve 18 EiB");
+        assert!(
+            !err.is_proven_false(),
+            "a local allocation outcome must never be attributable to a holder"
+        );
+        assert!(
+            matches!(err, PullFailure::UnsatisfiableDescriptor(_)),
+            "and it must NOT be terminal — another holder's descriptor is still worth trying: {}",
+            err.error()
+        );
+    }
+
+    /// GATE, end to end — a ~100-byte inflated descriptor must not deny the capsule.
+    ///
+    /// The attacker announces as a provider, wins the `getModuleInfo` race, and answers a SELF-CONSISTENT
+    /// descriptor whose `total_size` (and matching final `chunk_len`) this host cannot allocate. It must
+    /// cost the attacker the descriptor role and nothing else: no durable verdict against anyone, and the
+    /// honest holder standing right there completes the pull.
+    ///
+    /// Only the LIAR inflates. With every holder inflating — as this test first did — a puller that dies
+    /// instead of retrying is indistinguishable from one that recovers, so the regression was invisible.
+    #[tokio::test]
+    async fn an_honest_holder_completes_the_pull_after_an_unallocatable_descriptor() {
+        let store_id = hex_id(0x8A);
+        let root = hex_id(0x8B);
+        let key = module_download_key(&store_id, &root);
+        let module = b"a real module served honestly".to_vec();
+        let liar = crate::testkit::mock_peer_hex(1);
+        let state_store = Arc::new(InMemoryStateStore::new());
+
+        let transport = Arc::new(
+            MockModuleTransport::serving(&store_id, &root, module.clone(), 8)
+                .inflating_total_size_from(&liar, u64::MAX),
+        );
+        let downloader = ModuleDownloader::new(
+            locator_with(3, &store_id, &root),
+            transport.clone(),
+            Arc::new(AcceptAnyModuleAnchor),
+            state_store.clone(),
+            // A ceiling that admits the declared size, so the SIZE guard is not what rejects it and the
+            // allocation is genuinely what fails.
+            ModuleDownloadConfig {
+                max_module_size: u64::MAX,
+                ..ModuleDownloadConfig::default()
+            },
+        );
+        let sink = InMemorySink::new();
+
+        let len = downloader
+            .download(&store_id, &root, &sink)
+            .await
+            .expect("an honest holder's descriptor completes the pull");
+        assert_eq!(len, module.len() as u64);
+        assert_eq!(sink.contents().await, module);
+        assert!(
+            transport.module_info_calls().await.len() > 1,
+            "the unallocatable descriptor's source was demoted and another holder asked: {:?}",
+            transport.module_info_calls().await
+        );
+        assert!(
+            state_store
+                .bad_descriptor_peers(&key)
+                .await
+                .unwrap()
+                .is_empty(),
+            "and NOBODY is branded for this host's memory limits — not even the liar, since the \
+             allocation is not evidence about a peer"
+        );
+    }
+
+    /// The same failure when NO holder offers an allocatable module: the pull fails (bounded by the
+    /// attempt budget) and still records nothing against anyone.
+    #[tokio::test]
+    async fn no_holder_is_branded_when_none_offers_an_allocatable_module() {
+        let store_id = hex_id(0x8E);
+        let root = hex_id(0x8F);
+        let key = module_download_key(&store_id, &root);
+        let state_store = Arc::new(InMemoryStateStore::new());
+
+        let downloader = ModuleDownloader::new(
+            locator_with(2, &store_id, &root),
+            Arc::new(
+                MockModuleTransport::serving(&store_id, &root, b"a real module".to_vec(), 8)
+                    .declaring_total_size(u64::MAX),
+            ),
+            Arc::new(AcceptAnyModuleAnchor),
+            state_store.clone(),
+            ModuleDownloadConfig {
+                max_module_size: u64::MAX,
+                ..ModuleDownloadConfig::default()
+            },
+        );
+        let sink = InMemorySink::new();
+
+        downloader
+            .download(&store_id, &root, &sink)
+            .await
+            .expect_err("no holder can offer a module this host can hold");
+        assert!(
+            state_store
+                .bad_descriptor_peers(&key)
+                .await
+                .unwrap()
+                .is_empty(),
+            "no holder is branded for THIS host's memory limits"
+        );
+        assert!(!sink.is_finalized().await);
+    }
+
+    /// GATE — an anchor gate that cannot REACH an answer must not brand the holder.
+    ///
+    /// With a `bool` return an implementation that consults the chain had to answer `false` during an
+    /// outage, which was read as "proven not anchored" and persisted. An honest holder, a correct blob
+    /// and a chain-source blip then branded every holder tried — and for the whole TTL the node's
+    /// descriptor preference INVERTED, skipping remembered honest holders and asking unremembered
+    /// (i.e. sybil) peers first. `ModuleAnchor::Unavailable` is the third answer that fixes it.
+    #[tokio::test]
+    async fn an_unreachable_chain_anchor_is_terminal_and_brands_nobody() {
+        let store_id = hex_id(0x8C);
+        let root = hex_id(0x8D);
+        let key = module_download_key(&store_id, &root);
+        let state_store = Arc::new(InMemoryStateStore::new());
+
+        let downloader = ModuleDownloader::new(
+            locator_with(3, &store_id, &root),
+            Arc::new(MockModuleTransport::serving(
+                &store_id,
+                &root,
+                b"a correct, genuinely anchored module".to_vec(),
+                8,
+            )),
+            Arc::new(crate::testkit::UnreachableChainAnchor),
+            state_store.clone(),
+            ModuleDownloadConfig::default(),
+        );
+        let sink = InMemorySink::new();
+
+        let err = downloader
+            .download(&store_id, &root, &sink)
+            .await
+            .expect_err("an unverifiable anchor is fail-closed");
+        assert!(
+            err.to_string().contains("cannot verify the chain anchor"),
+            "it reports an unfinished CHECK, not a verdict on the module: {err}"
+        );
+        assert!(
+            state_store
+                .bad_descriptor_peers(&key)
+                .await
+                .unwrap()
+                .is_empty(),
+            "and no honest holder is branded by this node's own outage"
+        );
+        assert!(
+            !sink.is_finalized().await,
+            "fail-closed: nothing is promoted while the anchor is unproven"
         );
     }
 }

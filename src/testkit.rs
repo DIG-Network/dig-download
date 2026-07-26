@@ -35,6 +35,9 @@ pub struct MockContent {
     /// The whole-resource inclusion proof (base64), or `None` for a capsule.
     pub inclusion_proof: Option<String>,
     offsets: Vec<u64>,
+    /// A DECLARED first-frame `(total_length, chunk_lens)` that does not describe `bytes` at all — see
+    /// [`declaring`](Self::declaring).
+    declared_layout: Option<(u64, Vec<u64>)>,
 }
 
 impl MockContent {
@@ -58,7 +61,20 @@ impl MockContent {
             root: "ab".repeat(32),
             inclusion_proof: Some("mock-proof".into()),
             offsets,
+            declared_layout: None,
         }
+    }
+
+    /// Report `(total_length, chunk_lens)` in every first frame while still serving only the real
+    /// `bytes` — a peer whose DECLARED resource shape is a lie.
+    ///
+    /// The declared shape is what sizes the client: the plan, and the range assembler's buffer. So this
+    /// is the double needed to express "declares 1 TiB, sends 64 bytes", which no amount of honest
+    /// content can model (`new` requires the lengths to describe the bytes). A misbehaviour double that
+    /// cannot state the attack defends nothing.
+    pub fn declaring(mut self, total_length: u64, chunk_lens: Vec<u64>) -> Self {
+        self.declared_layout = Some((total_length, chunk_lens));
+        self
     }
 
     /// Evenly-chunked content of `n` bytes in `chunks` chunks (last chunk takes the remainder) —
@@ -80,9 +96,13 @@ impl MockContent {
     }
 
     fn meta(&self, offset: u64) -> RangeMeta {
+        let (total_length, chunk_lens) = match &self.declared_layout {
+            Some((declared_total, declared_lens)) => (*declared_total, declared_lens.clone()),
+            None => (self.bytes.len() as u64, self.chunk_lens.clone()),
+        };
         RangeMeta {
-            total_length: Some(self.bytes.len() as u64),
-            chunk_lens: Some(self.chunk_lens.clone()),
+            total_length: Some(total_length),
+            chunk_lens: Some(chunk_lens),
             chunk_index: Some(self.chunk_index_at(offset)),
             root: Some(self.root.clone()),
             inclusion_proof: self.inclusion_proof.clone(),
@@ -449,9 +469,11 @@ pub struct MockModuleTransport {
     corrupt_module_hash: bool,
     overserve: bool,
     declared_total_size: Option<u64>,
+    inflating_peer: Option<(String, u64)>,
     wrong_descriptor_for: Option<String>,
     alternate_module_for: Option<(String, Vec<u8>)>,
     fabricated_chunk_hashes_for: Option<String>,
+    one_byte_liar: Option<String>,
     budget: Option<Arc<AtomicUsize>>,
     fetches: Mutex<Vec<(String, u64)>>,
     info_calls: Mutex<Vec<String>>,
@@ -470,9 +492,11 @@ impl MockModuleTransport {
             corrupt_module_hash: false,
             overserve: false,
             declared_total_size: None,
+            inflating_peer: None,
             wrong_descriptor_for: None,
             alternate_module_for: None,
             fabricated_chunk_hashes_for: None,
+            one_byte_liar: None,
             budget: None,
             fetches: Mutex::new(Vec::new()),
             info_calls: Mutex::new(Vec::new()),
@@ -493,6 +517,18 @@ impl MockModuleTransport {
     /// puller's assembly buffer allocation.
     pub fn declaring_total_size(mut self, total_size: u64) -> Self {
         self.declared_total_size = Some(total_size);
+        self
+    }
+
+    /// ONLY `peer_id` declares `total_size` (with a matching inflated FINAL `chunk_len`, so the
+    /// descriptor stays self-consistent) while every other holder answers honestly.
+    ///
+    /// The per-peer version of [`declaring_total_size`](Self::declaring_total_size), and the double a
+    /// RECOVERY test needs: with every holder inflating, a puller that dies instead of trying the next
+    /// descriptor is indistinguishable from one that retries correctly. About 100 bytes on the wire buys
+    /// the attack, so the puller must route around it, not surrender to it.
+    pub fn inflating_total_size_from(mut self, peer_id: &str, total_size: u64) -> Self {
+        self.inflating_peer = Some((peer_id.to_string(), total_size));
         self
     }
 
@@ -540,6 +576,19 @@ impl MockModuleTransport {
     /// demoted and another holder's descriptor tried.
     pub fn fabricating_chunk_hashes_from(mut self, peer_id: &str) -> Self {
         self.fabricated_chunk_hashes_for = Some(peer_id.to_string());
+        self
+    }
+
+    /// ONLY `peer_id` answers `getModuleInfo` with a descriptor split as `chunk_lens = [1, rest]`
+    /// whose FIRST chunk hash is honest (the blob's real first byte) and whose SECOND is fabricated,
+    /// then serves that ONE byte and refuses every other window.
+    ///
+    /// This is the ONE-BYTE bypass of a "was any chunk verified?" bound: the liar pays a single byte to
+    /// make the pull look credible, then starves it. Every other holder answers honestly, so a puller
+    /// that demotes the descriptor source on exhaustion completes the pull from an honest descriptor —
+    /// and one that only demotes when NO chunk verified dies with honest holders standing right there.
+    pub fn serving_one_byte_then_refusing_from(mut self, peer_id: &str) -> Self {
+        self.one_byte_liar = Some(peer_id.to_string());
         self
     }
 
@@ -608,6 +657,19 @@ impl MockModuleTransport {
         }
     }
 
+    /// The honest descriptor with `total_size` inflated to `inflated` and the final `chunk_len` grown to
+    /// match, so it stays internally self-consistent — the ~100-byte hostile descriptor whose declared
+    /// size is what fails, not its shape.
+    fn descriptor_inflated_to(&self, inflated: u64) -> ModuleInfo {
+        let mut info = self.descriptor();
+        let real_total = info.total_size;
+        if let Some(last) = info.chunk_lens.last_mut() {
+            *last += inflated.saturating_sub(real_total);
+        }
+        info.total_size = inflated;
+        info
+    }
+
     /// A self-consistent descriptor whose whole-blob `module_hash` is wrong — it plans + attributes
     /// every chunk correctly and only fails at the final whole-blob gate.
     fn lying_descriptor(&self) -> ModuleInfo {
@@ -629,6 +691,22 @@ impl MockModuleTransport {
             .map(|(i, _)| hex_sha256(format!("fabricated-chunk-{i}").as_bytes()))
             .collect();
         info
+    }
+
+    /// A descriptor split as `[1, rest]` whose first chunk hash is HONEST (so the real first byte
+    /// satisfies it) and whose second is fabricated (so nothing can) — see
+    /// [`serving_one_byte_then_refusing_from`](Self::serving_one_byte_then_refusing_from).
+    fn one_byte_then_unsatisfiable_descriptor(&self) -> ModuleInfo {
+        let rest = self.blob.len().saturating_sub(1) as u64;
+        ModuleInfo {
+            total_size: self.blob.len() as u64,
+            module_hash: hex_sha256(&self.blob),
+            chunk_hashes: vec![
+                hex_sha256(&self.blob[..1]),
+                hex_sha256(b"fabricated-second-chunk"),
+            ],
+            chunk_lens: vec![1, rest],
+        }
     }
 
     /// The blob `provider_peer_id` serves bytes out of — the fabricated alternate module for the
@@ -677,6 +755,14 @@ impl crate::module::ModuleTransport for MockModuleTransport {
                 return Ok(self.descriptor_of(module));
             }
         }
+        if self.one_byte_liar.as_deref() == Some(provider_peer_id) {
+            return Ok(self.one_byte_then_unsatisfiable_descriptor());
+        }
+        if let Some((peer, inflated)) = &self.inflating_peer {
+            if peer == provider_peer_id {
+                return Ok(self.descriptor_inflated_to(*inflated));
+            }
+        }
         Ok(self.descriptor())
     }
 
@@ -707,6 +793,19 @@ impl crate::module::ModuleTransport for MockModuleTransport {
                 provider_peer_id,
                 "serving nothing",
             ));
+        }
+
+        if self.one_byte_liar.as_deref() == Some(provider_peer_id) {
+            // It pays exactly ONE byte — the real first byte, which its own descriptor commits to —
+            // and refuses every other window.
+            return if offset == 0 && length == 1 {
+                Ok(self.blob[..1].to_vec())
+            } else {
+                Err(DownloadError::transport(
+                    provider_peer_id,
+                    "refusing everything after the first byte",
+                ))
+            };
         }
 
         let served = self.served_blob(provider_peer_id);
@@ -743,8 +842,34 @@ fn hex_sha256(bytes: &[u8]) -> String {
 pub struct RejectAllModuleAnchor;
 
 impl crate::module::ModuleAnchorVerifier for RejectAllModuleAnchor {
-    fn verify_module_anchor(&self, _module: &[u8], _store_id: &str, _root: &str) -> bool {
-        false
+    fn verify_module_anchor(
+        &self,
+        _module: &[u8],
+        _store_id: &str,
+        _root: &str,
+    ) -> crate::module::ModuleAnchor {
+        crate::module::ModuleAnchor::NotAnchored
+    }
+}
+
+/// A [`ModuleAnchorVerifier`](crate::module::ModuleAnchorVerifier) that can never REACH an answer —
+/// the chain source is down.
+///
+/// This is the double for the distinction a `bool` return could not express: an honest holder serving a
+/// correct blob during a chain-source outage must NOT be branded a liar, because a durable verdict then
+/// inverts the node's descriptor preference toward unremembered (sybil) peers for the whole reputation
+/// TTL.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct UnreachableChainAnchor;
+
+impl crate::module::ModuleAnchorVerifier for UnreachableChainAnchor {
+    fn verify_module_anchor(
+        &self,
+        _module: &[u8],
+        _store_id: &str,
+        _root: &str,
+    ) -> crate::module::ModuleAnchor {
+        crate::module::ModuleAnchor::Unavailable("chain source unreachable".into())
     }
 }
 
@@ -765,8 +890,17 @@ impl OnlyThisModuleAnchor {
 }
 
 impl crate::module::ModuleAnchorVerifier for OnlyThisModuleAnchor {
-    fn verify_module_anchor(&self, module: &[u8], _store_id: &str, _root: &str) -> bool {
-        module == self.0.as_slice()
+    fn verify_module_anchor(
+        &self,
+        module: &[u8],
+        _store_id: &str,
+        _root: &str,
+    ) -> crate::module::ModuleAnchor {
+        if module == self.0.as_slice() {
+            crate::module::ModuleAnchor::Anchored
+        } else {
+            crate::module::ModuleAnchor::NotAnchored
+        }
     }
 }
 

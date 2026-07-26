@@ -20,7 +20,7 @@
 # by dig-node (see the implementers' note in the crate docs).
 [package]
 name = "dig-download"
-version = "0.8.1"
+version = "0.10.0"
 edition = "2021"
 rust-version = "1.75.0"
 license = "Apache-2.0 OR MIT"
@@ -139,5 +139,18 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"
 # dig-tls majors in the test build would otherwise produce an E0308 type mismatch on `NodeCert`.
 dig-tls = "0.3"
 
-[profile.release]
-overflow-checks = true
+# NO `[profile.release] overflow-checks` here, DELIBERATELY (#1608).
+#
+# Only the ROOT package's profile applies to a build — a dependency's is IGNORED — so a library that
+# sets `overflow-checks = true` protects nothing in the consumer builds that are the only ones that
+# matter. Worse, it reads as protection: this crate's own profile did NOT guard `ChunkPlan::from_info`
+# in a consumer build, and the only reason a hostile wrapping descriptor panicked early during
+# diagnosis was that dig-node happens to set the flag itself. With it off, a wrapping descriptor was
+# ACCEPTED (proven by execution).
+#
+# So every validator here is total over hostile input by CONSTRUCTION instead: `checked_add` /
+# `try_fold` / `usize::try_from` on anything wire-derived (`ChunkPlan::from_info`,
+# `ChunkLayout::try_new`, `sink::read_back_bounds`), and FALLIBLE `try_reserve_exact` for any
+# allocation an untrusted length sizes. In a library, a wrapping add is a silent ACCEPT, not a panic —
+# never delegate that to a profile flag. The `overflow-checks-off` CI job builds + runs the tests with
+# the checks explicitly DISABLED so this class fails loudly if it ever creeps back.

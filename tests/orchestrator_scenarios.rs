@@ -37,6 +37,7 @@ fn test_config(window: u64) -> DownloadConfig {
         max_relocate_attempts: 4,
         max_range_attempts: 8,
         verify_whole_resource: true,
+        max_resource_size: 64 * 1024,
         // Disable the per-range timeout + periodic refresh by default so the existing scenarios stay
         // deterministic (individual tests below opt into them). Selection uses the default
         // round-robin unless a test injects a selector.
@@ -1032,4 +1033,436 @@ async fn a_failed_metadata_probe_does_not_claim_no_providers_were_located() {
         !text.contains("no providers located"),
         "a failed metadata probe must NOT claim locate found nobody; got {text}"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// #1612 — the artifact PROMOTED must be provably the artifact VERIFIED (the E class, proven on the
+// module path). #1605 — a crash-RESUMED download must still end in the chain-binding backstop.
+// ---------------------------------------------------------------------------------------------
+
+/// A [`FileSink`] wrapper whose `truncate` claims success while shortening NOTHING — the sink a
+/// well-meaning implementer produces by "supporting" truncation as a no-op.
+///
+/// It exists to keep the promotion guard from rotting: if the shortening were the ONLY enforcement,
+/// this sink would promote a longer artifact and the guard would be decoration. Driving the real
+/// promotion path with it proves the read-back CONFIRM probe is what actually gates promotion.
+struct TruncateIgnoringSink(FileSink);
+
+#[async_trait::async_trait]
+impl Sink for TruncateIgnoringSink {
+    async fn write_at(&self, offset: u64, bytes: &[u8]) -> Result<(), DownloadError> {
+        self.0.write_at(offset, bytes).await
+    }
+    async fn finalize(&self) -> Result<(), DownloadError> {
+        self.0.finalize().await
+    }
+    async fn truncate(&self, _len: u64) -> Result<(), DownloadError> {
+        Ok(()) // claims success, shortens nothing
+    }
+    async fn read_at(&self, offset: u64, len: u64) -> Result<Vec<u8>, DownloadError> {
+        self.0.read_at(offset, len).await
+    }
+    fn staging_path(&self) -> Option<&std::path::Path> {
+        self.0.staging_path()
+    }
+}
+
+/// Stage `filler` bytes into the target's `.download.tmp` — a leftover from an earlier, LONGER
+/// abandoned attempt (a demoted holder's fabrication, or another shape's partial pull).
+fn stage_leftover(final_path: &std::path::Path, filler: &[u8]) {
+    std::fs::write(dig_download::staging_path_for(final_path), filler).unwrap();
+}
+
+#[tokio::test]
+async fn a_longer_leftover_staging_tail_never_survives_into_the_promoted_resource() {
+    // #1612 (E class, RED without the promotion seam): the download verifies 8 honest bytes and
+    // `finalize()` promotes the STAGING AREA. A staging area is written by offset and never shortened,
+    // so a 32-byte leftover from an earlier attempt makes the promoted artifact "8 honest bytes + 24
+    // attacker bytes" while `join()` returns Ok(8) — an honest node then re-announces itself as an
+    // authoritative source of a corrupt resource.
+    let content = MockContent::even(8, 1);
+    let cid = mock_content_id();
+    let dir = temp_dir("promote-tail");
+    let final_path = dir.join("resource.dig");
+    stage_leftover(&final_path, &[0xAA; 32]);
+
+    let dl = downloader(
+        Arc::new(MockRangeTransport::new(content.clone())),
+        Arc::new(MockProviderLocator::fixed(vec![mock_provider(1, &cid)])),
+        Arc::new(InMemoryStateStore::new()),
+        Arc::new(MerkleVerifier::insecure_structural_only()),
+        test_config(8),
+    );
+    let sink: Arc<dyn Sink> = Arc::new(FileSink::new(&final_path));
+    let total = join_ok(dl.download(cid, sink, DownloadOptions::default()))
+        .await
+        .expect("the honest bytes verify, so the pull itself succeeds");
+
+    assert_eq!(total, 8);
+    assert_eq!(
+        std::fs::read(&final_path).unwrap(),
+        content.bytes,
+        "the promoted artifact is byte-equal to the VERIFIED bytes — no attacker tail rides along"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn a_sink_that_ignores_truncate_cannot_promote_an_unproven_artifact() {
+    // Anti-rot: the shortening must not be the only enforcement. A sink that reports truncation
+    // success without shortening anything must FAIL CLOSED at the read-back confirm probe rather than
+    // promote a longer-than-verified artifact.
+    let content = MockContent::even(8, 1);
+    let cid = mock_content_id();
+    let dir = temp_dir("promote-norot");
+    let final_path = dir.join("resource.dig");
+    stage_leftover(&final_path, &[0xBB; 32]);
+
+    let dl = downloader(
+        Arc::new(MockRangeTransport::new(content.clone())),
+        Arc::new(MockProviderLocator::fixed(vec![mock_provider(1, &cid)])),
+        Arc::new(InMemoryStateStore::new()),
+        Arc::new(MerkleVerifier::insecure_structural_only()),
+        test_config(8),
+    );
+    let sink: Arc<dyn Sink> = Arc::new(TruncateIgnoringSink(FileSink::new(&final_path)));
+    let result = join_ok(dl.download(cid, sink, DownloadOptions::default())).await;
+
+    assert!(
+        matches!(result, Err(DownloadError::Verify(_))),
+        "an unproven promotion is refused, not reported as success; got {result:?}"
+    );
+    assert!(
+        !final_path.exists(),
+        "nothing was promoted onto the final path"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn a_resumed_download_still_binds_the_whole_resource_to_the_chain_root() {
+    // #1605 (RED without the resume backstop): run 1 verifies + persists two ranges, then is
+    // interrupted. Between the runs the staging file is TAMPERED inside the already-"done" prefix —
+    // right length, wrong bytes, so the per-range structural check cannot see it. Previously the
+    // resumed run created NO whole-resource hasher, skipped the chain-binding backstop entirely, and
+    // promoted the tampered resource as a success. A resumed download must end in the SAME
+    // chain-binding check as a fresh one.
+    let content = MockContent::even(40, 4);
+    let cid = mock_content_id();
+    let dir = temp_dir("resume-backstop");
+    let final_path = dir.join("resource.dig");
+    let state: Arc<dyn StateStore> = Arc::new(InMemoryStateStore::new());
+    let verifier: Arc<dyn Verifier> = Arc::new(MerkleVerifier::with_proof_verifier(Arc::new(
+        OnlyLeaf(MerkleVerifier::resource_leaf(&content.bytes)),
+    )));
+
+    // --- Run 1: two ranges verified + checkpointed, then interrupted.
+    let transport_a = Arc::new(MockRangeTransport::new(content.clone()));
+    transport_a.set_delay(Duration::from_millis(10)).await;
+    let dl_a = downloader(
+        transport_a,
+        Arc::new(MockProviderLocator::fixed(vec![mock_provider(1, &cid)])),
+        state.clone(),
+        verifier.clone(),
+        test_config(10),
+    );
+    let mut handle = dl_a.download(
+        cid,
+        Arc::new(FileSink::new(&final_path)),
+        DownloadOptions::default(),
+    );
+    let mut done_in_run1: Vec<usize> = Vec::new();
+    while let Some(ev) = handle.next_event().await {
+        if let DownloadEvent::RangeCompleted { range, .. } = ev {
+            done_in_run1.push(range);
+            if done_in_run1.len() == 2 {
+                handle.cancel();
+                break;
+            }
+        }
+    }
+    assert!(matches!(handle.join().await, Err(DownloadError::Cancelled)));
+    assert_eq!(done_in_run1.len(), 2);
+
+    // --- Tamper the staging file INSIDE a range run 1 recorded as done + verified.
+    let staging = dig_download::staging_path_for(&final_path);
+    let mut staged = std::fs::read(&staging).unwrap();
+    staged[done_in_run1[0] * 10] ^= 0xFF;
+    std::fs::write(&staging, &staged).unwrap();
+
+    // --- Run 2: an honest transport resumes. The tampered prefix must fail the backstop.
+    let dl_b = downloader(
+        Arc::new(MockRangeTransport::new(content.clone())),
+        Arc::new(MockProviderLocator::fixed(vec![mock_provider(1, &cid)])),
+        state.clone(),
+        verifier.clone(),
+        test_config(10),
+    );
+    let resumed = join_ok(dl_b.download(
+        cid,
+        Arc::new(FileSink::new(&final_path)),
+        DownloadOptions::default(),
+    ))
+    .await;
+    assert!(
+        matches!(resumed, Err(DownloadError::Verify(_))),
+        "a resumed download runs the chain-binding backstop and fails closed on tampered resumed \
+         bytes; got {resumed:?}"
+    );
+    assert!(
+        !final_path.exists(),
+        "unverified resumed bytes are never promoted"
+    );
+
+    // --- Run 3: the failed backstop discarded the poisoned checkpoint + staging, so a further
+    // attempt re-fetches everything and completes — fail-closed must not mean permanently denied.
+    let dl_c = downloader(
+        Arc::new(MockRangeTransport::new(content.clone())),
+        Arc::new(MockProviderLocator::fixed(vec![mock_provider(1, &cid)])),
+        state,
+        verifier,
+        test_config(10),
+    );
+    let total = join_ok(dl_c.download(
+        cid,
+        Arc::new(FileSink::new(&final_path)),
+        DownloadOptions::default(),
+    ))
+    .await
+    .expect("a clean re-attempt after the poisoned resume succeeds");
+    assert_eq!(total, 40);
+    assert_eq!(std::fs::read(&final_path).unwrap(), content.bytes);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Second-round gate fixes: the resource-size ceiling (#1608), the two-sided promotion length proof,
+// and staging-area exclusivity.
+// ---------------------------------------------------------------------------------------------
+
+/// GATE #2 — a peer-DECLARED resource length must be bounded before it is believed.
+///
+/// The metadata probe adopts the first frame's `total_length` / `chunk_lens` from a peer that has proven
+/// nothing (the `want_root` check only compares an echoed hex string, and is skipped when the frame
+/// carries no root). `plan_ranges` always takes at least one WHOLE chunk regardless of the window, so a
+/// declared `chunk_lens: [2^40]` became a single `Range { offset: 0, length: 2^40 }` and the range
+/// assembler then buffered against `max_len = 2^40` — one small frame with a high `offset` was enough to
+/// drive a terabyte allocation. Bounded now, before any layout exists.
+#[tokio::test]
+async fn an_absurd_declared_resource_length_is_refused_before_any_plan_exists() {
+    const TIB: u64 = 1 << 40;
+    let cid = mock_content_id();
+    // The holder declares a 1 TiB resource in ONE chunk and confirms availability for it.
+    let huge = MockContent::even(32, 1).declaring(TIB, vec![TIB]);
+    let transport = Arc::new(MockRangeTransport::new(huge));
+
+    let dl = downloader(
+        transport,
+        Arc::new(MockProviderLocator::fixed(vec![mock_provider(1, &cid)])),
+        Arc::new(InMemoryStateStore::new()),
+        Arc::new(MerkleVerifier::insecure_structural_only()),
+        test_config(10),
+    );
+    let sink = Arc::new(InMemorySink::new());
+    let result = join_ok(dl.download(cid, sink.clone(), DownloadOptions::default())).await;
+
+    assert!(
+        matches!(result, Err(DownloadError::NotFound { .. })),
+        "an over-ceiling commitment is never adopted, so no holder can seed the download; got \
+         {result:?}"
+    );
+    assert!(
+        sink.contents().await.is_empty(),
+        "and nothing was ever staged for it"
+    );
+}
+
+/// GATE — with the whole-resource backstop DISABLED, staged bytes are still never TRUSTED.
+///
+/// The checkpoint outlives its staging file for real: `TmpGc::sweep` reaps `<target>.download.tmp` plus
+/// its `.state` sidecar, while `FileStateStore` keeps checkpoints under a different filename entirely. So
+/// a resume can find every range marked done over bytes that are wrong, short, or absent.
+///
+/// Rehydration used to bail out when there was no hasher, which left every range `Done`, `all_done()`
+/// immediately true, zero fetches and zero verification — and the staging file was promoted as a
+/// verified success. With a file of the RIGHT length that is exactly `Ok(total_length)` over ARBITRARY
+/// bytes, which the node then caches and advertises itself as a holder of. Per-range checks cannot catch
+/// it (they are structural), so with nothing able to bind staged bytes to the commitment they are
+/// RE-FETCHED instead of trusted: the download recovers and the garbage never survives.
+#[tokio::test]
+async fn staged_bytes_are_never_trusted_when_the_backstop_is_disabled() {
+    let content = MockContent::even(40, 4);
+    let cid = mock_content_id();
+    let dir = temp_dir("untrusted-staging");
+    let final_path = dir.join("resource.dig");
+
+    // A checkpoint claiming all four ranges are done + verified …
+    let state = Arc::new(InMemoryStateStore::new());
+    let mut checkpoint = dig_download::DownloadState::new(dig_download::download_key(&cid));
+    checkpoint.total_length = 40;
+    checkpoint.chunk_lens = vec![10, 10, 10, 10];
+    for range in 0..4 {
+        checkpoint.mark_done(range);
+    }
+    state.save(&checkpoint).await.unwrap();
+    // … over a staging file of exactly the right LENGTH holding entirely attacker bytes.
+    let garbage = vec![0xAAu8; 40];
+    std::fs::write(dig_download::staging_path_for(&final_path), &garbage).unwrap();
+
+    let mut config = test_config(10);
+    config.verify_whole_resource = false; // drops chain-anchoring — and the ability to trust staging
+    let transport = Arc::new(MockRangeTransport::new(content.clone()));
+    let dl = downloader(
+        transport.clone(),
+        Arc::new(MockProviderLocator::fixed(vec![mock_provider(1, &cid)])),
+        state,
+        Arc::new(MerkleVerifier::insecure_structural_only()),
+        config,
+    );
+    let sink: Arc<dyn Sink> = Arc::new(FileSink::new(&final_path));
+    let total = join_ok(dl.download(cid, sink, DownloadOptions::default()))
+        .await
+        .expect("the ranges are re-fetched, so the download completes");
+
+    assert_eq!(total, 40);
+    let promoted = std::fs::read(&final_path).unwrap();
+    assert_eq!(
+        promoted, content.bytes,
+        "the promoted artifact is the fetched content — arbitrary staged bytes never survive"
+    );
+    assert_ne!(
+        promoted, garbage,
+        "and specifically not the attacker's bytes"
+    );
+    for range in 0..4u64 {
+        assert_eq!(
+            transport.attempts_at(range * 10).await,
+            1,
+            "every range was re-fetched rather than trusted from staging"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// GATE #3b — one staging area, one download.
+///
+/// Two downloads of the same target share a `.download.tmp` AND a resume checkpoint with no
+/// coordination: they write over each other by offset, and either can `truncate` the other's bytes away
+/// (which the length proof above then refuses — a corruption turned into a baffling failure). Since
+/// per-range verification is structural, a sibling's right-length bytes are not even distinguishable
+/// from this download's own. The staging path is therefore claimed EXCLUSIVELY and the second download
+/// refuses to start.
+#[tokio::test]
+async fn a_second_download_refuses_to_share_a_live_staging_area() {
+    let content = MockContent::even(30, 3);
+    let cid = mock_content_id();
+    let dir = temp_dir("staging-exclusive");
+    let final_path = dir.join("resource.dig");
+
+    let transport = Arc::new(MockRangeTransport::new(content.clone()));
+    transport.set_delay(Duration::from_millis(200)).await; // keep the first download in flight
+    let dl = downloader(
+        transport,
+        Arc::new(MockProviderLocator::fixed(vec![mock_provider(1, &cid)])),
+        Arc::new(InMemoryStateStore::new()),
+        Arc::new(MerkleVerifier::insecure_structural_only()),
+        test_config(10),
+    );
+
+    let first: Arc<dyn Sink> = Arc::new(FileSink::new(&final_path));
+    let first_handle = dl.download(cid, first, DownloadOptions::default());
+    // Let the first download claim its staging path.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let second: Arc<dyn Sink> = Arc::new(FileSink::new(&final_path));
+    let second_result = join_ok(dl.download(cid, second, DownloadOptions::default())).await;
+    // The MESSAGE is the discriminator, not the variant: a download that goes ahead and shares the
+    // staging area also tends to end in a `Sink` error (its sibling renames the file out from under it),
+    // so asserting the variant alone would pass with no exclusivity at all.
+    let reason = match &second_result {
+        Err(e) => e.to_string(),
+        Ok(len) => {
+            panic!("the second download must not succeed on a shared staging area: Ok({len})")
+        }
+    };
+    assert!(
+        reason.contains("refusing to share a staging area"),
+        "it is REFUSED UP FRONT for sharing, not failed incidentally later; got {reason}"
+    );
+
+    // And the FIRST download is unharmed — it completes and promotes exactly its verified bytes.
+    let total = join_ok(first_handle)
+        .await
+        .expect("the holder of the claim completes");
+    assert_eq!(total, 30);
+    assert_eq!(std::fs::read(&final_path).unwrap(), content.bytes);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// GATE — a promotion refusal must be RECOVERABLE, not a permanent per-target denial.
+///
+/// A refused promotion means the staged artifact was not the verified one. If the checkpoint that led
+/// there survives, every later fetch of that content repeats the same refusal forever — and that state is
+/// reachable with no attacker, since GC reaps `<target>.download.tmp` plus its `.state` sidecar while the
+/// `StateStore` keeps its checkpoint under an unrelated filename. Two sibling paths (a failed
+/// whole-resource check, an abandoned descriptor plan) already self-heal; this one must too.
+///
+/// Driven through a sink whose `truncate` reports success without shortening, so the refusal is the
+/// long-side promotion proof rather than any earlier check.
+#[tokio::test]
+async fn a_refused_promotion_discards_its_checkpoint_so_a_later_attempt_can_succeed() {
+    let content = MockContent::even(8, 1);
+    let cid = mock_content_id();
+    let dir = temp_dir("refusal-recovers");
+    let final_path = dir.join("resource.dig");
+    let state: Arc<dyn StateStore> = Arc::new(InMemoryStateStore::new());
+    stage_leftover(&final_path, &[0xCC; 32]); // a longer leftover from an earlier attempt
+
+    // Attempt 1: the leftover tail cannot be shortened, so the promotion is refused.
+    let dl = downloader(
+        Arc::new(MockRangeTransport::new(content.clone())),
+        Arc::new(MockProviderLocator::fixed(vec![mock_provider(1, &cid)])),
+        state.clone(),
+        Arc::new(MerkleVerifier::insecure_structural_only()),
+        test_config(8),
+    );
+    let refused: Arc<dyn Sink> = Arc::new(TruncateIgnoringSink(FileSink::new(&final_path)));
+    let result = join_ok(dl.download(cid, refused, DownloadOptions::default())).await;
+    assert!(
+        matches!(result, Err(DownloadError::Verify(_))),
+        "the unproven promotion is refused; got {result:?}"
+    );
+    assert!(
+        state
+            .load(&dig_download::download_key(&cid))
+            .await
+            .unwrap()
+            .is_none(),
+        "and the checkpoint that led to the refusal is DISCARDED — fail-closed is not permanent denial"
+    );
+
+    // Attempt 2: an ordinary sink for the same target now succeeds from a clean slate.
+    let dl2 = downloader(
+        Arc::new(MockRangeTransport::new(content.clone())),
+        Arc::new(MockProviderLocator::fixed(vec![mock_provider(1, &cid)])),
+        state,
+        Arc::new(MerkleVerifier::insecure_structural_only()),
+        test_config(8),
+    );
+    let total = join_ok(dl2.download(
+        cid,
+        Arc::new(FileSink::new(&final_path)),
+        DownloadOptions::default(),
+    ))
+    .await
+    .expect("the retry is not denied by the previous refusal");
+    assert_eq!(total, 8);
+    assert_eq!(std::fs::read(&final_path).unwrap(), content.bytes);
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
