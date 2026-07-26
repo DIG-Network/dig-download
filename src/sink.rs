@@ -39,6 +39,20 @@ pub trait Sink: Send + Sync {
         Ok(())
     }
 
+    /// Read back `len` bytes previously [`write_at`](Self::write_at)-ten at `offset` from the staging
+    /// area, if this sink supports it.
+    ///
+    /// A whole-`.dig`-module pull ([`ModuleDownloader`](crate::ModuleDownloader)) needs the FULL
+    /// assembled blob to run its final whole-blob-hash + chain-anchor gate, so on **resume** it reads
+    /// the already-verified chunks back rather than re-fetching them over the network. Staging sinks
+    /// ([`InMemorySink`], [`FileSink`]) implement it; a sink that cannot read back returns the default
+    /// [`DownloadError::Sink`] "read-back unsupported", and the module puller gracefully degrades by
+    /// RE-FETCHING those chunks (still correct — never a silent partial). Resource downloads never
+    /// call this.
+    async fn read_at(&self, _offset: u64, _len: u64) -> Result<Vec<u8>, DownloadError> {
+        Err(DownloadError::sink("read-back unsupported by this sink"))
+    }
+
     /// The staging (`.download.tmp`) path this sink writes into before finalize, if any. The
     /// orchestrator registers it with the [`ActiveDownloads`](crate::gc::ActiveDownloads) registry so
     /// GC does not reap a live/paused-resumable download's staging file. In-memory sinks return
@@ -93,6 +107,19 @@ impl Sink for InMemorySink {
     async fn finalize(&self) -> Result<(), DownloadError> {
         self.inner.lock().await.finalized = true;
         Ok(())
+    }
+
+    async fn read_at(&self, offset: u64, len: u64) -> Result<Vec<u8>, DownloadError> {
+        let inner = self.inner.lock().await;
+        let start = offset as usize;
+        let end = start + len as usize;
+        if inner.buf.len() < end {
+            return Err(DownloadError::sink(format!(
+                "read-back past staged end: want [{start}, {end}), have {}",
+                inner.buf.len()
+            )));
+        }
+        Ok(inner.buf[start..end].to_vec())
     }
 }
 
@@ -173,6 +200,31 @@ impl Sink for FileSink {
             .map_err(DownloadError::sink)?;
         f.write_all(bytes).map_err(DownloadError::sink)?;
         Ok(())
+    }
+
+    async fn read_at(&self, offset: u64, len: u64) -> Result<Vec<u8>, DownloadError> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut guard = self.file.lock().await;
+        // On a cross-process resume the staging file exists on disk but is not yet open in THIS
+        // process — open it read/write (never truncating) so a subsequent write_at reattaches.
+        if guard.is_none() {
+            let f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&self.tmp_path)
+                .map_err(DownloadError::sink)?;
+            *guard = Some(f);
+        }
+        let f = guard.as_mut().expect("file opened above");
+        f.seek(SeekFrom::Start(offset))
+            .map_err(DownloadError::sink)?;
+        let mut buf = vec![0u8; len as usize];
+        f.read_exact(&mut buf).map_err(|e| {
+            DownloadError::sink(format!("read-back of {len} bytes at {offset} failed: {e}"))
+        })?;
+        Ok(buf)
     }
 
     async fn finalize(&self) -> Result<(), DownloadError> {

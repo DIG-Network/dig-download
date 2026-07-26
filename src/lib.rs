@@ -78,6 +78,7 @@ pub mod addr;
 pub mod error;
 pub mod gc;
 pub mod locate;
+pub mod module;
 pub mod orchestrator;
 pub mod plan;
 pub mod progress;
@@ -98,6 +99,13 @@ pub use addr::{candidate_socket, dial_candidates, AddrError, MAX_DIAL_CANDIDATES
 pub use error::{DownloadError, VerifyError};
 pub use gc::{ActiveDownloads, GcConfig, TmpGc};
 pub use locate::{DhtProviderLocator, ProviderLocator};
+pub use module::{
+    module_content_id, module_download_key, AcceptAnyModuleAnchor, ModuleAnchorVerifier,
+    ModuleDownloadConfig, ModuleDownloader, ModuleTransport,
+};
+// Re-export the wire descriptor so consumers use ONE `ModuleInfo` shape (the dig-rpc-protocol
+// byte-contract) across the module pull — no divergent local copy (#1576).
+pub use dig_rpc_protocol::types::ModuleInfo;
 pub use orchestrator::{
     download_key, DownloadConfig, DownloadHandle, DownloadOptions, Downloader,
     DEFAULT_RANGE_TIMEOUT, DEFAULT_REFRESH_INTERVAL,

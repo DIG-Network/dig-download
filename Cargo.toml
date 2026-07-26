@@ -48,6 +48,14 @@ dig-constants = "0.8"
 # NC-7: prefer the crates.io release over bare-git.
 dig-dht = "0.5.1"
 
+# WIRE — the whole-`.dig`-module pull descriptor + method names (#1576). `ModuleInfo`
+# (`total_size` / `module_hash` / `chunk_hashes` / `chunk_lens`) is the canonical byte-contract a
+# `getModuleInfo` handshake returns; the `ModuleDownloader` consumes it directly rather than
+# re-declaring the shape (single source of truth, no drift vs the dig-node serve leg). Foundation-level
+# (L00), zero DIG deps — a legal downward edge from L30. NC-7: prefer the crates.io release over
+# bare-git.
+dig-rpc-protocol = "0.5"
+
 # REACH + FETCH — the mTLS peer transport the range fetch rides: `dig.getAvailability` +
 # `dig.fetchRange` over dig-nat mux streams, plus the wire shapes (`RangeRequest`, `RangeFrame`,
 # `AvailabilityItem`/`Answer`/`Response`) and `PeerId`/`PeerTarget`/`NodeCert`/`connect`.

@@ -14,6 +14,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use dig_dht::{CandidateAddr, ContentId, PeerId, ProviderRecord};
 use dig_nat::{AvailabilityAnswer, AvailabilityItem, AvailabilityResponse};
+use dig_rpc_protocol::types::ModuleInfo;
 use tokio::sync::Mutex;
 
 use crate::error::DownloadError;
@@ -414,6 +415,164 @@ pub fn mock_peer_hex(n: u8) -> String {
 /// (HIGH #179), so the two must agree for an honest download to proceed.
 pub fn mock_content_id() -> ContentId {
     ContentId::resource([1; 32], [0xAB; 32], [3; 32])
+}
+
+// ===========================================================================
+// Whole-`.dig`-module pull doubles (#1576) — drive a `ModuleDownloader` with NO real network.
+// ===========================================================================
+
+/// An in-memory [`ModuleTransport`](crate::module::ModuleTransport) over a known "true" module blob:
+/// it answers `dig.getModuleInfo` with the blob's descriptor and `dig.fetchModuleRange` with the
+/// requested window — with configurable per-holder misbehaviour (a holder that TAMPERS a chunk, a
+/// success BUDGET that starves the pull mid-way to model an interrupt, and a corrupted whole-blob
+/// `module_hash`) so a test can exercise the fail-closed + resume paths. Every fetch is recorded as
+/// `(peer_id, offset)` so a test can assert the pull was MULTI-SOURCE and did not re-fetch a resumed
+/// chunk.
+pub struct MockModuleTransport {
+    store_id: String,
+    root: String,
+    blob: Vec<u8>,
+    chunk_size: usize,
+    tamper_peer: Option<String>,
+    corrupt_module_hash: bool,
+    budget: Option<Arc<AtomicUsize>>,
+    fetches: Mutex<Vec<(String, u64)>>,
+}
+
+impl MockModuleTransport {
+    /// A transport serving `blob` for `(store_id, root)` split into `chunk_size`-byte chunks, with no
+    /// misbehaviour.
+    pub fn serving(store_id: &str, root: &str, blob: Vec<u8>, chunk_size: usize) -> Self {
+        MockModuleTransport {
+            store_id: store_id.to_string(),
+            root: root.to_string(),
+            blob,
+            chunk_size,
+            tamper_peer: None,
+            corrupt_module_hash: false,
+            budget: None,
+            fetches: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// This holder serves corrupted bytes for every chunk (flips the first byte) — models a lying
+    /// source a puller must reject + route around.
+    pub fn tampering(mut self, peer_id: &str) -> Self {
+        self.tamper_peer = Some(peer_id.to_string());
+        self
+    }
+
+    /// `getModuleInfo` reports a wrong whole-blob `module_hash` (per-chunk hashes stay honest) — models
+    /// a descriptor that passes every per-chunk check yet fails the whole-blob gate.
+    pub fn with_corrupt_module_hash(mut self) -> Self {
+        self.corrupt_module_hash = true;
+        self
+    }
+
+    /// Only `n` `fetchModuleRange` calls succeed; the rest error — models an interrupt after partial
+    /// progress so a test can assert resume re-fetches ONLY the missing chunks.
+    pub fn with_success_budget(mut self, n: usize) -> Self {
+        self.budget = Some(Arc::new(AtomicUsize::new(n)));
+        self
+    }
+
+    /// A snapshot of every `(peer_id, offset)` served (to assert multi-source + no-refetch-on-resume).
+    pub async fn fetches(&self) -> Vec<(String, u64)> {
+        self.fetches.lock().await.clone()
+    }
+
+    /// The descriptor this transport reports (the honest chunk layout + hashes).
+    fn descriptor(&self) -> ModuleInfo {
+        let mut chunk_hashes = Vec::new();
+        let mut chunk_lens = Vec::new();
+        for chunk in self.blob.chunks(self.chunk_size.max(1)) {
+            chunk_hashes.push(hex_sha256(chunk));
+            chunk_lens.push(chunk.len() as u64);
+        }
+        let module_hash = if self.corrupt_module_hash {
+            "0".repeat(64)
+        } else {
+            hex_sha256(&self.blob)
+        };
+        ModuleInfo {
+            total_size: self.blob.len() as u64,
+            module_hash,
+            chunk_hashes,
+            chunk_lens,
+        }
+    }
+}
+
+#[async_trait]
+impl crate::module::ModuleTransport for MockModuleTransport {
+    async fn get_module_info(
+        &self,
+        _provider_peer_id: &str,
+        store_id: &str,
+        root: &str,
+    ) -> Result<ModuleInfo, DownloadError> {
+        if store_id != self.store_id || root != self.root {
+            return Err(DownloadError::transport("mock", "unknown (store_id, root)"));
+        }
+        Ok(self.descriptor())
+    }
+
+    async fn fetch_module_range(
+        &self,
+        provider_peer_id: &str,
+        _store_id: &str,
+        _root: &str,
+        offset: u64,
+        length: u64,
+    ) -> Result<Vec<u8>, DownloadError> {
+        if let Some(budget) = &self.budget {
+            // `fetch_sub` returns the PREVIOUS value; 0 means the budget was already spent.
+            if budget.fetch_sub(1, Ordering::SeqCst) == 0 {
+                budget.fetch_add(1, Ordering::SeqCst); // keep it pinned at 0
+                return Err(DownloadError::transport(provider_peer_id, "budget spent"));
+            }
+        }
+        self.fetches
+            .lock()
+            .await
+            .push((provider_peer_id.to_string(), offset));
+
+        let start = offset as usize;
+        let end = (start + length as usize).min(self.blob.len());
+        let mut bytes = self.blob[start..end].to_vec();
+        if self.tamper_peer.as_deref() == Some(provider_peer_id) && !bytes.is_empty() {
+            bytes[0] ^= 0xFF;
+        }
+        Ok(bytes)
+    }
+}
+
+/// The 64-hex SHA-256 of `bytes` (test-side mirror of the puller's chunk/module content-id).
+fn hex_sha256(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(64);
+    for b in digest {
+        out.push(char::from_digit((b >> 4) as u32, 16).unwrap());
+        out.push(char::from_digit((b & 0x0f) as u32, 16).unwrap());
+    }
+    out
+}
+
+/// A [`ModuleAnchorVerifier`](crate::module::ModuleAnchorVerifier) that REJECTS every blob — models
+/// content that assembles + whole-blob-hashes cleanly yet is not the chain-anchored module.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RejectAllModuleAnchor;
+
+impl crate::module::ModuleAnchorVerifier for RejectAllModuleAnchor {
+    fn verify_module_anchor(&self, _module: &[u8], _store_id: &str, _root: &str) -> bool {
+        false
+    }
+}
+
+/// Build `n` mock holders (peers `1..=n`) of `content` — the multi-source holder set for a module pull.
+pub fn mock_providers(n: u8, content: &ContentId) -> Vec<ProviderRecord> {
+    (1..=n).map(|i| mock_provider(i, content)).collect()
 }
 
 #[cfg(test)]
