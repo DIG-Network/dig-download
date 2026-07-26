@@ -276,7 +276,9 @@ A provider record's candidate `host` is an IP **literal** (IPv4, IPv6, or v4-map
   file; a crash MUST leave only a `.download.tmp`, never a corrupt final file.
 - **Explicit shortening** — because writing never shortens a staging area, a sink exposes `truncate(len)`,
   which reduces it to `len` bytes and never extends it. This is how a caller proves the promoted artifact is
-  the verified one (§17.5b); the trait default is a no-op, so an existing implementation stays valid.
+  the verified one (§17.5b); the trait default is **fail-closed** (an error), matching `read_at`'s default —
+  a sink with no staging area to shorten MUST opt in explicitly (`Ok(())`, asserting it commits whole) rather
+  than inherit a silent no-op, which used to combine with `read_at`'s default to promote an un-truncated tail.
 - **Resume** — per-range progress is checkpointed to a `StateStore`. A paused or crashed download
   resumes into the same staging file and re-fetches ONLY the still-missing ranges; a verified range is
   never re-fetched.
@@ -515,16 +517,20 @@ reshare: the bytes verify per chunk, the pull assembles, and only the final gate
 - Demotion is bounded by `MAX_DESCRIPTOR_ATTEMPTS` (3) and by the supply of un-demoted holders; when it is
   exhausted the pull fails with the **descriptor** failure (a gate `Verify`), never a `NotFound` — blaming
   discovery for a descriptor lie is the ambiguity §17.4's reason-surfacing rule exists to prevent.
-- **A chunk-level exhaustion under an UNVERIFIED descriptor IS a descriptor failure (MUST).** Exhaustion
-  is ambiguous: unavailable bytes and an unsatisfiable descriptor are indistinguishable from inside one
-  attempt. A holder that fabricates `chunk_hashes` (rather than `module_hash`) serves ZERO bytes and never
-  reaches a final gate, so treating exhaustion as terminal would let the cheapest possible liar deny a
-  capsule's reshare permanently. The bound is whether ANY chunk has verified under that descriptor:
+- **Exhaustion with NO verified chunk is attributed to the descriptor (MUST).** Exhaustion is ambiguous:
+  unavailable bytes and an unsatisfiable descriptor are indistinguishable from inside one attempt. A holder
+  that fabricates `chunk_hashes` (rather than `module_hash`) serves ZERO bytes and never reaches a final
+  gate, so treating exhaustion as terminal would let the cheapest possible liar deny a capsule's reshare
+  permanently. The bound is whether ANY chunk has verified under that descriptor:
   - no chunk has ever verified → the descriptor is the suspect: demote its source and re-handshake
     (subject to the same `MAX_DESCRIPTOR_ATTEMPTS` + un-demoted-holder bounds);
   - at least one chunk HAS verified → the descriptor is credible, so the exhaustion is genuinely missing
     bytes and is terminal.
   A chunk rehydrated from staging is verified against this descriptor's hashes and therefore counts.
+  **Residual (known, tracked separately, not a poisoning primitive):** the bound flips on the FIRST verified
+  chunk, so a holder that lets exactly one chunk verify (e.g. a descriptor declaring a 1-byte first chunk)
+  can still force every later exhaustion to classify as terminal — a bounded one-chunk denial, not a
+  falsified artifact.
 
 ### 17.5b Promotion (MUST — the promoted artifact IS the verified artifact)
 

@@ -47,11 +47,25 @@ pub trait Sink: Send + Sync {
     /// the promoted artifact IS the verified one, so the module puller shortens the staging area to the
     /// verified length before finalizing, and resets it to 0 when it abandons a plan.
     ///
-    /// Only ever SHRINKS: a `len` at or beyond the staged end is a no-op (never zero-extends). A sink
-    /// with no staging area to shorten (a store-write sink that commits whole) can keep the default
-    /// no-op — it never promotes a partially-overwritten staging file in the first place.
+    /// Only ever SHRINKS: a `len` at or beyond the staged end is a no-op (never zero-extends).
+    ///
+    /// The default is **fail-closed**, matching [`read_at`](Self::read_at)'s default: an
+    /// implementation that does not override this returns [`DownloadError::Sink`]. A silent no-op
+    /// default here used to combine with `read_at`'s fail-closed default to fail OPEN — `truncate`
+    /// claimed success without shortening anything, so the module puller's "bytes past the verified
+    /// end" promotion probe read `read_at`'s "unsupported" as "nothing past the end" and promoted
+    /// whatever longer, un-truncated bytes were staged.
+    ///
+    /// A sink with genuinely no staging area to shorten — a store-write sink that commits the WHOLE
+    /// resource in one shot and can never hold a partially-overwritten tail — MUST opt IN explicitly
+    /// rather than inherit a default:
+    /// ```ignore
+    /// async fn truncate(&self, _len: u64) -> Result<(), DownloadError> {
+    ///     Ok(()) // asserts: this sink commits whole, so there is never a tail to shrink
+    /// }
+    /// ```
     async fn truncate(&self, _len: u64) -> Result<(), DownloadError> {
-        Ok(())
+        Err(DownloadError::sink("truncation unsupported by this sink"))
     }
 
     /// Read back `len` bytes previously [`write_at`](Self::write_at)-ten at `offset` from the staging

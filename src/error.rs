@@ -206,7 +206,7 @@ impl DownloadError {
 
 /// Why a fetched range or a reassembled resource failed integrity — the checks of L7 §9
 /// "per-range integrity". A [`VerifyError`] on a range marks its source suspect + re-fetches.
-#[derive(Debug, Error, Clone, PartialEq, Eq)]
+#[derive(Error, Clone, PartialEq, Eq)]
 pub enum VerifyError {
     /// A returned range's byte length did not match the sum of the `chunk_lens` for the chunk(s) it
     /// was supposed to cover — the cheapest, per-range detection of a bad/truncated source.
@@ -239,6 +239,24 @@ pub enum VerifyError {
     /// / `root`) required to establish or check the commitment.
     #[error("first frame is missing verification metadata ({0})")]
     MissingMetadata(String),
+}
+
+/// `Debug` sanitizes the wrapped text the same way [`DownloadError::Verify`]'s `Display` does, rather
+/// than printing the derived struct fields verbatim.
+///
+/// `Metadata` / `Alignment` / `MissingMetadata` carry peer-reported text (a first-frame `root`, a
+/// declared length) — the same untrusted-text class [`DownloadError`]'s own manual `Debug` guards.
+/// `DownloadError::Verify`'s `Display` already sanitizes a WRAPPED `VerifyError`, but a bare one
+/// reaches `{:?}` too (an `unwrap`/`expect` panic, a raw `tracing::error!(?e)`) — this closes that
+/// second door with the same [`sanitize_untrusted_text`] the wrapping site uses.
+impl std::fmt::Debug for VerifyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "VerifyError({})",
+            sanitize_untrusted_text(&self.to_string(), MAX_ERROR_REASON_CHARS)
+        )
+    }
 }
 
 #[cfg(test)]
@@ -298,6 +316,23 @@ mod tests {
         assert!(
             !rendered.contains('\n'),
             "a wrapped verify reason forges a second line: {rendered}"
+        );
+        assert!(
+            rendered.contains("deadbeef"),
+            "still diagnosable: {rendered}"
+        );
+    }
+
+    /// A bare (unwrapped) `VerifyError`'s `{:?}` must sanitize too — not just `DownloadError::Verify`'s
+    /// `Display`. `unwrap`/`expect` on a `Result<_, VerifyError>` and a raw `tracing::error!(?e)` both
+    /// go through `Debug` directly, bypassing the wrapping site entirely.
+    #[test]
+    fn a_bare_verify_error_debug_is_sanitized_too() {
+        let hostile = "root deadbeef\n[FATAL] forged by a peer != committed abc";
+        let rendered = format!("{:?}", VerifyError::Metadata(hostile.to_string()));
+        assert!(
+            !rendered.contains('\n'),
+            "a bare Debug forges a second line: {rendered}"
         );
         assert!(
             rendered.contains("deadbeef"),

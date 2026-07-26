@@ -1741,14 +1741,21 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A sink that IGNORES `truncate` — an external implementation on the trait's DEFAULT no-op, or one
-    /// whose staging area simply cannot shrink. Everything else delegates to an [`InMemorySink`].
+    /// A sink that implements `read_at` (delegating to an inner [`InMemorySink`]) but IGNORES
+    /// `truncate` — the ONE-DEFAULT case: a staging area that simply cannot shrink, paired with a
+    /// working read-back. `truncate`'s own default is now fail-closed (it must be OPTED IN to model
+    /// "ignores truncate" rather than "unsupported"), so this claims success without ever shortening
+    /// the inner buffer — the exact contract the trait doc's opt-in example describes. Everything else
+    /// delegates to the inner sink.
     struct UnshrinkableSink(InMemorySink);
 
     #[async_trait]
     impl Sink for UnshrinkableSink {
         async fn write_at(&self, offset: u64, bytes: &[u8]) -> Result<(), DownloadError> {
             self.0.write_at(offset, bytes).await
+        }
+        async fn truncate(&self, _len: u64) -> Result<(), DownloadError> {
+            Ok(()) // models a staging area that cannot shrink: claims success but never truncates
         }
         async fn read_at(&self, offset: u64, len: u64) -> Result<Vec<u8>, DownloadError> {
             self.0.read_at(offset, len).await
@@ -1787,6 +1794,60 @@ mod tests {
         assert!(
             err.to_string().contains("past the verified length"),
             "names the promotion invariant it refused: {err}"
+        );
+        assert!(!sink.0.is_finalized().await, "and it never finalized");
+    }
+
+    /// A sink implementing ONLY `write_at` + `finalize` — BOTH `truncate` and `read_at` left on the
+    /// trait's defaults. This is the TWO-DEFAULT combination that used to fail OPEN: the old
+    /// `truncate` default silently no-op'd (nothing ever shortened) while `read_at`'s default already
+    /// failed closed, so `promote_verified_module`'s "bytes past the verified end" probe read that
+    /// failure as "nothing past the end" and promoted a longer, un-truncated, poisoned artifact.
+    /// Delegates storage + finalized-tracking to an inner [`InMemorySink`]; everything else is the
+    /// plain trait default — this is exactly the shape of a pre-existing external `Sink` that never
+    /// anticipated a promotable staging area.
+    struct TwoDefaultSink(InMemorySink);
+
+    #[async_trait]
+    impl Sink for TwoDefaultSink {
+        async fn write_at(&self, offset: u64, bytes: &[u8]) -> Result<(), DownloadError> {
+            self.0.write_at(offset, bytes).await
+        }
+        async fn finalize(&self) -> Result<(), DownloadError> {
+            self.0.finalize().await
+        }
+    }
+
+    /// The TWO-DEFAULT case, proven previously fail-OPEN: an external sink on both the `truncate` AND
+    /// `read_at` defaults must never promote a longer, un-truncated tail behind a shorter verified
+    /// artifact — the pull errors and the sink is never finalized.
+    #[tokio::test]
+    async fn a_sink_on_both_truncate_and_read_at_defaults_never_promotes_a_poisoned_tail() {
+        let store_id = hex_id(0xE9);
+        let root = hex_id(0xEA);
+        let honest = b"honest!!".to_vec();
+        let fabricated = vec![0xAA; 32];
+        let liar = crate::testkit::mock_peer_hex(1);
+
+        let downloader = ModuleDownloader::new(
+            locator_with(3, &store_id, &root),
+            Arc::new(
+                MockModuleTransport::serving(&store_id, &root, honest.clone(), 8)
+                    .serving_alternate_module_from(&liar, fabricated),
+            ),
+            Arc::new(crate::testkit::OnlyThisModuleAnchor::new(honest.clone())),
+            Arc::new(InMemoryStateStore::new()),
+            ModuleDownloadConfig::default(),
+        );
+        let sink = TwoDefaultSink(InMemorySink::new());
+
+        let err = downloader
+            .download(&store_id, &root, &sink)
+            .await
+            .expect_err("a sink on both defaults must fail closed, never promote blind");
+        assert!(
+            matches!(err, DownloadError::Sink(_)),
+            "the fail-closed truncate default refuses rather than promoting blind: {err}"
         );
         assert!(!sink.0.is_finalized().await, "and it never finalized");
     }
