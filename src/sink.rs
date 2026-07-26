@@ -39,6 +39,21 @@ pub trait Sink: Send + Sync {
         Ok(())
     }
 
+    /// Reduce the staging area to exactly `len` bytes, discarding anything beyond it.
+    ///
+    /// A staging area is APPEND-OR-OVERWRITE by offset and is never shortened by writing, so bytes
+    /// from a LONGER earlier attempt — a demoted descriptor's fabrication, or a leftover file from a
+    /// differently-shaped pull — outlive the attempt that wrote them. Promotion is only meaningful if
+    /// the promoted artifact IS the verified one, so the module puller shortens the staging area to the
+    /// verified length before finalizing, and resets it to 0 when it abandons a plan.
+    ///
+    /// Only ever SHRINKS: a `len` at or beyond the staged end is a no-op (never zero-extends). A sink
+    /// with no staging area to shorten (a store-write sink that commits whole) can keep the default
+    /// no-op — it never promotes a partially-overwritten staging file in the first place.
+    async fn truncate(&self, _len: u64) -> Result<(), DownloadError> {
+        Ok(())
+    }
+
     /// Read back `len` bytes previously [`write_at`](Self::write_at)-ten at `offset` from the staging
     /// area, if this sink supports it.
     ///
@@ -133,16 +148,28 @@ impl InMemorySink {
 impl Sink for InMemorySink {
     async fn write_at(&self, offset: u64, bytes: &[u8]) -> Result<(), DownloadError> {
         let mut inner = self.inner.lock().await;
-        let end = offset as usize + bytes.len();
+        // Same CHECKED conversion as `read_at`: a write offset is descriptor-derived too, and one
+        // unchecked `as usize` pair is all it takes to place bytes at a wrapped index.
+        let (start, end) = read_back_bounds(offset, bytes.len() as u64)?;
         if inner.buf.len() < end {
             inner.buf.resize(end, 0);
         }
-        inner.buf[offset as usize..end].copy_from_slice(bytes);
+        inner.buf[start..end].copy_from_slice(bytes);
         Ok(())
     }
 
     async fn finalize(&self) -> Result<(), DownloadError> {
         self.inner.lock().await.finalized = true;
+        Ok(())
+    }
+
+    async fn truncate(&self, len: u64) -> Result<(), DownloadError> {
+        let mut inner = self.inner.lock().await;
+        if let Ok(len) = usize::try_from(len) {
+            if inner.buf.len() > len {
+                inner.buf.truncate(len);
+            }
+        }
         Ok(())
     }
 
@@ -262,6 +289,31 @@ impl Sink for FileSink {
             DownloadError::sink(format!("read-back of {len} bytes at {offset} failed: {e}"))
         })?;
         Ok(buf)
+    }
+
+    async fn truncate(&self, len: u64) -> Result<(), DownloadError> {
+        let mut guard = self.file.lock().await;
+        if guard.is_none() {
+            // Nothing staged in this process. An ABSENT staging file has nothing to shorten and must
+            // not be conjured (same rule as `read_at`); a present one from an earlier attempt is
+            // opened WITHOUT truncating so a `set_len` below is the only length change.
+            if !self.tmp_path.exists() {
+                return Ok(());
+            }
+            let f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .truncate(false)
+                .open(&self.tmp_path)
+                .map_err(DownloadError::sink)?;
+            *guard = Some(f);
+        }
+        let f = guard.as_mut().expect("file opened above");
+        let staged = f.metadata().map_err(DownloadError::sink)?.len();
+        if staged > len {
+            f.set_len(len).map_err(DownloadError::sink)?;
+        }
+        Ok(())
     }
 
     async fn finalize(&self) -> Result<(), DownloadError> {
@@ -386,6 +438,41 @@ mod tests {
             !sink.tmp_path().exists(),
             "a read did not conjure a staging file"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `truncate` only ever SHRINKS the staging area — it never zero-extends a short one into a
+    /// wrong-length artifact.
+    #[tokio::test]
+    async fn truncate_shrinks_and_never_extends() {
+        let sink = InMemorySink::new();
+        sink.write_at(0, b"ABCDEF").await.unwrap();
+        sink.truncate(3).await.unwrap();
+        assert_eq!(sink.contents().await, b"ABC");
+        sink.truncate(99).await.unwrap();
+        assert_eq!(sink.contents().await, b"ABC", "a longer len is a no-op");
+    }
+
+    #[tokio::test]
+    async fn file_sink_truncate_shrinks_the_staging_file() {
+        let dir = temp_dir("truncate");
+        let final_path = dir.join("resource.dig");
+        let sink = FileSink::new(&final_path);
+        sink.write_at(0, b"ABCDEF").await.unwrap();
+        sink.truncate(3).await.unwrap();
+        sink.finalize().await.unwrap();
+        assert_eq!(std::fs::read(&final_path).unwrap(), b"ABC");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Truncating an ABSENT staging file is a no-op that does not conjure one (same rule as `read_at`:
+    /// a phantom 0-byte staging file would confuse GC + resume).
+    #[tokio::test]
+    async fn truncate_never_creates_the_staging_file() {
+        let dir = temp_dir("truncate-no-create");
+        let sink = FileSink::new(dir.join("resource.dig"));
+        sink.truncate(0).await.unwrap();
+        assert!(!sink.tmp_path().exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

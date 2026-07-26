@@ -48,7 +48,7 @@ pub fn sanitize_untrusted_text(text: &str, max_chars: usize) -> String {
             out.push_str("…<truncated>");
             break;
         }
-        if ch.is_control() {
+        if ch.is_control() || is_bidi_control(ch) {
             out.extend(ch.escape_debug());
         } else {
             out.push(ch);
@@ -57,8 +57,22 @@ pub fn sanitize_untrusted_text(text: &str, max_chars: usize) -> String {
     out
 }
 
+/// Whether `ch` is a Unicode bidirectional-formatting character (the LRE/RLE/PDF/LRO/RLO overrides,
+/// the isolate set, and the LRM/RLM/ALM marks).
+///
+/// These are category-`Cf`, NOT control characters, so `is_control` misses them — yet they visually
+/// REORDER the text around them, which is enough to make a rendered log line read as something other
+/// than what it says (the classic `…exe.txt` / `…txt.exe` swap). Escaped, not deleted, like every other
+/// untrusted byte here.
+fn is_bidi_control(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{200E}' | '\u{200F}' | '\u{061C}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+    )
+}
+
 /// An error from a download operation.
-#[derive(Debug, Error)]
+#[derive(Error)]
 pub enum DownloadError {
     /// A transport-level failure fetching from one provider (connect failed, stream dropped,
     /// availability/range RPC errored, timeout). Carries the reason as text. **Recoverable**: the
@@ -89,7 +103,14 @@ pub enum DownloadError {
 
     /// A fetched range failed integrity verification. **Recoverable**: the bad range is discarded and
     /// re-fetched from a different provider, and the serving provider is penalized.
-    #[error("integrity failure: {0}")]
+    ///
+    /// The wrapped reason is SANITIZED here for the same reason a transport reason is: a verify failure
+    /// routinely quotes peer-reported metadata (a first-frame `root`, a declared length), so it is
+    /// untrusted text arriving through a different door.
+    #[error(
+        "integrity failure: {}",
+        sanitize_untrusted_text(&.0.to_string(), MAX_ERROR_REASON_CHARS)
+    )]
     Verify(#[from] VerifyError),
 
     /// A still-needed range has no live provider left to fetch it from — every known holder has been
@@ -138,6 +159,18 @@ pub enum DownloadError {
     /// indicates a bug or an aborted runtime, not a normal download outcome.
     #[error("download task ended without a result")]
     TaskEnded,
+}
+
+/// `Debug` delegates to the SANITIZING [`Display`](std::fmt::Display) rather than printing raw fields.
+///
+/// `Debug` is not a developer-only rendering in practice: `tracing`'s `?field`, a `{:?}` in a log line,
+/// and every `unwrap`/`expect` panic message emit it. A derived `Debug` would print the untrusted
+/// `provider` / `reason` / verify text verbatim — unbounded, with markup intact — bypassing the very
+/// sanitization `Display` applies. One rendering, one door.
+impl std::fmt::Debug for DownloadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "DownloadError({self})")
+    }
 }
 
 impl DownloadError {
@@ -252,6 +285,36 @@ mod tests {
         }
         .to_string();
         assert!(!direct.contains('\n') && !direct.contains("<script>"));
+    }
+
+    /// #1603, second door — a peer-reported first-frame `root` reaches a log through
+    /// `VerifyError::Metadata` (`verify.rs`), and the `Verify` arm wrapped it VERBATIM. A wrapped
+    /// integrity failure is as untrusted as a transport one, so `Display` must sanitize it too.
+    #[test]
+    fn a_hostile_verify_reason_can_never_forge_a_log_line() {
+        let hostile = "root deadbeef\n[FATAL] forged by a peer != committed abc";
+        let rendered =
+            DownloadError::Verify(VerifyError::Metadata(hostile.to_string())).to_string();
+        assert!(
+            !rendered.contains('\n'),
+            "a wrapped verify reason forges a second line: {rendered}"
+        );
+        assert!(
+            rendered.contains("deadbeef"),
+            "still diagnosable: {rendered}"
+        );
+    }
+
+    /// A bidi override reorders a rendered log line without being a control char, so it is escaped
+    /// exactly like one.
+    #[test]
+    fn bidi_overrides_are_escaped_like_control_characters() {
+        let sanitized = sanitize_untrusted_text("safe\u{202E}dorp.exe", 64);
+        assert!(
+            !sanitized.contains('\u{202E}'),
+            "the override survived: {sanitized}"
+        );
+        assert!(sanitized.contains("safe"), "still diagnosable: {sanitized}");
     }
 
     #[test]

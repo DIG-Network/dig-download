@@ -130,3 +130,42 @@ final-gate failure, demote the descriptor's source, drop the checkpoint its plan
 with another holder (bounded attempts). And distinguish the two failure kinds — a chunk-level exhaustion
 means the bytes are unavailable (terminal), while a final-gate failure means the descriptor lied (retry
 elsewhere) — and report the descriptor failure as such, never as "not found".
+
+## "Verified" only means something if the artifact verified is the artifact PROMOTED
+
+A module pull verified the in-memory assembled blob against both final gates and then promoted the STAGING
+AREA — two different artifacts, silently. A staging area is written by offset and nothing ever shortens it
+(`FileSink::finalize` was `sync_all` + `rename`), so any earlier attempt that staged MORE bytes left a tail
+the verified blob does not contain. The descriptor-demotion retry makes that reachable on purpose: a holder
+declares a module LARGER than the real capsule with self-consistent `chunk_hashes`, serves those bytes
+(passing every per-chunk check and the whole-blob hash), fails the chain-anchor gate on purpose, and the
+pull then completes honestly against a SHORTER descriptor. `download()` returns `Ok(8)`, both gates passed,
+and the promoted file is 8 honest bytes followed by 24 attacker bytes. There is an attacker-free trigger
+too: a shape-mismatched checkpoint is discarded but the leftover staging FILE is not, so any resume across a
+shape change promotes the same divergence.
+
+That is a cache-poisoning primitive, not a length bug. On the reshare leg the node caches a `.dig` whose
+SHA-256 is not `module_hash`, reports success, announces itself as a holder — and every downstream peer that
+re-verifies fails, with an honest node as the authoritative-looking source of corrupt content.
+
+So make promotion PROVE the equality rather than assume it: shorten the staging area to the verified length,
+CONFIRM nothing is readable past that length (fail closed if it is — a sink that cannot shrink must refuse to
+promote, not promote long), and reset the sink whenever a plan is abandoned (descriptor demotion, or a
+checkpoint that does not resume the current shape). Assert on the PROMOTED bytes in the test, not on
+`Ok(len)`: the existing tests all asserted the return value and the in-memory sink contents, which is
+exactly why a 32-vs-8 promotion sat there green.
+
+## Chunk exhaustion under an unverified descriptor is a DESCRIPTOR failure, not a missing-bytes failure
+
+The demotion fix above classified a final-gate failure as "the descriptor lied" and chunk exhaustion as
+"the bytes are unavailable, terminal". That handed the attacker a CHEAPER attack: fabricate `chunk_hashes`
+instead of `module_hash` and serve nothing. Nobody can satisfy hashes of nothing, so the pull exhausts every
+holder on chunk 0, returns `NotFound`, never reaches a gate — and the liar is never demoted, so no second
+descriptor is ever tried. Zero bytes served, permanent reshare denial.
+
+Exhaustion is genuinely AMBIGUOUS from inside one attempt; the honest discriminator is whether any chunk has
+EVER verified under that descriptor. None → the descriptor is the suspect (demote + re-handshake). At least
+one → the descriptor is credible and the exhaustion really is missing bytes (terminal; re-handshaking would
+only replay the same fetches). Generalization: whenever a retry policy keys off WHICH check failed, enumerate
+what an attacker can do to avoid reaching that check at all — the cheapest lie is usually the one that makes
+your detector never run.

@@ -273,10 +273,14 @@ impl ModuleDownloader {
                         return Err(e);
                     }
                     // The whole plan came from the demoted holder, so its partial progress is not
-                    // resumable against the next descriptor — drop the checkpoint.
+                    // resumable against the next descriptor — drop the checkpoint AND the bytes it
+                    // staged. A demoted plan may have been LONGER than the next one, and a staging
+                    // area is never shortened by writing, so leaving it would let the demoted
+                    // holder's tail survive into a later promotion.
                     self.state_store
                         .clear(&module_download_key(store_id, root))
                         .await?;
+                    sink.truncate(0).await?;
                 }
             }
         }
@@ -300,7 +304,16 @@ impl ModuleDownloader {
         // Load resume state; a checkpoint for a DIFFERENT generation shape is discarded (never mixed)
         // so a resume re-plans identically to the original.
         let key = module_download_key(store_id, root);
-        let mut state = self.load_or_fresh_state(&key, &layout).await?;
+        let Resume {
+            mut state,
+            resumes_staging,
+        } = self.load_or_fresh_state(&key, &layout).await?;
+        if !resumes_staging {
+            // No checkpoint resumes THIS plan, so anything already in the staging area belongs to a
+            // different shape (an earlier abandoned attempt). It is discarded with the checkpoint —
+            // otherwise a longer stale tail rides out inside this plan's promotion.
+            sink.truncate(0).await?;
+        }
 
         // Assemble into an in-memory blob (the final whole-blob-hash + chain-anchor gate needs the
         // complete bytes). The size is attacker-DECLARED, so the allocation is FALLIBLE: exhaustion
@@ -310,15 +323,23 @@ impl ModuleDownloader {
         self.rehydrate_done_chunks(sink, info, &layout, &mut state, &mut blob, &mut done)
             .await;
 
-        // FETCH + ATTRIBUTE every still-missing chunk, fanned round-robin across the holders.
+        // FETCH + ATTRIBUTE every still-missing chunk, fanned round-robin across the holders. A
+        // rehydrated chunk verified against THIS descriptor's hashes, so it already makes the
+        // descriptor credible for the exhaustion classification below.
+        let mut any_chunk_verified = done.iter().any(|d| *d);
         for (index, already_done) in done.iter().enumerate() {
             if *already_done {
                 continue;
             }
             let (offset, len) = layout.chunk_span(index);
-            let bytes = self
+            let bytes = match self
                 .fetch_verified_chunk(providers, info, &layout, index, store_id, root)
-                .await?;
+                .await
+            {
+                Ok(bytes) => bytes,
+                Err(e) => return Err(classify_chunk_exhaustion(e, any_chunk_verified)),
+            };
+            any_chunk_verified = true;
             sink.write_at(offset, &bytes).await?;
             blob[offset as usize..(offset + len) as usize].copy_from_slice(&bytes);
             state.mark_done(index);
@@ -344,9 +365,38 @@ impl ModuleDownloader {
             )));
         }
 
-        sink.finalize().await?;
+        self.promote_verified_module(sink, layout.total_size)
+            .await?;
         self.state_store.clear(&key).await?;
         Ok(layout.total_size)
+    }
+
+    /// Promote the staging area, having PROVEN it holds exactly the bytes the gates above verified.
+    ///
+    /// The gates verify the assembled `blob`; finalize promotes the STAGING AREA — and the two are only
+    /// the same artifact if nothing longer was ever staged. A staging area is written by offset and
+    /// never shortened, so a demoted longer descriptor (or a leftover file from another shape) leaves a
+    /// tail the verified blob does not contain. Promoting that would cache a `.dig` whose SHA-256 is
+    /// not `module_hash` while reporting success — the node would then re-announce itself as a holder
+    /// of content every downstream peer rejects.
+    ///
+    /// So the staging area is SHORTENED to the verified length and the reduction is then CONFIRMED: a
+    /// readable byte at `verified_len` means bytes past the verified end survive, which is fail-closed
+    /// (never promoted). A sink that cannot read back reports "unsupported" here exactly as it does
+    /// elsewhere, in which case the shortening above is the enforcement.
+    async fn promote_verified_module(
+        &self,
+        sink: &dyn Sink,
+        verified_len: u64,
+    ) -> Result<(), DownloadError> {
+        sink.truncate(verified_len).await?;
+        if sink.read_at(verified_len, 1).await.is_ok() {
+            return Err(DownloadError::Verify(VerifyError::Metadata(format!(
+                "staging area holds bytes past the verified length {verified_len}; refusing to \
+                 promote an artifact that is not the verified one"
+            ))));
+        }
+        sink.finalize().await
     }
 
     /// Try each not-yet-demoted holder's `dig.getModuleInfo` until one answers, returning the
@@ -488,15 +538,21 @@ impl ModuleDownloader {
         &self,
         key: &str,
         layout: &ChunkPlan,
-    ) -> Result<DownloadState, DownloadError> {
+    ) -> Result<Resume, DownloadError> {
         let fresh = || {
             let mut s = DownloadState::new(key);
             s.total_length = layout.total_size;
             s.chunk_lens = layout.chunk_lens.clone();
-            s
+            Resume {
+                state: s,
+                resumes_staging: false,
+            }
         };
         match self.state_store.load(key).await? {
-            Some(prev) if prev.chunk_lens == layout.chunk_lens => Ok(prev),
+            Some(prev) if prev.chunk_lens == layout.chunk_lens => Ok(Resume {
+                state: prev,
+                resumes_staging: true,
+            }),
             _ => Ok(fresh()),
         }
     }
@@ -541,18 +597,49 @@ impl ModuleDownloader {
     }
 }
 
+/// The resume checkpoint a pull starts from, and whether it belongs to THIS descriptor's plan.
+///
+/// `resumes_staging` is the licence to inherit what is already staged. A discarded (shape-mismatched
+/// or absent) checkpoint means the staging area — which no write ever shortens — may still hold a
+/// different plan's bytes, so it is reset rather than resumed.
+struct Resume {
+    state: DownloadState,
+    resumes_staging: bool,
+}
+
 /// Why one descriptor's pull attempt failed — and therefore whether ANOTHER holder's descriptor is
 /// worth trying.
 ///
-/// The distinction is the whole point: a chunk-level exhaustion means the BYTES are unavailable
-/// (terminal), while a final-gate failure means the DESCRIPTOR was a lie and an honest holder may
-/// still be able to serve the capsule.
+/// A final-gate failure means the DESCRIPTOR was a lie and an honest holder may still serve the
+/// capsule. Chunk exhaustion is AMBIGUOUS and classified by [`classify_chunk_exhaustion`]: unavailable
+/// bytes and an unsatisfiable descriptor look identical from inside one attempt.
 enum PullFailure {
-    /// The assembled blob failed the whole-blob-hash or chain-anchor gate, or the descriptor itself was
-    /// unusable — attributable to the holder that supplied the descriptor, which is demoted.
+    /// The assembled blob failed the whole-blob-hash or chain-anchor gate, the descriptor itself was
+    /// unusable, or no chunk ever verified under it — attributable to the holder that supplied the
+    /// descriptor, which is demoted.
     BadDescriptor(DownloadError),
-    /// Any other failure (holders exhausted for a chunk, sink/state error) — terminal for the pull.
+    /// Any other failure (bytes genuinely unavailable under a credible descriptor, sink/state error) —
+    /// terminal for the pull.
     Terminal(DownloadError),
+}
+
+/// Classify a chunk-level exhaustion: is the DESCRIPTOR unsatisfiable, or are the BYTES unavailable?
+///
+/// A holder that fabricates `chunk_hashes` (rather than `module_hash`) is the cheapest reshare-denial
+/// attack there is — it serves ZERO bytes, and since no holder can satisfy hashes of nothing, the pull
+/// exhausts its holders on the first chunk and never reaches a final gate. Treating that as terminal
+/// lets one such holder deny a capsule's reshare permanently.
+///
+/// The honest bound is whether ANY chunk has verified under this descriptor: if one has, the descriptor
+/// is credible and the exhaustion really is missing bytes (terminal — re-handshaking would only replay
+/// the same fetches). If none ever has, the descriptor is the suspect, so its source is demoted and
+/// another holder's descriptor tried (bounded by [`MAX_DESCRIPTOR_ATTEMPTS`]).
+fn classify_chunk_exhaustion(e: DownloadError, any_chunk_verified: bool) -> PullFailure {
+    if any_chunk_verified {
+        PullFailure::Terminal(e)
+    } else {
+        PullFailure::BadDescriptor(e)
+    }
 }
 
 impl From<DownloadError> for PullFailure {
@@ -1377,11 +1464,15 @@ mod tests {
         );
     }
 
-    /// A RESUMED pull must not re-adopt a descriptor the previous run proved wrong: the checkpoint the
-    /// liar's plan produced is dropped on demotion, and the resumed pull re-handshakes and completes
-    /// against the honest holder.
+    /// A pull that resumes over an earlier run's staging + checkpoint must not re-adopt a descriptor
+    /// THIS call already proved wrong: the checkpoint the liar's plan produced is dropped on demotion
+    /// and the pull re-handshakes with another holder.
+    ///
+    /// The demotion set is per-CALL (a local `Vec`), so this covers within-call resume only — a fresh
+    /// process re-asks the same liar first and demotes it again. Holder reputation that outlives a call
+    /// would have to live in the [`StateStore`]; it is deliberately not claimed here.
     #[tokio::test]
-    async fn a_resumed_pull_does_not_re_adopt_a_demoted_descriptor() {
+    async fn a_pull_does_not_re_adopt_a_demoted_descriptor_within_the_same_call() {
         let store_id = hex_id(0xC5);
         let root = hex_id(0xC6);
         let module = (0u8..40).collect::<Vec<u8>>(); // 40 bytes / 8 = 5 chunks
@@ -1534,5 +1625,210 @@ mod tests {
             chunk_lens: vec![5],
         };
         assert!(ChunkPlan::from_info(&mismatched, DEFAULT_MAX_MODULE_SIZE).is_err());
+    }
+
+    /// A throwaway directory for the file-backed promotion tests.
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "dig-download-module-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// CACHE POISONING — the artifact VERIFIED must be the artifact PROMOTED.
+    ///
+    /// A holder that wins the `getModuleInfo` race with a self-consistent fabrication LARGER than the
+    /// real module gets its long bytes staged (they pass every per-chunk check and the whole-blob hash
+    /// gate) and only dies at the chain-anchor gate. The pull then re-handshakes and completes against
+    /// the honest, SHORTER module — so unless the staging area is provably reduced to the verified
+    /// length, the promoted `.dig` is honest bytes followed by the attacker's tail: a file whose
+    /// SHA-256 is not `module_hash`, cached and re-announced as a holder by the reshare leg.
+    #[tokio::test]
+    async fn the_promoted_artifact_is_byte_equal_to_the_verified_one_after_a_shorter_retry() {
+        let dir = temp_dir("shrinking-lie");
+        let final_path = dir.join("module.dig");
+        let store_id = hex_id(0xE1);
+        let root = hex_id(0xE2);
+        let honest = b"honest!!".to_vec(); // 8 bytes, one 8-byte chunk
+        let fabricated = vec![0xAA; 32]; // 32 bytes, four self-consistent chunks
+        let liar = crate::testkit::mock_peer_hex(1); // providers[0] — wins the handshake race
+
+        let transport = Arc::new(
+            MockModuleTransport::serving(&store_id, &root, honest.clone(), 8)
+                .serving_alternate_module_from(&liar, fabricated.clone()),
+        );
+        let downloader = ModuleDownloader::new(
+            locator_with(3, &store_id, &root),
+            transport,
+            Arc::new(crate::testkit::OnlyThisModuleAnchor::new(honest.clone())),
+            Arc::new(InMemoryStateStore::new()),
+            ModuleDownloadConfig::default(),
+        );
+        let sink = crate::sink::FileSink::new(&final_path);
+
+        let len = downloader
+            .download(&store_id, &root, &sink)
+            .await
+            .expect("the honest holder's descriptor completes the pull");
+        assert_eq!(
+            len,
+            honest.len() as u64,
+            "the VERIFIED length is the honest one"
+        );
+
+        let promoted = std::fs::read(&final_path).expect("the module was promoted");
+        assert_eq!(
+            promoted,
+            honest,
+            "the promoted artifact carries the attacker's tail: {} promoted bytes vs {} verified",
+            promoted.len(),
+            honest.len()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The SAME divergence with NO attacker: a staging file left by an earlier attempt at a DIFFERENT
+    /// module shape (its checkpoint is discarded as mismatched, but the FILE is not) must not survive
+    /// into the promotion of a shorter, freshly-verified module.
+    #[tokio::test]
+    async fn leftover_staging_of_another_shape_never_survives_into_the_promotion() {
+        let dir = temp_dir("stale-staging");
+        let final_path = dir.join("module.dig");
+        let store_id = hex_id(0xE3);
+        let root = hex_id(0xE4);
+        let honest = b"honest!!".to_vec();
+
+        // An earlier, differently-shaped attempt left a LONGER staging file plus its checkpoint.
+        let staging = crate::sink::staging_path_for(&final_path);
+        std::fs::write(&staging, vec![0xAA; 32]).unwrap();
+        let state_store = Arc::new(InMemoryStateStore::new());
+        let key = module_download_key(&store_id, &root);
+        let mut stale = DownloadState::new(&key);
+        stale.total_length = 32;
+        stale.chunk_lens = vec![8, 8, 8, 8];
+        stale.mark_done(0);
+        state_store.save(&stale).await.unwrap();
+
+        let downloader = ModuleDownloader::new(
+            locator_with(2, &store_id, &root),
+            Arc::new(MockModuleTransport::serving(
+                &store_id,
+                &root,
+                honest.clone(),
+                8,
+            )),
+            Arc::new(crate::testkit::OnlyThisModuleAnchor::new(honest.clone())),
+            state_store,
+            ModuleDownloadConfig::default(),
+        );
+        let sink = crate::sink::FileSink::new(&final_path);
+
+        let len = downloader.download(&store_id, &root, &sink).await.unwrap();
+        assert_eq!(len, honest.len() as u64);
+        assert_eq!(
+            std::fs::read(&final_path).unwrap(),
+            honest,
+            "the stale longer staging tail was promoted with the verified bytes"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A sink that IGNORES `truncate` — an external implementation on the trait's DEFAULT no-op, or one
+    /// whose staging area simply cannot shrink. Everything else delegates to an [`InMemorySink`].
+    struct UnshrinkableSink(InMemorySink);
+
+    #[async_trait]
+    impl Sink for UnshrinkableSink {
+        async fn write_at(&self, offset: u64, bytes: &[u8]) -> Result<(), DownloadError> {
+            self.0.write_at(offset, bytes).await
+        }
+        async fn read_at(&self, offset: u64, len: u64) -> Result<Vec<u8>, DownloadError> {
+            self.0.read_at(offset, len).await
+        }
+        async fn finalize(&self) -> Result<(), DownloadError> {
+            self.0.finalize().await
+        }
+    }
+
+    /// The promotion check is a CONFIRMATION, not just a shortening: a sink that cannot shrink must
+    /// FAIL CLOSED rather than promote an artifact longer than the verified one.
+    #[tokio::test]
+    async fn a_staging_area_that_cannot_shrink_is_never_promoted() {
+        let store_id = hex_id(0xE7);
+        let root = hex_id(0xE8);
+        let honest = b"honest!!".to_vec();
+        let fabricated = vec![0xAA; 32];
+        let liar = crate::testkit::mock_peer_hex(1);
+
+        let downloader = ModuleDownloader::new(
+            locator_with(3, &store_id, &root),
+            Arc::new(
+                MockModuleTransport::serving(&store_id, &root, honest.clone(), 8)
+                    .serving_alternate_module_from(&liar, fabricated),
+            ),
+            Arc::new(crate::testkit::OnlyThisModuleAnchor::new(honest.clone())),
+            Arc::new(InMemoryStateStore::new()),
+            ModuleDownloadConfig::default(),
+        );
+        let sink = UnshrinkableSink(InMemorySink::new());
+
+        let err = downloader
+            .download(&store_id, &root, &sink)
+            .await
+            .expect_err("a staging area that still holds the demoted tail is not promoted");
+        assert!(
+            err.to_string().contains("past the verified length"),
+            "names the promotion invariant it refused: {err}"
+        );
+        assert!(!sink.0.is_finalized().await, "and it never finalized");
+    }
+
+    /// RESHARE-DENIAL, the CHEAPEST variant — a descriptor whose per-chunk hashes are FABRICATED.
+    ///
+    /// Nobody can satisfy those hashes, so the pull exhausts every holder on chunk 0 and never reaches
+    /// a final gate. Treating that exhaustion as terminal lets a holder that serves ZERO bytes deny a
+    /// capsule's reshare forever: while no chunk has verified, the descriptor itself is the suspect, so
+    /// its source is demoted and an honest holder's descriptor completes the pull.
+    #[tokio::test]
+    async fn a_fabricated_chunk_hash_descriptor_source_is_demoted_and_the_pull_completes() {
+        let store_id = hex_id(0xF1);
+        let root = hex_id(0xF2);
+        let module = b"honest bytes behind a zero-byte liar".to_vec();
+        let liar = crate::testkit::mock_peer_hex(1);
+
+        let transport = Arc::new(
+            MockModuleTransport::serving(&store_id, &root, module.clone(), 8)
+                .fabricating_chunk_hashes_from(&liar),
+        );
+        let downloader = ModuleDownloader::new(
+            locator_with(3, &store_id, &root),
+            transport.clone(),
+            Arc::new(crate::testkit::OnlyThisModuleAnchor::new(module.clone())),
+            Arc::new(InMemoryStateStore::new()),
+            ModuleDownloadConfig::default(),
+        );
+        let sink = InMemorySink::new();
+
+        let len = downloader
+            .download(&store_id, &root, &sink)
+            .await
+            .expect("an honest holder's descriptor completes the pull");
+        assert_eq!(len, module.len() as u64);
+        assert_eq!(sink.contents().await, module);
+
+        let handshakes = transport.module_info_calls().await;
+        assert_eq!(handshakes[0], liar, "the liar answered first");
+        assert!(
+            handshakes.len() >= 2 && handshakes[1] != liar,
+            "the fabricating source was demoted and another holder re-handshaked: {handshakes:?}"
+        );
     }
 }

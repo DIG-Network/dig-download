@@ -274,6 +274,9 @@ A provider record's candidate `host` is an IP **literal** (IPv4, IPv6, or v4-map
   NEVER truncating, so a resume reattaches to the partial file) and, on finalize, flushes + syncs +
   atomically renames the staging file onto the final path. A reader MUST never observe a partial final
   file; a crash MUST leave only a `.download.tmp`, never a corrupt final file.
+- **Explicit shortening** — because writing never shortens a staging area, a sink exposes `truncate(len)`,
+  which reduces it to `len` bytes and never extends it. This is how a caller proves the promoted artifact is
+  the verified one (§17.5b); the trait default is a no-op, so an existing implementation stays valid.
 - **Resume** — per-range progress is checkpointed to a `StateStore`. A paused or crashed download
   resumes into the same staging file and re-fetches ONLY the still-missing ranges; a verified range is
   never re-fetched.
@@ -482,8 +485,13 @@ equals `chunk_hashes[index]`. Otherwise it is discarded and the next holder trie
   **unrepresentable** in an error string however the error was constructed — sanitizing only at the
   reporting call site is insufficient, because a wrapped `Transport` error carries the raw id back out.
 - **Escape untrusted TEXT (MUST)** — a foreign error's message may carry peer-supplied content (a remote
-  reason, a returned status line). Control characters in it are ESCAPED and its length is bounded before it
-  reaches an error or a log, so one holder reason is always exactly ONE line and cannot forge a log line.
+  reason, a returned status line, a peer-reported first-frame `root` quoted by a `VerifyError`). Control
+  characters AND Unicode bidirectional-formatting characters in it are ESCAPED and its length is bounded
+  before it reaches an error or a log, so one holder reason is always exactly ONE line, reads in the order
+  it is written, and cannot forge a log line. This applies to EVERY variant that carries foreign text,
+  including a WRAPPED `VerifyError`, and it is applied in `Display`. `Debug` MUST delegate to that same
+  `Display` rather than printing raw fields: `Debug` is emitted by `tracing`'s `?field` and by every
+  `unwrap`/`expect` panic, so a derived one would be an unsanitized second door.
 - **Relocate once** — when every known holder has failed one chunk, `find_providers` is re-queried and
   newly-discovered holders appended before the pull gives up on that chunk.
 
@@ -507,7 +515,35 @@ reshare: the bytes verify per chunk, the pull assembles, and only the final gate
 - Demotion is bounded by `MAX_DESCRIPTOR_ATTEMPTS` (3) and by the supply of un-demoted holders; when it is
   exhausted the pull fails with the **descriptor** failure (a gate `Verify`), never a `NotFound` — blaming
   discovery for a descriptor lie is the ambiguity §17.4's reason-surfacing rule exists to prevent.
-- A chunk-level exhaustion is NOT a descriptor failure and remains terminal (the bytes are unavailable).
+- **A chunk-level exhaustion under an UNVERIFIED descriptor IS a descriptor failure (MUST).** Exhaustion
+  is ambiguous: unavailable bytes and an unsatisfiable descriptor are indistinguishable from inside one
+  attempt. A holder that fabricates `chunk_hashes` (rather than `module_hash`) serves ZERO bytes and never
+  reaches a final gate, so treating exhaustion as terminal would let the cheapest possible liar deny a
+  capsule's reshare permanently. The bound is whether ANY chunk has verified under that descriptor:
+  - no chunk has ever verified → the descriptor is the suspect: demote its source and re-handshake
+    (subject to the same `MAX_DESCRIPTOR_ATTEMPTS` + un-demoted-holder bounds);
+  - at least one chunk HAS verified → the descriptor is credible, so the exhaustion is genuinely missing
+    bytes and is terminal.
+  A chunk rehydrated from staging is verified against this descriptor's hashes and therefore counts.
+
+### 17.5b Promotion (MUST — the promoted artifact IS the verified artifact)
+
+The gates in §17.6 verify the assembled blob; `Sink::finalize` promotes the STAGING AREA. Those are the
+same artifact only if nothing longer was ever staged, and a staging area is written by offset and **never
+shortened by writing**. So:
+
+- **The promoted artifact MUST be byte-identical to the verified one.** Before finalize the staging area
+  MUST be reduced to the verified length (`Sink::truncate`), and a staged length ≠ the verified length is a
+  **fail-closed `Verify(Metadata)` error, never a promotion**. `Sink::truncate` only ever shrinks; it never
+  zero-extends.
+- **An abandoned plan's bytes MUST be discarded with its checkpoint.** On descriptor demotion (§17.5a) the
+  sink is RESET alongside the checkpoint, and a pull whose checkpoint does not resume the current plan
+  (absent, or a different shape) resets the sink before staging. Otherwise a longer earlier attempt —
+  a demoted holder's fabrication, or a leftover file from another shape — survives as a tail on a later,
+  shorter promotion.
+- Violating this is a cache-poisoning primitive, not a cosmetic length bug: the promoted `.dig` would hash
+  to something other than `module_hash` while the pull reports success, so the reshare leg would announce
+  the node as a holder of content every downstream peer rejects.
 
 ### 17.6 Final gates (MUST — fail-closed, both, every time)
 
@@ -516,7 +552,8 @@ Before `Sink::finalize`, on EVERY pull including a resumed one:
 1. The reassembled blob's SHA-256 equals the descriptor's `module_hash`.
 2. `ModuleAnchorVerifier::verify_module_anchor(blob, store_id, root)` returns `true`.
 
-If either fails, the pull returns `Verify(Metadata)`, the sink is **NOT finalized** (the staging file is
+Both gates run on the single path to `finalize`, and finalize is reached only through the §17.5b promotion
+check. If either gate fails, the pull returns `Verify(Metadata)`, the sink is **NOT finalized** (the staging file is
 never promoted, so nothing is served or announced), and the checkpoint is left in place. There is no path
 by which a module is finalized without both gates passing — an unanchored module is a clean miss, never a
 serve. This is what makes reshare safe: only chain-anchored bytes can ever be re-announced.
