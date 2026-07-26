@@ -108,7 +108,17 @@ tracing = "0.1"
 # tree unless a consumer wants the built-in probe); the trait-based ladder works without it.
 http-probe = ["dep:reqwest"]
 
+# The in-memory test harness (`testkit`) AND the fail-OPEN `AcceptAnyModuleAnchor` it pairs with. OFF by
+# default so a production consumer build cannot even name the no-op anchor verifier that would bypass the
+# module pull's sole root of trust (#1576 security gate); a consumer unit-testing its own download wiring
+# enables it as a dev-dependency feature.
+testkit = []
+
 [dev-dependencies]
+# Self-dev-dependency so this crate's OWN integration tests (a separate crate) see the `testkit`
+# feature, while a normal consumer build still gets it off by default.
+dig-download = { path = ".", features = ["testkit"] }
+
 # The in-memory harness spins up mock providers + mock range sources + an in-memory sink/state store
 # in one process (NO real network). test-util drives the backoff timers deterministically.
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "test-util"] }

@@ -55,8 +55,9 @@
 //!   [`testkit::MockModuleTransport`](crate::testkit) used by the tests.
 //! - [`ModuleAnchorVerifier`] — binds the assembled blob to the chain root. dig-node injects the
 //!   digstore verifier (which parses the `.dig`, extracts its committed root, and checks it equals the
-//!   `getAnchoredRoot` value). This crate ships only the explicitly-opt-in, `#[doc(hidden)]`
-//!   [`AcceptAnyModuleAnchor`] for tests — there is no fail-open production default.
+//!   `getAnchoredRoot` value). There is no fail-open production default: the no-op
+//!   `AcceptAnyModuleAnchor` exists ONLY under `cfg(test)` / the `testkit` feature, so a default
+//!   consumer build cannot even name it.
 
 use std::sync::Arc;
 
@@ -65,7 +66,9 @@ use dig_dht::ContentId;
 use dig_rpc_protocol::types::ModuleInfo;
 use sha2::{Digest, Sha256};
 
-use crate::error::{DownloadError, VerifyError};
+use crate::error::{
+    hex64_or_sentinel, sanitize_untrusted_text, DownloadError, VerifyError, MAX_ERROR_REASON_CHARS,
+};
 use crate::locate::ProviderLocator;
 use crate::progress::{DownloadState, StateStore};
 use crate::sink::Sink;
@@ -114,22 +117,49 @@ pub trait ModuleAnchorVerifier: Send + Sync {
 }
 
 /// A **fail-OPEN** [`ModuleAnchorVerifier`] that accepts any blob without checking the chain — for
-/// tests / explicit opt-in ONLY. Provides NO chain-anchored integrity; a production caller MUST inject
-/// the real digstore anchor verifier. Named + `#[doc(hidden)]` so the insecure path is asked for by
-/// name.
+/// tests ONLY. Provides NO chain-anchored integrity; a production caller MUST inject the real digstore
+/// anchor verifier.
+///
+/// COMPILED OUT of a default consumer build (`cfg(any(test, feature = "testkit"))`): `#[doc(hidden)]`
+/// hides a type, it does not gate access, and the reshare path's only root of trust must not be
+/// bypassable by a `use`. A consumer that genuinely wants a no-op verifier opts in by enabling the
+/// `testkit` feature — a visible, reviewable choice in its `Cargo.toml`.
+#[cfg(any(test, feature = "testkit"))]
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AcceptAnyModuleAnchor;
 
+#[cfg(any(test, feature = "testkit"))]
 impl ModuleAnchorVerifier for AcceptAnyModuleAnchor {
     fn verify_module_anchor(&self, _module: &[u8], _store_id: &str, _root: &str) -> bool {
         true
     }
 }
 
-/// The default [`ModuleDownloadConfig::max_module_size`] — 8 GiB, comfortably above any real `.dig`
-/// capsule while still bounding what one lying `getModuleInfo` can make a node allocate.
-pub const DEFAULT_MAX_MODULE_SIZE: u64 = 8 * 1024 * 1024 * 1024;
+/// The default [`ModuleDownloadConfig::max_module_size`] — 512 MiB.
+///
+/// The puller assembles the module in memory, so this bound is what ONE lying `getModuleInfo` can
+/// make a node try to allocate. It is deliberately sized to what a small node can actually hold, not
+/// to the largest conceivable capsule: a ceiling above real host memory is not a bound at all (a
+/// declared multi-gigabyte module would be an out-of-memory primitive costing the attacker one
+/// message). A deployment that genuinely reshares larger capsules raises it explicitly, having sized
+/// the host for it.
+pub const DEFAULT_MAX_MODULE_SIZE: u64 = 512 * 1024 * 1024;
+
+/// The hard upper bound on the number of chunks a [`ModuleInfo`] may declare.
+///
+/// The declared chunk COUNT sizes the puller's `offsets` + `done` vectors, so an absurd count is the
+/// same one-message allocation attack as an absurd `total_size` — bounded here, before any allocation.
+/// 1 Mi chunks covers any real capsule at any sane chunk size.
+pub const MAX_MODULE_CHUNK_COUNT: usize = 1024 * 1024;
+
+/// How many DIFFERENT holders' descriptors a single pull will try before giving up.
+///
+/// The descriptor defines the whole plan, so a holder that answers `getModuleInfo` first with a
+/// well-formed but WRONG descriptor would otherwise deny the capsule's reshare permanently (holder
+/// order is deterministic, so every retry re-asks the same liar). A descriptor whose blob fails the
+/// whole-blob or chain-anchor gate is DEMOTED and the next holder's descriptor tried instead.
+pub const MAX_DESCRIPTOR_ATTEMPTS: usize = 3;
 
 /// Tunables for a module pull.
 #[derive(Debug, Clone)]
@@ -209,31 +239,85 @@ impl ModuleDownloader {
             });
         }
 
-        // 2. HANDSHAKE getModuleInfo from the first responsive holder → the transfer descriptor.
-        let info = self.fetch_module_info(&providers, store_id, root).await?;
-        let layout = ChunkPlan::from_info(&info, self.config.max_module_size)?;
+        // 2. Pull against ONE holder's descriptor at a time. A descriptor that is well-formed but
+        //    WRONG survives every per-chunk check and only dies at the final gates — so its SOURCE is
+        //    demoted and the next holder's descriptor tried, rather than the pull going terminal. One
+        //    holder winning the `getModuleInfo` race must not be able to deny a capsule's reshare.
+        let mut demoted: Vec<String> = Vec::new();
+        loop {
+            let (source, info) = self
+                .fetch_module_info(&providers, &demoted, store_id, root)
+                .await?;
+            match self
+                .pull_with_descriptor(&info, store_id, root, sink, &mut providers)
+                .await
+            {
+                Ok(len) => return Ok(len),
+                Err(PullFailure::Terminal(e)) => return Err(e),
+                Err(PullFailure::BadDescriptor(e)) => {
+                    tracing::warn!(
+                        peer = %hex64_or_sentinel(&source, "peer-id"),
+                        error = %e,
+                        "module pull: descriptor source failed a final gate; demoting it and \
+                         re-handshaking with another holder"
+                    );
+                    demoted.push(source);
+                    // Give up when the attempt budget is spent OR no un-demoted holder is left. The
+                    // returned error is the DESCRIPTOR failure, never a "not found": blaming discovery
+                    // for a descriptor lie is exactly the ambiguity that cost four #1586 rounds.
+                    let usable = providers
+                        .iter()
+                        .filter(|p| !demoted.contains(&p.provider_peer_id))
+                        .count();
+                    if demoted.len() >= MAX_DESCRIPTOR_ATTEMPTS || usable == 0 {
+                        return Err(e);
+                    }
+                    // The whole plan came from the demoted holder, so its partial progress is not
+                    // resumable against the next descriptor — drop the checkpoint.
+                    self.state_store
+                        .clear(&module_download_key(store_id, root))
+                        .await?;
+                }
+            }
+        }
+    }
 
-        // 3. Load resume state; a checkpoint for a DIFFERENT generation shape is discarded (never
-        //    mixed) so a resume re-plans identically to the original.
+    /// Run one whole pull — plan, resume, fetch, and the two final gates — against ONE holder's
+    /// descriptor. Returns [`PullFailure::BadDescriptor`] exactly when the assembled blob fails a
+    /// final gate (the descriptor's source lied and another holder should be asked), and
+    /// [`PullFailure::Terminal`] for every other failure.
+    async fn pull_with_descriptor(
+        &self,
+        info: &ModuleInfo,
+        store_id: &str,
+        root: &str,
+        sink: &dyn Sink,
+        providers: &mut Vec<dig_dht::ProviderRecord>,
+    ) -> Result<u64, PullFailure> {
+        let layout = ChunkPlan::from_info(info, self.config.max_module_size)
+            .map_err(PullFailure::BadDescriptor)?;
+
+        // Load resume state; a checkpoint for a DIFFERENT generation shape is discarded (never mixed)
+        // so a resume re-plans identically to the original.
         let key = module_download_key(store_id, root);
         let mut state = self.load_or_fresh_state(&key, &layout).await?;
 
-        // 4. Assemble into an in-memory blob (the final whole-blob-hash + chain-anchor gate needs the
-        //    complete bytes). Already-verified chunks are read back from the sink's staging area
-        //    rather than re-fetched; a sink that can't read back re-fetches them (still fail-closed).
-        let mut blob = vec![0u8; layout.total_size as usize];
+        // Assemble into an in-memory blob (the final whole-blob-hash + chain-anchor gate needs the
+        // complete bytes). The size is attacker-DECLARED, so the allocation is FALLIBLE: exhaustion
+        // must be a `DownloadError`, never the uncatchable abort an infallible `vec![0; n]` produces.
+        let mut blob = try_zeroed_blob(layout.total_size).map_err(PullFailure::BadDescriptor)?;
         let mut done: Vec<bool> = vec![false; layout.chunk_count()];
-        self.rehydrate_done_chunks(sink, &info, &layout, &mut state, &mut blob, &mut done)
+        self.rehydrate_done_chunks(sink, info, &layout, &mut state, &mut blob, &mut done)
             .await;
 
-        // 5. FETCH + ATTRIBUTE every still-missing chunk, fanned round-robin across the holders.
+        // FETCH + ATTRIBUTE every still-missing chunk, fanned round-robin across the holders.
         for (index, already_done) in done.iter().enumerate() {
             if *already_done {
                 continue;
             }
             let (offset, len) = layout.chunk_span(index);
             let bytes = self
-                .fetch_verified_chunk(&mut providers, &info, &layout, index, store_id, root)
+                .fetch_verified_chunk(providers, info, &layout, index, store_id, root)
                 .await?;
             sink.write_at(offset, &bytes).await?;
             blob[offset as usize..(offset + len) as usize].copy_from_slice(&bytes);
@@ -241,19 +325,23 @@ impl ModuleDownloader {
             self.state_store.save(&state).await?;
         }
 
-        // 6. The two FAIL-CLOSED final gates, BEFORE finalize. Neither pass ⇒ the staging file is
-        //    never promoted (the module is rejected, not written through — NC-9).
+        // The two FAIL-CLOSED final gates, BEFORE finalize. Neither pass ⇒ the staging file is never
+        // promoted (the module is rejected, not written through — NC-9).
         let assembled_hash = sha256_hex(&blob);
         if assembled_hash != info.module_hash {
-            return Err(DownloadError::Verify(VerifyError::Metadata(format!(
-                "assembled module_hash {assembled_hash} != declared {}",
-                hex64_or_sentinel(&info.module_hash, "module-hash")
-            ))));
+            return Err(PullFailure::BadDescriptor(DownloadError::Verify(
+                VerifyError::Metadata(format!(
+                    "assembled module_hash {assembled_hash} != declared {}",
+                    hex64_or_sentinel(&info.module_hash, "module-hash")
+                )),
+            )));
         }
         if !self.anchor.verify_module_anchor(&blob, store_id, root) {
-            return Err(DownloadError::Verify(VerifyError::Metadata(format!(
-                "assembled module is not chain-anchored under ({store_id}, {root})"
-            ))));
+            return Err(PullFailure::BadDescriptor(DownloadError::Verify(
+                VerifyError::Metadata(format!(
+                    "assembled module is not chain-anchored under ({store_id}, {root})"
+                )),
+            )));
         }
 
         sink.finalize().await?;
@@ -261,8 +349,9 @@ impl ModuleDownloader {
         Ok(layout.total_size)
     }
 
-    /// Try each holder's `dig.getModuleInfo` until one answers; the descriptor is content-addressed so
-    /// any honest holder returns the same shape (a lie is caught by the whole-blob + anchor gates).
+    /// Try each not-yet-demoted holder's `dig.getModuleInfo` until one answers, returning the
+    /// answering holder's `peer_id` alongside its descriptor so a lying source can be attributed +
+    /// demoted.
     ///
     /// If every holder fails, the terminal error names the STEP (`getModuleInfo`) and carries each
     /// holder's own reason — a swallowed reason resurfacing as an unrelated message cost six blind
@@ -270,22 +359,29 @@ impl ModuleDownloader {
     async fn fetch_module_info(
         &self,
         providers: &[dig_dht::ProviderRecord],
+        demoted: &[String],
         store_id: &str,
         root: &str,
-    ) -> Result<ModuleInfo, DownloadError> {
+    ) -> Result<(String, ModuleInfo), DownloadError> {
         let mut reasons = HolderReasons::default();
+        let mut tried = 0usize;
         for provider in providers {
             let peer = &provider.provider_peer_id;
+            if demoted.iter().any(|d| d == peer) {
+                continue; // this holder's descriptor already failed a final gate
+            }
+            tried += 1;
             match self.transport.get_module_info(peer, store_id, root).await {
-                Ok(info) => return Ok(info),
+                Ok(info) => return Ok((peer.clone(), info)),
                 Err(e) if e.is_recoverable() => reasons.record(peer, e),
                 Err(e) => return Err(e),
             }
         }
         Err(DownloadError::NotFound {
             content: format!(
-                "getModuleInfo failed on all {} located holder(s) for module {} — {reasons}",
-                providers.len(),
+                "getModuleInfo failed on all {tried} usable holder(s) ({} demoted) for module {} — \
+                 {reasons}",
+                demoted.len(),
                 module_download_key(store_id, root),
             ),
         })
@@ -445,6 +541,48 @@ impl ModuleDownloader {
     }
 }
 
+/// Why one descriptor's pull attempt failed — and therefore whether ANOTHER holder's descriptor is
+/// worth trying.
+///
+/// The distinction is the whole point: a chunk-level exhaustion means the BYTES are unavailable
+/// (terminal), while a final-gate failure means the DESCRIPTOR was a lie and an honest holder may
+/// still be able to serve the capsule.
+enum PullFailure {
+    /// The assembled blob failed the whole-blob-hash or chain-anchor gate, or the descriptor itself was
+    /// unusable — attributable to the holder that supplied the descriptor, which is demoted.
+    BadDescriptor(DownloadError),
+    /// Any other failure (holders exhausted for a chunk, sink/state error) — terminal for the pull.
+    Terminal(DownloadError),
+}
+
+impl From<DownloadError> for PullFailure {
+    fn from(e: DownloadError) -> Self {
+        PullFailure::Terminal(e)
+    }
+}
+
+/// Allocate the `total_size`-byte assembly buffer FALLIBLY.
+///
+/// `total_size` is attacker-declared (bounded only by [`ModuleDownloadConfig::max_module_size`]), and
+/// `vec![0u8; n]` aborts the process via `handle_alloc_error` when the allocation fails — an
+/// uncatchable death a hostile descriptor must never be able to cause. `try_reserve` turns exhaustion
+/// into an ordinary rejected-descriptor error.
+fn try_zeroed_blob(total_size: u64) -> Result<Vec<u8>, DownloadError> {
+    let len = usize::try_from(total_size).map_err(|_| {
+        DownloadError::Verify(VerifyError::Metadata(format!(
+            "declared module total_size {total_size} does not fit this platform's address space"
+        )))
+    })?;
+    let mut blob: Vec<u8> = Vec::new();
+    blob.try_reserve_exact(len).map_err(|e| {
+        DownloadError::Verify(VerifyError::Metadata(format!(
+            "cannot allocate the {len}-byte assembly buffer a descriptor declared: {e}"
+        )))
+    })?;
+    blob.resize(len, 0); // within the reservation above — no further allocation
+    Ok(blob)
+}
+
 /// Why each holder could not serve a step, accumulated so the terminal error explains the failure
 /// instead of swallowing it (#836). Holder ids are sentinelled — a `provider_peer_id` is free-form
 /// text off the wire, and a log an attacker can write is not evidence (#1603).
@@ -456,6 +594,11 @@ impl HolderReasons {
     /// later holder succeeds and no error is ever returned).
     fn record(&mut self, peer: &str, reason: impl std::fmt::Display) {
         let peer = hex64_or_sentinel(peer, "peer-id");
+        // The REASON is as untrusted as the peer id: a foreign error's `Display` plausibly carries a
+        // remote message or status line, and an un-escaped newline in it forges a whole log line just
+        // as effectively as a hostile peer id would (#1603). Escape + bound it here, at the one place
+        // every holder reason funnels through.
+        let reason = sanitize_untrusted_text(&reason.to_string(), MAX_ERROR_REASON_CHARS);
         tracing::debug!(%peer, %reason, "module pull: holder rejected");
         self.0.push(format!("{peer}: {reason}"));
     }
@@ -470,23 +613,9 @@ impl std::fmt::Display for HolderReasons {
     }
 }
 
-/// Render an untrusted identifier for a log or an error message: the lowercase 64-hex value if it IS
-/// canonical 64-hex, else `<non-canonical-{label}>`.
-///
-/// Peer ids and the descriptor's hashes are peer-supplied free-form strings. Echoing them verbatim
-/// lets a hostile holder inject newlines, markup, or forged log lines into the node's own diagnostics
-/// — so a non-canonical value never reaches the output (#1603).
-fn hex64_or_sentinel(value: &str, label: &str) -> String {
-    let canonical = value.len() == 64 && value.chars().all(|c| c.is_ascii_hexdigit());
-    if canonical {
-        value.to_ascii_lowercase()
-    } else {
-        format!("<non-canonical-{label}>")
-    }
-}
-
 /// The chunk layout derived from a [`ModuleInfo`]: per-chunk lengths + their cumulative offsets, with
 /// the descriptor's self-consistency checked once up front.
+#[derive(Debug)]
 struct ChunkPlan {
     total_size: u64,
     chunk_lens: Vec<u64>,
@@ -497,7 +626,9 @@ impl ChunkPlan {
     /// Validate a [`ModuleInfo`] and derive its chunk plan. The descriptor MUST carry `chunk_lens`
     /// (required for the byte→chunk mapping), have one length per `chunk_hashes` entry, have the
     /// lengths sum to `total_size` — otherwise the per-chunk fail-closed check is unimplementable —
-    /// and declare no more than `max_module_size` bytes.
+    /// declare no more than `max_module_size` bytes, and declare no more than
+    /// [`MAX_MODULE_CHUNK_COUNT`] chunks. All of its arithmetic is CHECKED — a wrapping sum must be a
+    /// typed rejection, not a panic (see the inline note below).
     ///
     /// The size bound is checked FIRST and before any allocation: the descriptor comes from an
     /// untrusted holder and `total_size` sizes the puller's assembly buffer, so an unbounded declared
@@ -509,31 +640,63 @@ impl ChunkPlan {
                 info.total_size
             ))));
         }
-        let chunk_lens = info.chunk_lens.clone();
-        if chunk_lens.is_empty() {
+        if info.chunk_lens.is_empty() {
             return Err(DownloadError::Verify(VerifyError::Metadata(
                 "ModuleInfo carries no chunk_lens (cannot map ranges to chunk hashes)".into(),
             )));
         }
-        if chunk_lens.len() != info.chunk_hashes.len() {
+        // Bound the declared COUNT before cloning it: the count sizes the plan's own vectors, so an
+        // absurd one is the same one-message allocation attack as an absurd `total_size`.
+        if info.chunk_lens.len() > MAX_MODULE_CHUNK_COUNT {
+            return Err(DownloadError::Verify(VerifyError::Metadata(format!(
+                "declared chunk_lens count {} exceeds the maximum {MAX_MODULE_CHUNK_COUNT}",
+                info.chunk_lens.len()
+            ))));
+        }
+        if info.chunk_lens.len() != info.chunk_hashes.len() {
             return Err(DownloadError::Verify(VerifyError::Metadata(format!(
                 "chunk_lens ({}) != chunk_hashes ({})",
-                chunk_lens.len(),
+                info.chunk_lens.len(),
                 info.chunk_hashes.len()
             ))));
         }
-        let sum: u64 = chunk_lens.iter().sum();
+        // CHECKED arithmetic, both here and for the offsets below. Unchecked, a descriptor of
+        // `{ total_size: 0, chunk_lens: [1, u64::MAX] }` WRAPS to a sum of 0, matches its declared
+        // total, and passes every check above — then either aborts the node inside `sum()` (with
+        // overflow checks on, as dig-node's release profile has them) or yields spans that index far
+        // past the assembled blob. This validator's whole job is to be TOTAL over a hostile
+        // descriptor, so no arithmetic in it may wrap or panic.
+        let sum = info
+            .chunk_lens
+            .iter()
+            .try_fold(0u64, |acc, &len| acc.checked_add(len))
+            .ok_or_else(|| {
+                DownloadError::Verify(VerifyError::Metadata(
+                    "chunk_lens sum overflows u64 (hostile descriptor)".into(),
+                ))
+            })?;
         if sum != info.total_size {
             return Err(DownloadError::Verify(VerifyError::Metadata(format!(
                 "chunk_lens sum {sum} != total_size {}",
                 info.total_size
             ))));
         }
-        let mut offsets = Vec::with_capacity(chunk_lens.len());
+        let chunk_lens = info.chunk_lens.clone();
+        let mut offsets = Vec::new();
+        offsets.try_reserve_exact(chunk_lens.len()).map_err(|e| {
+            DownloadError::Verify(VerifyError::Metadata(format!(
+                "cannot allocate a {}-entry chunk plan: {e}",
+                chunk_lens.len()
+            )))
+        })?;
         let mut acc = 0u64;
         for &len in &chunk_lens {
             offsets.push(acc);
-            acc += len;
+            acc = acc.checked_add(len).ok_or_else(|| {
+                DownloadError::Verify(VerifyError::Metadata(
+                    "chunk offsets overflow u64 (hostile descriptor)".into(),
+                ))
+            })?;
         }
         Ok(ChunkPlan {
             total_size: info.total_size,
@@ -1128,6 +1291,10 @@ mod tests {
             message.contains("non-canonical-peer-id"),
             "a sentinel stands in for it: {message}"
         );
+        assert!(
+            !message.contains('\n'),
+            "the whole record is ONE line — a forged log line cannot ride in on the reason: {message}"
+        );
     }
 
     /// A peer-supplied hash from the descriptor is equally untrusted text and equally sentinelled when
@@ -1162,6 +1329,181 @@ mod tests {
     fn download_key_is_module_scoped() {
         let k = module_download_key(&hex_id(1), &hex_id(2));
         assert!(k.starts_with("module:"));
+    }
+
+    /// RESHARE-DENIAL — the descriptor defines the WHOLE plan, and holder order is deterministic, so
+    /// one holder that wins the `getModuleInfo` race with a well-formed-but-WRONG descriptor would
+    /// otherwise deny a capsule's reshare forever: the pull assembles honest bytes, dies at the
+    /// whole-blob gate, and every retry re-asks the same liar. The lying SOURCE must be demoted and
+    /// the next holder's descriptor tried — an honest holder in the set means the pull SUCCEEDS.
+    #[tokio::test]
+    async fn a_lying_descriptor_source_is_demoted_and_an_honest_holder_completes_the_pull() {
+        let store_id = hex_id(0xC1);
+        let root = hex_id(0xC2);
+        let module = b"honest bytes, one lying descriptor source".to_vec();
+        let liar = crate::testkit::mock_peer_hex(1);
+
+        let transport = Arc::new(
+            MockModuleTransport::serving(&store_id, &root, module.clone(), 8)
+                .lying_descriptor_from(&liar),
+        );
+        let downloader = ModuleDownloader::new(
+            locator_with(2, &store_id, &root),
+            transport.clone(),
+            Arc::new(AcceptAnyModuleAnchor),
+            Arc::new(InMemoryStateStore::new()),
+            ModuleDownloadConfig::default(),
+        );
+        let sink = InMemorySink::new();
+
+        let len = downloader
+            .download(&store_id, &root, &sink)
+            .await
+            .expect("the honest holder's descriptor completes the pull");
+        assert_eq!(len, module.len() as u64);
+        assert_eq!(sink.contents().await, module);
+        assert!(sink.is_finalized().await);
+
+        let handshakes = transport.module_info_calls().await;
+        assert_eq!(
+            handshakes.len(),
+            2,
+            "the liar's descriptor was demoted and another holder re-handshaked: {handshakes:?}"
+        );
+        assert_eq!(handshakes[0], liar, "the liar answered first");
+        assert_ne!(
+            handshakes[1], liar,
+            "the demoted source is never re-asked: {handshakes:?}"
+        );
+    }
+
+    /// A RESUMED pull must not re-adopt a descriptor the previous run proved wrong: the checkpoint the
+    /// liar's plan produced is dropped on demotion, and the resumed pull re-handshakes and completes
+    /// against the honest holder.
+    #[tokio::test]
+    async fn a_resumed_pull_does_not_re_adopt_a_demoted_descriptor() {
+        let store_id = hex_id(0xC5);
+        let root = hex_id(0xC6);
+        let module = (0u8..40).collect::<Vec<u8>>(); // 40 bytes / 8 = 5 chunks
+        let liar = crate::testkit::mock_peer_hex(1);
+        let state_store = Arc::new(InMemoryStateStore::new());
+        let sink = InMemorySink::new();
+
+        // First run: 2 chunks land, then the source starves — the pull ends without finalize.
+        let interrupted = Arc::new(
+            MockModuleTransport::serving(&store_id, &root, module.clone(), 8)
+                .lying_descriptor_from(&liar)
+                .with_success_budget(2),
+        );
+        ModuleDownloader::new(
+            locator_with(2, &store_id, &root),
+            interrupted,
+            Arc::new(AcceptAnyModuleAnchor),
+            state_store.clone(),
+            ModuleDownloadConfig::default(),
+        )
+        .download(&store_id, &root, &sink)
+        .await
+        .expect_err("the interrupted pull fails before finalize");
+
+        // Resumed run against the SAME staging + checkpoint, with the liar still answering first.
+        let healthy = Arc::new(
+            MockModuleTransport::serving(&store_id, &root, module.clone(), 8)
+                .lying_descriptor_from(&liar),
+        );
+        let len = ModuleDownloader::new(
+            locator_with(2, &store_id, &root),
+            healthy,
+            Arc::new(AcceptAnyModuleAnchor),
+            state_store,
+            ModuleDownloadConfig::default(),
+        )
+        .download(&store_id, &root, &sink)
+        .await
+        .expect("the resumed pull completes via the honest holder");
+        assert_eq!(len, module.len() as u64);
+        assert_eq!(sink.contents().await, module);
+        assert!(sink.is_finalized().await);
+    }
+
+    /// Demotion is BOUNDED: when every holder lies about the descriptor the pull still ends — with a
+    /// fail-closed verify error and no finalize — rather than looping over holders forever.
+    #[tokio::test]
+    async fn every_descriptor_source_lying_is_terminal_and_never_finalizes() {
+        let store_id = hex_id(0xC3);
+        let root = hex_id(0xC4);
+        let liar = crate::testkit::mock_peer_hex(1);
+        let transport = Arc::new(
+            MockModuleTransport::serving(&store_id, &root, b"only a liar holds this".to_vec(), 8)
+                .lying_descriptor_from(&liar),
+        );
+        let downloader = ModuleDownloader::new(
+            locator_with(1, &store_id, &root),
+            transport.clone(),
+            Arc::new(AcceptAnyModuleAnchor),
+            Arc::new(InMemoryStateStore::new()),
+            ModuleDownloadConfig::default(),
+        );
+        let sink = InMemorySink::new();
+
+        let err = downloader
+            .download(&store_id, &root, &sink)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, DownloadError::Verify(_)),
+            "fail-closed: {err}"
+        );
+        assert!(!sink.is_finalized().await);
+        assert!(
+            transport.module_info_calls().await.len() <= MAX_DESCRIPTOR_ATTEMPTS,
+            "descriptor attempts are bounded"
+        );
+    }
+
+    /// A hostile descriptor whose `chunk_lens` SUM WRAPS: `1 + u64::MAX == 0`, which equals the
+    /// declared `total_size`, so every self-consistency check passes on unchecked arithmetic. The
+    /// descriptor validator's whole job is to be TOTAL over a hostile descriptor before any
+    /// allocation, so the wrap must be a typed error — never a panic (with overflow checks on, an
+    /// unchecked `sum()` aborts the node from ONE `getModuleInfo` response, zero bytes fetched) and
+    /// never an accepted plan (with them off, the derived spans index past a zero-length blob).
+    #[test]
+    fn a_wrapping_chunk_len_sum_is_rejected_not_panicked() {
+        let hostile = ModuleInfo {
+            total_size: 0,
+            module_hash: "ab".repeat(32),
+            chunk_hashes: vec!["cd".repeat(32), "ef".repeat(32)],
+            chunk_lens: vec![1, u64::MAX],
+        };
+        let err = ChunkPlan::from_info(&hostile, DEFAULT_MAX_MODULE_SIZE)
+            .expect_err("a wrapping descriptor is refused");
+        assert!(
+            matches!(err, DownloadError::Verify(_)),
+            "a hostile descriptor is a verify failure: {err}"
+        );
+        assert!(
+            err.to_string().contains("overflow"),
+            "names the arithmetic it broke: {err}"
+        );
+    }
+
+    /// The declared chunk COUNT is as unbounded as the declared size: a descriptor claiming billions
+    /// of zero-length chunks costs the puller two big allocations (`offsets` + the `done` bitmap)
+    /// before a byte is fetched. It is refused against a fixed cap.
+    #[test]
+    fn an_absurd_chunk_count_is_refused() {
+        let hostile = ModuleInfo {
+            total_size: 0,
+            module_hash: "ab".repeat(32),
+            chunk_hashes: Vec::new(),
+            chunk_lens: vec![0; MAX_MODULE_CHUNK_COUNT + 1],
+        };
+        let err = ChunkPlan::from_info(&hostile, DEFAULT_MAX_MODULE_SIZE)
+            .expect_err("an over-count descriptor is refused");
+        assert!(
+            err.to_string().contains("chunk_lens"),
+            "names the bound it broke: {err}"
+        );
     }
 
     #[test]

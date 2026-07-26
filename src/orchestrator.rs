@@ -935,7 +935,7 @@ impl Job {
                 // provider + the reason: without it the download's terminal error looks like a
                 // discovery miss and the real fault stays invisible (#1586).
                 tracing::debug!(
-                    peer = %provider.provider_peer_id,
+                    peer = %crate::error::hex64_or_sentinel(&provider.provider_peer_id, "peer-id"),
                     error = %e,
                     "establish_commitment: metadata probe failed on this holder"
                 );

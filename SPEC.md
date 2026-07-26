@@ -410,9 +410,10 @@ attributable machinery as §§5–10, addressed at the module blob rather than a
   - `fetch_module_range(provider_peer_id, store_id, root, offset, length) -> Vec<u8>`
     (`dig.fetchModuleRange`).
 - **`ModuleAnchorVerifier`** — `verify_module_anchor(module, store_id, root) -> bool`, binding an
-  assembled blob to its on-chain generation root. There is **NO fail-open production default**: the only
-  implementation this crate ships is the `#[doc(hidden)]`, named `AcceptAnyModuleAnchor`, which a caller
-  must ask for by name. A production caller MUST inject a real chain-anchored verifier.
+  assembled blob to its on-chain generation root. There is **NO fail-open production default**, and none is
+  reachable: the no-op `AcceptAnyModuleAnchor` is compiled ONLY under `cfg(test)` or the explicit `testkit`
+  feature, so a default consumer build cannot name it. A production caller MUST inject a real
+  chain-anchored verifier (it is a required positional argument of `ModuleDownloader::new`).
 
 `ModuleInfo` (`total_size`, `module_hash`, `chunk_hashes`, `chunk_lens`) is the **dig-rpc-protocol**
 wire type, re-exported unchanged — this crate MUST NOT declare a second copy of the descriptor.
@@ -434,14 +435,32 @@ wire type, re-exported unchanged — this crate MUST NOT declare a second copy o
 
 ### 17.3 Descriptor validation (MUST — before allocation)
 
+Descriptor validation is **TOTAL**: for EVERY `ModuleInfo` a hostile holder can send, validation MUST
+terminate in either a chunk plan or a `Verify(Metadata)` rejection. It MUST NOT panic, abort, or wrap.
+
 A `ModuleInfo` is rejected with `Verify(Metadata)` unless ALL hold, checked in this order:
 
-- `total_size <= max_module_size` (`DEFAULT_MAX_MODULE_SIZE` = 8 GiB). The descriptor is UNTRUSTED and
+- `total_size <= max_module_size` (`DEFAULT_MAX_MODULE_SIZE` = **512 MiB**). The descriptor is UNTRUSTED and
   `total_size` sizes the assembly buffer, so this bound MUST be checked **before any allocation** — an
-  unbounded declared size is a one-message memory-exhaustion attack.
+  unbounded declared size is a one-message memory-exhaustion attack. The default is deliberately sized to
+  what a modest host can hold: a ceiling above real host memory bounds nothing. A deployment that reshares
+  larger capsules raises `max_module_size` explicitly.
 - `chunk_lens` is non-empty (without it no byte→chunk mapping, hence no per-chunk check, exists).
+- `chunk_lens.len() <= MAX_MODULE_CHUNK_COUNT` (1 Mi). The declared COUNT sizes the plan's own vectors, so an
+  absurd count is the same one-message allocation attack as an absurd `total_size`; it MUST be bounded
+  before the lengths are copied.
 - `chunk_lens.len() == chunk_hashes.len()`.
-- `chunk_lens` sums exactly to `total_size`.
+- `chunk_lens` sums exactly to `total_size`, computed with **CHECKED** arithmetic; a sum that would overflow
+  `u64` is a rejection. Unchecked, `{ total_size: 0, chunk_lens: [1, u64::MAX] }` WRAPS to a sum of 0,
+  matches its declared total, and passes every other check — then either aborts the process inside the
+  summation (where overflow checks are on) or yields spans that index past the assembled blob.
+- Cumulative chunk offsets are likewise accumulated with **CHECKED** arithmetic.
+
+**Allocation is FALLIBLE (MUST).** Every allocation sized by the descriptor — the assembly buffer, the chunk
+plan, a staging read-back buffer — MUST use a fallible reservation and surface exhaustion as a
+`Verify(Metadata)` / `Sink` error. An infallible `vec![0; n]` aborts the process (`handle_alloc_error`),
+which an untrusted descriptor MUST never be able to cause. A declared size or span that does not fit the
+platform's `usize` is likewise a rejection, never a truncating conversion.
 
 ### 17.4 Per-chunk attribution (MUST — fail-closed)
 
@@ -459,7 +478,12 @@ equals `chunk_hashes[index]`. Otherwise it is discarded and the next holder trie
 - **Sentinel untrusted identifiers (MUST)** — a `provider_peer_id` and the descriptor's hashes are
   free-form peer-supplied strings. Any such value reaching a log or an error message is rendered as
   lowercase 64-hex only when it IS canonical 64-hex, else as `<non-canonical-{label}>`. A log an attacker
-  can write is not evidence.
+  can write is not evidence. The rendering lives in `DownloadError`'s own `Display`, so a raw identifier is
+  **unrepresentable** in an error string however the error was constructed — sanitizing only at the
+  reporting call site is insufficient, because a wrapped `Transport` error carries the raw id back out.
+- **Escape untrusted TEXT (MUST)** — a foreign error's message may carry peer-supplied content (a remote
+  reason, a returned status line). Control characters in it are ESCAPED and its length is bounded before it
+  reaches an error or a log, so one holder reason is always exactly ONE line and cannot forge a log line.
 - **Relocate once** — when every known holder has failed one chunk, `find_providers` is re-queried and
   newly-discovered holders appended before the pull gives up on that chunk.
 
@@ -470,6 +494,20 @@ freshly-fetched one**. The staging file survives crashes, other processes, and b
 trusted input. A chunk that cannot be read back, reads short, or fails its hash is left NOT done, is
 re-fetched, and the checkpoint is corrected to match. Resume is an OPTIMIZATION and MUST NEVER be a
 correctness dependency, and MUST NEVER skip the §17.6 gates.
+
+### 17.5a Descriptor-source demotion (MUST)
+
+The descriptor defines the WHOLE plan, and holder order is deterministic, so a holder that answers
+`get_module_info` first with a **well-formed but WRONG** descriptor MUST NOT be able to deny a capsule's
+reshare: the bytes verify per chunk, the pull assembles, and only the final gates (§17.6) reject it.
+
+- A pull whose assembled blob fails EITHER final gate, or whose descriptor is unusable, MUST **demote that
+  descriptor's source** and re-handshake `get_module_info` with a holder that has not been demoted,
+  discarding the checkpoint the rejected plan produced.
+- Demotion is bounded by `MAX_DESCRIPTOR_ATTEMPTS` (3) and by the supply of un-demoted holders; when it is
+  exhausted the pull fails with the **descriptor** failure (a gate `Verify`), never a `NotFound` — blaming
+  discovery for a descriptor lie is the ambiguity §17.4's reason-surfacing rule exists to prevent.
+- A chunk-level exhaustion is NOT a descriptor failure and remains terminal (the bytes are unavailable).
 
 ### 17.6 Final gates (MUST — fail-closed, both, every time)
 

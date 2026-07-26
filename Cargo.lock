@@ -632,6 +632,7 @@ dependencies = [
  "async-trait",
  "dig-constants 0.8.0",
  "dig-dht",
+ "dig-download",
  "dig-nat",
  "dig-peer",
  "dig-rpc-protocol 0.5.0",

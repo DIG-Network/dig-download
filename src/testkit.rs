@@ -449,8 +449,10 @@ pub struct MockModuleTransport {
     corrupt_module_hash: bool,
     overserve: bool,
     declared_total_size: Option<u64>,
+    wrong_descriptor_for: Option<String>,
     budget: Option<Arc<AtomicUsize>>,
     fetches: Mutex<Vec<(String, u64)>>,
+    info_calls: Mutex<Vec<String>>,
 }
 
 impl MockModuleTransport {
@@ -466,8 +468,10 @@ impl MockModuleTransport {
             corrupt_module_hash: false,
             overserve: false,
             declared_total_size: None,
+            wrong_descriptor_for: None,
             budget: None,
             fetches: Mutex::new(Vec::new()),
+            info_calls: Mutex::new(Vec::new()),
         }
     }
 
@@ -502,6 +506,15 @@ impl MockModuleTransport {
         self
     }
 
+    /// ONLY `peer_id`'s `getModuleInfo` answers with a WELL-FORMED but WRONG descriptor (honest
+    /// per-chunk hashes + lengths, a wrong whole-blob `module_hash`), while every other holder answers
+    /// honestly — models the descriptor-source attack: one holder winning the `getModuleInfo` race can
+    /// otherwise deny the pull permanently even though honest holders are present.
+    pub fn lying_descriptor_from(mut self, peer_id: &str) -> Self {
+        self.wrong_descriptor_for = Some(peer_id.to_string());
+        self
+    }
+
     /// Only `n` `fetchModuleRange` calls succeed; the rest error — models an interrupt after partial
     /// progress so a test can assert resume re-fetches ONLY the missing chunks.
     pub fn with_success_budget(mut self, n: usize) -> Self {
@@ -512,6 +525,12 @@ impl MockModuleTransport {
     /// A snapshot of every `(peer_id, offset)` served (to assert multi-source + no-refetch-on-resume).
     pub async fn fetches(&self) -> Vec<(String, u64)> {
         self.fetches.lock().await.clone()
+    }
+
+    /// The `peer_id` of every `getModuleInfo` handshake served, in order — so a test can assert a
+    /// lying descriptor source was DEMOTED and a different holder re-handshaked.
+    pub async fn module_info_calls(&self) -> Vec<String> {
+        self.info_calls.lock().await.clone()
     }
 
     /// The descriptor this transport reports (the honest chunk layout + hashes).
@@ -543,18 +562,42 @@ impl MockModuleTransport {
             chunk_lens,
         }
     }
+
+    /// A self-consistent descriptor whose whole-blob `module_hash` is wrong — it plans + attributes
+    /// every chunk correctly and only fails at the final whole-blob gate.
+    fn lying_descriptor(&self) -> ModuleInfo {
+        ModuleInfo {
+            module_hash: "0".repeat(64),
+            ..self.descriptor()
+        }
+    }
 }
 
 #[async_trait]
 impl crate::module::ModuleTransport for MockModuleTransport {
     async fn get_module_info(
         &self,
-        _provider_peer_id: &str,
+        provider_peer_id: &str,
         store_id: &str,
         root: &str,
     ) -> Result<ModuleInfo, DownloadError> {
+        self.info_calls
+            .lock()
+            .await
+            .push(provider_peer_id.to_string());
         if store_id != self.store_id || root != self.root {
-            return Err(DownloadError::transport("mock", "unknown (store_id, root)"));
+            // The crate's OWN idiom stamps the raw `provider_peer_id` into the error (see
+            // `source.rs`), and the real sub-family-4 adapter will mirror it — so the mock must too,
+            // or the #1603 sentinel test defends nothing.
+            return Err(DownloadError::transport(
+                provider_peer_id,
+                "unknown (store_id, root)",
+            ));
+        }
+        if let Some(wrong) = self.wrong_descriptor_for.as_deref() {
+            if wrong == provider_peer_id {
+                return Ok(self.lying_descriptor());
+            }
         }
         Ok(self.descriptor())
     }

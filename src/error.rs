@@ -9,13 +9,65 @@
 
 use thiserror::Error;
 
+/// The character bound applied to a foreign error `reason` when it is rendered (#1603). Long enough
+/// for a nested dial/transport chain, short enough that a hostile peer cannot flood a log line.
+pub const MAX_ERROR_REASON_CHARS: usize = 512;
+
+/// The character bound applied to a rendered failure CONTEXT (a per-holder reason list), which is
+/// legitimately longer than one reason but still bounded.
+pub const MAX_ERROR_CONTEXT_CHARS: usize = 4096;
+
+/// Render an untrusted identifier for a log or an error message: the lowercase 64-hex value if it IS
+/// canonical 64-hex, else `<non-canonical-{label}>`.
+///
+/// Peer ids and a descriptor's hashes are peer-supplied free-form strings. Echoing one verbatim lets a
+/// hostile holder inject newlines, markup, or forged log lines into the node's own diagnostics — so a
+/// non-canonical value never reaches the output, and a log an attacker can write is never mistaken for
+/// evidence (#1603). Applied in [`DownloadError`]'s own `Display`, so the raw id is UNREPRESENTABLE in
+/// an error string however the error was constructed.
+pub fn hex64_or_sentinel(value: &str, label: &str) -> String {
+    let canonical = value.len() == 64 && value.chars().all(|c| c.is_ascii_hexdigit());
+    if canonical {
+        value.to_ascii_lowercase()
+    } else {
+        format!("<non-canonical-{label}>")
+    }
+}
+
+/// Render free-form foreign TEXT (a remote error message, a returned status line) safely: control
+/// characters are escaped rather than emitted, and the result is bounded to `max_chars`.
+///
+/// A peer-supplied reason lands inside error messages consumers LOG, so an un-escaped newline lets a
+/// holder forge whole log lines — the same #1603 class as an un-sentinelled peer id, through a
+/// different door. Escaping (not deleting) keeps the reason diagnosable while making it exactly ONE
+/// line.
+pub fn sanitize_untrusted_text(text: &str, max_chars: usize) -> String {
+    let mut out = String::with_capacity(text.len().min(max_chars));
+    for (count, ch) in text.chars().enumerate() {
+        if count == max_chars {
+            out.push_str("…<truncated>");
+            break;
+        }
+        if ch.is_control() {
+            out.extend(ch.escape_debug());
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
 /// An error from a download operation.
 #[derive(Debug, Error)]
 pub enum DownloadError {
     /// A transport-level failure fetching from one provider (connect failed, stream dropped,
     /// availability/range RPC errored, timeout). Carries the reason as text. **Recoverable**: the
     /// orchestrator marks the provider suspect and re-queues the range to another holder.
-    #[error("transport error from provider {provider}: {reason}")]
+    #[error(
+        "transport error from provider {}: {}",
+        hex64_or_sentinel(provider, "peer-id"),
+        sanitize_untrusted_text(reason, MAX_ERROR_REASON_CHARS)
+    )]
     Transport {
         /// The provider `peer_id` (64-hex) the failure came from.
         provider: String,
@@ -26,7 +78,10 @@ pub enum DownloadError {
     /// A range fetch exceeded the configured per-range timeout (`DownloadConfig::range_timeout`) — a
     /// too-slow or stalled source. **Recoverable**: the range is re-queued to another holder and the
     /// slow source is backed off (its `TimedOut` outcome is reported to the selector).
-    #[error("range fetch from provider {provider} timed out")]
+    #[error(
+        "range fetch from provider {} timed out",
+        hex64_or_sentinel(provider, "peer-id")
+    )]
     Timeout {
         /// The provider `peer_id` (64-hex) whose fetch timed out.
         provider: String,
@@ -51,7 +106,10 @@ pub enum DownloadError {
     ///
     /// `content` names the content id AND which of those two steps failed: the message must never
     /// blame discovery for a probe failure (that ambiguity cost four #1586 investigations).
-    #[error("content not found: {content}")]
+    #[error(
+        "content not found: {}",
+        sanitize_untrusted_text(content, MAX_ERROR_CONTEXT_CHARS)
+    )]
     NotFound {
         /// The content id that could not be fetched, plus the step that failed.
         content: String,
@@ -154,12 +212,73 @@ pub enum VerifyError {
 mod tests {
     use super::*;
 
+    /// A canonical 64-hex peer id is a real identifier and is reported as-is.
     #[test]
     fn transport_helper_formats_with_provider() {
-        let e = DownloadError::transport("abcd", "connection refused");
-        assert!(e.to_string().contains("abcd"));
+        let peer = "ab".repeat(32);
+        let e = DownloadError::transport(&peer, "connection refused");
+        assert!(e.to_string().contains(&peer));
         assert!(e.to_string().contains("connection refused"));
         assert!(e.is_recoverable());
+    }
+
+    /// #1603 — the provider id is UNREPRESENTABLE raw in an error string. The crate's own idiom
+    /// stamps `&provider.provider_peer_id` (free-form text off the wire) straight into
+    /// [`DownloadError::transport`], so the sanitization must live in `Display`, not at each call
+    /// site: otherwise a hostile holder's forged log line rides out inside the wrapped error even
+    /// though the surrounding code sentinelled the peer id.
+    #[test]
+    fn a_hostile_provider_id_and_reason_are_never_echoed() {
+        let hostile = "not-hex <script>x</script>\n[FATAL] forged log line";
+        let rendered =
+            DownloadError::transport(hostile, "remote said: \n[FATAL] also forged").to_string();
+        assert!(
+            rendered.contains("<non-canonical-peer-id>"),
+            "the id is sentinelled: {rendered}"
+        );
+        assert!(
+            !rendered.contains("<script>"),
+            "no peer-supplied id text: {rendered}"
+        );
+        assert!(
+            !rendered.contains('\n'),
+            "a foreign reason can never forge a second log line: {rendered}"
+        );
+
+        // Struct-literal construction bypasses the helper — Display still sanitizes.
+        let direct = DownloadError::Transport {
+            provider: hostile.to_string(),
+            reason: "x\ny".to_string(),
+        }
+        .to_string();
+        assert!(!direct.contains('\n') && !direct.contains("<script>"));
+    }
+
+    #[test]
+    fn untrusted_text_is_escaped_and_bounded() {
+        assert_eq!(sanitize_untrusted_text("a\nb", 64), "a\\nb");
+        assert_eq!(sanitize_untrusted_text("héllo", 64), "héllo");
+        let long = sanitize_untrusted_text(&"x".repeat(100), 10);
+        assert_eq!(long, format!("{}…<truncated>", "x".repeat(10)));
+    }
+
+    #[test]
+    fn untrusted_ids_are_sentinelled() {
+        let canonical = "ab".repeat(32);
+        assert_eq!(hex64_or_sentinel(&canonical, "peer-id"), canonical);
+        assert_eq!(
+            hex64_or_sentinel(&"AB".repeat(32), "peer-id"),
+            canonical,
+            "canonical form is lowercase"
+        );
+        assert_eq!(
+            hex64_or_sentinel("short", "peer-id"),
+            "<non-canonical-peer-id>"
+        );
+        assert_eq!(
+            hex64_or_sentinel(&"zz".repeat(32), "hash"),
+            "<non-canonical-hash>"
+        );
     }
 
     #[test]
@@ -174,11 +293,12 @@ mod tests {
 
     #[test]
     fn timeout_is_recoverable() {
+        let peer = "cd".repeat(32);
         let e = DownloadError::Timeout {
-            provider: "abcd".into(),
+            provider: peer.clone(),
         };
         assert!(e.is_recoverable());
-        assert!(e.to_string().contains("abcd"));
+        assert!(e.to_string().contains(&peer));
         assert!(e.to_string().contains("timed out"));
     }
 

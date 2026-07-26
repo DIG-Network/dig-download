@@ -87,6 +87,9 @@ pub mod read_ladder;
 pub mod select;
 pub mod sink;
 pub mod source;
+// The in-memory test harness is compiled ONLY for this crate's own tests or behind the explicit
+// `testkit` feature — it ships the fail-OPEN doubles, which have no place in a production build.
+#[cfg(any(test, feature = "testkit"))]
 pub mod testkit;
 pub mod throttle;
 pub mod verify;
@@ -96,13 +99,22 @@ pub mod verify;
 pub use dig_dht::{ContentId, ProviderRecord};
 
 pub use addr::{candidate_socket, dial_candidates, AddrError, MAX_DIAL_CANDIDATES};
-pub use error::{DownloadError, VerifyError};
+pub use error::{
+    hex64_or_sentinel, sanitize_untrusted_text, DownloadError, VerifyError,
+    MAX_ERROR_CONTEXT_CHARS, MAX_ERROR_REASON_CHARS,
+};
 pub use gc::{ActiveDownloads, GcConfig, TmpGc};
 pub use locate::{DhtProviderLocator, ProviderLocator};
 pub use module::{
-    module_content_id, module_download_key, AcceptAnyModuleAnchor, ModuleAnchorVerifier,
-    ModuleDownloadConfig, ModuleDownloader, ModuleTransport,
+    module_content_id, module_download_key, ModuleAnchorVerifier, ModuleDownloadConfig,
+    ModuleDownloader, ModuleTransport, DEFAULT_MAX_MODULE_SIZE, MAX_DESCRIPTOR_ATTEMPTS,
+    MAX_MODULE_CHUNK_COUNT,
 };
+// The fail-OPEN anchor verifier is a TEST double, not part of the production surface (#1576 gate): it
+// exists only under `cfg(test)` / the `testkit` feature so a consumer build cannot bypass the module
+// pull's sole root of trust.
+#[cfg(any(test, feature = "testkit"))]
+pub use module::AcceptAnyModuleAnchor;
 // Re-export the wire descriptor so consumers use ONE `ModuleInfo` shape (the dig-rpc-protocol
 // byte-contract) across the module pull — no divergent local copy (#1576).
 pub use dig_rpc_protocol::types::ModuleInfo;

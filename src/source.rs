@@ -358,7 +358,7 @@ impl NatRangeTransport {
                     dig_nat::PeerTarget::with_addr(peer_id, socket, self.network_id.clone()),
                 )),
                 Err(e) => tracing::warn!(
-                    peer = %provider.provider_peer_id,
+                    peer = %crate::error::hex64_or_sentinel(&provider.provider_peer_id, "peer-id"),
                     candidate = %crate::addr::display(candidate),
                     error = %e,
                     "skipping unusable provider candidate address"
@@ -408,7 +408,7 @@ impl NatRangeTransport {
                 Ok(peer) => return Ok(peer),
                 Err(e) => {
                     tracing::debug!(
-                        peer = %provider.provider_peer_id,
+                        peer = %crate::error::hex64_or_sentinel(&provider.provider_peer_id, "peer-id"),
                         candidate = %addr,
                         error = %e,
                         "provider dial candidate failed; trying the next address"

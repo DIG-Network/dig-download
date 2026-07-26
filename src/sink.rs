@@ -62,6 +62,43 @@ pub trait Sink: Send + Sync {
     }
 }
 
+/// The `[start, end)` usize bounds of a read-back window, or a typed error if the span cannot exist.
+///
+/// `offset` / `len` are derived from a peer-supplied module descriptor, so the conversion and the
+/// addition must both be CHECKED: on a 32-bit target `as usize` silently truncates, and `start + len`
+/// can wrap — either turning a hostile span into a read of the wrong bytes instead of a rejection.
+fn read_back_bounds(offset: u64, len: u64) -> Result<(usize, usize), DownloadError> {
+    let end = offset
+        .checked_add(len)
+        .ok_or_else(|| span_too_large(offset, len))?;
+    let start = usize::try_from(offset).map_err(|_| span_too_large(offset, len))?;
+    let end = usize::try_from(end).map_err(|_| span_too_large(offset, len))?;
+    Ok((start, end))
+}
+
+fn span_too_large(offset: u64, len: u64) -> DownloadError {
+    DownloadError::sink(format!(
+        "read-back span [{offset}, +{len}) does not fit this platform's address space"
+    ))
+}
+
+/// Allocate a `len`-byte read-back buffer FALLIBLY.
+///
+/// `len` comes from an untrusted descriptor's chunk length, and `vec![0u8; len]` aborts the process
+/// via `handle_alloc_error` — an uncatchable death. `try_reserve` makes exhaustion an ordinary
+/// [`DownloadError::Sink`] the puller can route around.
+fn try_zeroed_read_buffer(len: u64) -> Result<Vec<u8>, DownloadError> {
+    let len = usize::try_from(len).map_err(|_| span_too_large(0, len))?;
+    let mut buf: Vec<u8> = Vec::new();
+    buf.try_reserve_exact(len).map_err(|e| {
+        DownloadError::sink(format!(
+            "cannot allocate a {len}-byte read-back buffer: {e}"
+        ))
+    })?;
+    buf.resize(len, 0); // within the reservation above — no further allocation
+    Ok(buf)
+}
+
 /// An in-memory [`Sink`] that assembles the resource in a byte buffer — the test sink, and a
 /// reference for the trait shape. Thread-safe (writes from concurrent range tasks).
 #[derive(Debug, Default)]
@@ -111,8 +148,7 @@ impl Sink for InMemorySink {
 
     async fn read_at(&self, offset: u64, len: u64) -> Result<Vec<u8>, DownloadError> {
         let inner = self.inner.lock().await;
-        let start = offset as usize;
-        let end = start + len as usize;
+        let (start, end) = read_back_bounds(offset, len)?;
         if inner.buf.len() < end {
             return Err(DownloadError::sink(format!(
                 "read-back past staged end: want [{start}, {end}), have {}",
@@ -206,12 +242,13 @@ impl Sink for FileSink {
         use std::io::{Read, Seek, SeekFrom};
         let mut guard = self.file.lock().await;
         // On a cross-process resume the staging file exists on disk but is not yet open in THIS
-        // process — open it read/write (never truncating) so a subsequent write_at reattaches.
+        // process — open it read/write (never truncating) so a subsequent write_at reattaches. A READ
+        // never CREATES: an absent staging file must surface as "nothing staged", not as a 0-byte file
+        // conjured as a side effect of reading.
         if guard.is_none() {
             let f = std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
-                .create(true)
                 .truncate(false)
                 .open(&self.tmp_path)
                 .map_err(DownloadError::sink)?;
@@ -220,7 +257,7 @@ impl Sink for FileSink {
         let f = guard.as_mut().expect("file opened above");
         f.seek(SeekFrom::Start(offset))
             .map_err(DownloadError::sink)?;
-        let mut buf = vec![0u8; len as usize];
+        let mut buf = try_zeroed_read_buffer(len)?;
         f.read_exact(&mut buf).map_err(|e| {
             DownloadError::sink(format!("read-back of {len} bytes at {offset} failed: {e}"))
         })?;
@@ -322,6 +359,33 @@ mod tests {
         sink2.finalize().await.unwrap();
         assert_eq!(std::fs::read(&final_path).unwrap(), b"ABCDEF");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A read-back span derived from a hostile descriptor must be REJECTED, never turned into a
+    /// wrapped/truncated index or an infallible 18-EiB allocation (which aborts the process).
+    #[tokio::test]
+    async fn an_absurd_read_back_span_is_a_typed_error_not_an_abort() {
+        let sink = InMemorySink::new();
+        sink.write_at(0, b"eight!!!").await.unwrap();
+        let err = sink
+            .read_at(1, u64::MAX)
+            .await
+            .expect_err("an unsatisfiable span is refused");
+        assert!(matches!(err, DownloadError::Sink(_)), "typed error: {err}");
+    }
+
+    /// Reading back an ABSENT staging file must not CREATE it: a read has no business leaving a
+    /// 0-byte file behind (it would also make a later GC/resume see phantom staging).
+    #[tokio::test]
+    async fn read_back_never_creates_the_staging_file() {
+        let dir = temp_dir("no-create");
+        let sink = FileSink::new(dir.join("resource.dig"));
+        assert!(sink.read_at(0, 4).await.is_err());
+        assert!(
+            !sink.tmp_path().exists(),
+            "a read did not conjure a staging file"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

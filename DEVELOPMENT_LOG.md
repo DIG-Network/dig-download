@@ -73,3 +73,60 @@ Any field that crosses a trust boundary and then feeds `Vec::with_capacity` / `v
 pre-allocated file needs a configured ceiling checked BEFORE the allocation, not a sanity check after it.
 The bound belongs in config (callers legitimately differ) with a documented default sized to the real
 artifact — here 8 GiB against capsules measured in megabytes.
+
+## A peer-supplied descriptor's arithmetic must be CHECKED — a WRAPPING sum passes every self-consistency check
+
+A transfer descriptor a peer sends (`ModuleInfo`: `total_size` + per-chunk `chunk_lens`) is validated by
+checking the lengths sum to the declared total. With UNCHECKED arithmetic that check is vacuous against a
+descriptor built to wrap: `{ total_size: 0, chunk_lens: [1, u64::MAX] }` sums to `1 + u64::MAX == 0`, which
+equals `total_size`, so it passes — and then behaves differently in the two build configurations, both bad:
+
+- `overflow-checks = on` (dig-node's release profile): the process PANICS inside `Iterator::sum` while
+  validating. One `getModuleInfo` response, zero bytes fetched, no per-holder fallback — the panic happens
+  before any recovery path exists.
+- `overflow-checks = off`: the descriptor is ACCEPTED, producing spans `[(0, 1), (1, u64::MAX)]` against a
+  zero-length assembly buffer, which panics on the copy — and reaches an 18 EiB INFALLIBLE allocation
+  (`vec![0u8; len]`), whose failure is `handle_alloc_error`, an UNCATCHABLE abort.
+
+Three durable lessons:
+
+1. **A library's own `[profile.release]` does not protect it.** Only the ROOT package's profile applies, so
+   a crate cannot rely on `overflow-checks = true` in its own `Cargo.toml`; its hostile-input validators must
+   be total in BOTH configurations. Never treat "we enable overflow checks" as a mitigation.
+2. **A validator whose stated job is "bound this before any allocation" must be TOTAL** — `checked_add` /
+   `try_fold` on every accumulation, a cap on every declared COUNT (not just the declared SIZE), a
+   `try_from` instead of `as usize`, and a `try_reserve` instead of `vec![0; n]` for anything the untrusted
+   input sizes. An infallible allocation is a denial-of-service primitive with no error path.
+3. **A size ceiling above real host memory is not a bound.** Capping a declared in-memory assembly at 8 GiB
+   only raises the attacker's price to one message; the cap must be sized to what the host can actually hold
+   (512 MiB default here), with the streaming rewrite tracked separately.
+
+## Sanitizing an untrusted id at the REPORTING site does not sanitize it — the wrapped error carries it back
+
+An untrusted `provider_peer_id` was correctly replaced by a sentinel where holder reasons were recorded, and
+the test proving it passed — yet the raw id still reached the log, because the recorded REASON was a
+`DownloadError::Transport` whose own `Display` is `"transport error from provider {provider}: {reason}"`
+with the raw id inside. The crate's own idiom (`DownloadError::transport(&provider.provider_peer_id, e)`)
+reproduces the leak at every call site, and a new adapter written by pattern-matching that code inherits it.
+The test only passed because the ONE mock on that path happened to pass a literal instead of the peer id.
+
+Put the sanitization in the error type's `Display`, not at the reporting site: then the raw value is
+UNREPRESENTABLE in a rendered error however the error was constructed (including a struct literal), and the
+leak cannot be reintroduced by a new call site. Sanitize the foreign REASON text the same way (escape
+control characters + bound the length) — a remote error message is as attacker-controlled as an id, and an
+un-escaped newline forges a whole log line. And make the test use the crate's real idiom, or it defends
+nothing.
+
+## One lying descriptor can deny a whole capsule's reshare if only the BYTES have holder rotation
+
+A multi-source pull had careful per-chunk holder rotation + re-locate, but took its transfer DESCRIPTOR from
+whichever holder answered first and never retried that step. Since holder order is deterministic, a single
+holder answering with a well-formed-but-WRONG descriptor made every attempt — including every resume —
+assemble honest bytes, fail the final whole-blob/anchor gate, and die terminally: an indefinite reshare
+denial of a targeted capsule, from one message, with honest holders sitting right there.
+
+The layer that controls the PLAN needs the same source rotation as the layer that fetches bytes: on a
+final-gate failure, demote the descriptor's source, drop the checkpoint its plan produced, and re-handshake
+with another holder (bounded attempts). And distinguish the two failure kinds — a chunk-level exhaustion
+means the bytes are unavailable (terminal), while a final-gate failure means the descriptor lied (retry
+elsewhere) — and report the descriptor failure as such, never as "not found".
