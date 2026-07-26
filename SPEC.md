@@ -234,6 +234,23 @@ The transport MUST NOT let a peer exhaust client memory:
   still be able to FETCH from it (over hole-punch/relay), not just from directly-reachable holders. The
   same ladder that carries DHT discovery carries the byte download.
 
+### 9.1 Candidate address resolution (MUST)
+
+A provider record's candidate `host` is an IP **literal** (IPv4, IPv6, or v4-mapped IPv6).
+
+- A candidate MUST be resolved by parsing `host` as an IP address and CONSTRUCTING the socket address
+  with the candidate's port. An implementation MUST NOT compose `"{host}:{port}"` and parse that text
+  as a socket address: the socket-address grammar requires an IPv6 literal to be bracketed, so the
+  round trip rejects every IPv6 candidate before any socket is opened.
+- Rendering a candidate as text (logs, selection DTOs) MUST bracket an IPv6 literal, so the rendered
+  form parses back as a socket address.
+- A `host` that is not an IP literal is NOT dialable (this crate performs no DNS resolution on the dial
+  path); such a candidate MUST be skipped with a named reason, never treated as fatal to the provider.
+- **IPv6-first with IPv4 fallback (§5.2).** A dial MUST try EVERY dialable candidate of the provider in
+  order — IPv6 candidates first, then IPv4, then relay-only reachability by identity — and MUST report
+  the holder unreachable only after every candidate has failed. The number of candidates tried per
+  provider is bounded. Each failed attempt MUST be logged with the address that produced it.
+
 ---
 
 ## 10. Reassembly, staging, and resume

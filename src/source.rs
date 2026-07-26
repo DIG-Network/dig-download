@@ -318,33 +318,57 @@ impl NatRangeTransport {
         }
     }
 
+    /// Every way to reach `provider`, in dial order: each resolvable candidate address as a
+    /// [`dig_nat::PeerTarget`] — **IPv6 first, then IPv4** (§5.2) — followed by a relay-only target
+    /// reached purely by identity.
+    ///
+    /// Each entry carries the candidate's rendered address so a failed dial can name WHICH address it
+    /// tried. Unresolvable candidates are logged and skipped rather than aborting the provider: one
+    /// malformed v6 candidate must never hide a working v4 one (#836).
+    pub fn provider_dial_targets(
+        &self,
+        provider: &ProviderRecord,
+    ) -> Result<Vec<(String, dig_nat::PeerTarget)>, DownloadError> {
+        let peer_id = provider.provider_peer_id().ok_or_else(|| {
+            DownloadError::transport(&provider.provider_peer_id, "malformed provider peer_id")
+        })?;
+        let mut targets = Vec::new();
+        for candidate in crate::addr::dial_candidates(provider) {
+            match crate::addr::candidate_socket(candidate) {
+                Ok(socket) => targets.push((
+                    socket.to_string(),
+                    dig_nat::PeerTarget::with_addr(peer_id, socket, self.network_id.clone()),
+                )),
+                Err(e) => tracing::warn!(
+                    peer = %provider.provider_peer_id,
+                    candidate = %crate::addr::display(candidate),
+                    error = %e,
+                    "skipping unusable provider candidate address"
+                ),
+            }
+        }
+        targets.push((
+            "relay-only".to_string(),
+            dig_nat::PeerTarget::relay_only(peer_id, self.network_id.clone()),
+        ));
+        Ok(targets)
+    }
+
     /// Build a [`dig_nat::PeerTarget`] from a provider record: its `peer_id` + the most-direct
     /// dialable candidate address (falling back to relay-only reachability by identity).
+    ///
+    /// This is the FIRST of [`provider_dial_targets`](Self::provider_dial_targets); dialing uses the
+    /// full ordered list so a failing candidate falls through to the next.
     pub fn provider_to_target(
         &self,
         provider: &ProviderRecord,
     ) -> Result<dig_nat::PeerTarget, DownloadError> {
-        let peer_id = provider.provider_peer_id().ok_or_else(|| {
-            DownloadError::transport(&provider.provider_peer_id, "malformed provider peer_id")
-        })?;
-        match provider.best_address() {
-            Some(addr) => {
-                let socket = format!("{}:{}", addr.host, addr.port)
-                    .parse::<std::net::SocketAddr>()
-                    .map_err(|e| {
-                        DownloadError::transport(&provider.provider_peer_id, format!("addr: {e}"))
-                    })?;
-                Ok(dig_nat::PeerTarget::with_addr(
-                    peer_id,
-                    socket,
-                    self.network_id.clone(),
-                ))
-            }
-            None => Ok(dig_nat::PeerTarget::relay_only(
-                peer_id,
-                self.network_id.clone(),
-            )),
-        }
+        let (_, target) = self
+            .provider_dial_targets(provider)?
+            .into_iter()
+            .next()
+            .expect("dial targets always include the relay-only fallback");
+        Ok(target)
     }
 
     /// Connect to a provider as a [`DigPeer`] (fresh `peer_id`-pinned mTLS connection over the FULL
@@ -353,11 +377,32 @@ impl NatRangeTransport {
     /// injected them (#1305). The [`PeerTarget`](dig_nat::PeerTarget) carries the provider's `peer_id`,
     /// which [`DigPeer::connect_with_runtime`] pins so a different CA-valid peer cannot impersonate the
     /// intended provider (#1283).
+    ///
+    /// Every candidate address is tried in order (IPv6 first, then IPv4, then relay-only, §5.2) and
+    /// each failure is logged with the address that produced it, so an unreachable v6 candidate falls
+    /// through to a working v4 one instead of failing the whole holder (#836).
     async fn connect(&self, provider: &ProviderRecord) -> Result<DigPeer, DownloadError> {
-        let target = self.provider_to_target(provider)?;
-        DigPeer::connect_with_runtime(&target, &self.node, &self.config, &self.runtime)
-            .await
-            .map_err(|e| DownloadError::transport(&provider.provider_peer_id, e))
+        let mut last_error = None;
+        for (addr, target) in self.provider_dial_targets(provider)? {
+            match DigPeer::connect_with_runtime(&target, &self.node, &self.config, &self.runtime)
+                .await
+            {
+                Ok(peer) => return Ok(peer),
+                Err(e) => {
+                    tracing::debug!(
+                        peer = %provider.provider_peer_id,
+                        candidate = %addr,
+                        error = %e,
+                        "provider dial candidate failed; trying the next address"
+                    );
+                    last_error = Some(format!("dial {addr}: {e}"));
+                }
+            }
+        }
+        Err(DownloadError::transport(
+            &provider.provider_peer_id,
+            last_error.unwrap_or_else(|| "no dialable candidate address".to_string()),
+        ))
     }
 
     /// Get the pooled connection for `provider`, dialing (and caching) a fresh one if none is pooled.
@@ -491,6 +536,126 @@ mod tests {
             "203.0.113.7:9444"
         );
         assert_eq!(target.network_id, "DIG_MAINNET");
+    }
+
+    #[test]
+    fn provider_to_target_accepts_v4_mapped_v6_host() {
+        // #836 regression: the e2e read leg died with "addr: invalid socket address syntax" because
+        // the host+port were STRING-formatted before parsing, and an IPv6 literal needs brackets.
+        let t = NatRangeTransport::new(
+            fake_node_cert(),
+            dig_nat::NatConfig::default(),
+            "DIG_MAINNET",
+        );
+        let p = provider(1, "::ffff:172.31.79.22", 9444);
+        let target = t
+            .provider_to_target(&p)
+            .expect("v4-mapped v6 host must resolve");
+        assert_eq!(
+            target.direct_addr().unwrap(),
+            std::net::SocketAddr::new("::ffff:172.31.79.22".parse().unwrap(), 9444)
+        );
+    }
+
+    #[test]
+    fn provider_to_target_accepts_plain_v6_host() {
+        let t = NatRangeTransport::new(
+            fake_node_cert(),
+            dig_nat::NatConfig::default(),
+            "DIG_MAINNET",
+        );
+        let p = provider(1, "2001:db8::1", 9444);
+        let target = t.provider_to_target(&p).expect("v6 host must resolve");
+        assert_eq!(
+            target.direct_addr().unwrap(),
+            std::net::SocketAddr::new("2001:db8::1".parse().unwrap(), 9444)
+        );
+    }
+
+    #[test]
+    fn unusable_first_candidate_falls_through_to_the_ipv4_one() {
+        // #836 / §5.2: IPv6-first with IPv4 FALLBACK. A provider whose leading candidate is unusable
+        // must still be dialed on its valid v4 candidate — previously the record's FIRST address was
+        // the only one considered, so one bad candidate condemned the holder.
+        let t = NatRangeTransport::new(
+            fake_node_cert(),
+            dig_nat::NatConfig::default(),
+            "DIG_MAINNET",
+        );
+        let p = ProviderRecord::new(
+            &dig_dht::Key::from_bytes([0xAB; 32]),
+            &PeerId::from_bytes([3; 32]),
+            vec![
+                CandidateAddr::direct("not-an-ip-literal", 9444),
+                CandidateAddr::direct("10.0.0.1", 9444),
+            ],
+            u64::MAX,
+        );
+        let target = t
+            .provider_to_target(&p)
+            .expect("the v4 candidate is dialable");
+        assert_eq!(
+            target.direct_addr().unwrap(),
+            "10.0.0.1:9444".parse::<std::net::SocketAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn dial_targets_order_v6_then_v4_then_relay() {
+        let t = NatRangeTransport::new(
+            fake_node_cert(),
+            dig_nat::NatConfig::default(),
+            "DIG_MAINNET",
+        );
+        let p = ProviderRecord::new(
+            &dig_dht::Key::from_bytes([0xAB; 32]),
+            &PeerId::from_bytes([4; 32]),
+            vec![
+                CandidateAddr::direct("172.31.79.22", 9444),
+                CandidateAddr::direct("::ffff:172.31.79.22", 9444),
+            ],
+            u64::MAX,
+        );
+        let addrs: Vec<String> = t
+            .provider_dial_targets(&p)
+            .unwrap()
+            .into_iter()
+            .map(|(addr, _)| addr)
+            .collect();
+        assert_eq!(
+            addrs,
+            vec![
+                "[::ffff:172.31.79.22]:9444",
+                "172.31.79.22:9444",
+                "relay-only"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_tries_every_candidate_before_failing() {
+        // Both candidates are closed loopback ports: the dial must walk the whole list (v6 then v4
+        // then relay-only) and report the LAST attempt, proving no early give-up.
+        let t = NatRangeTransport::new(
+            fake_node_cert(),
+            dig_nat::NatConfig::default(),
+            "DIG_MAINNET",
+        );
+        let p = ProviderRecord::new(
+            &dig_dht::Key::from_bytes([0xAB; 32]),
+            &PeerId::from_bytes([5; 32]),
+            vec![
+                CandidateAddr::direct("::1", 1),
+                CandidateAddr::direct("127.0.0.1", 1),
+            ],
+            u64::MAX,
+        );
+        let err = t.connect(&p).await.expect_err("no listener is up");
+        let reason = err.to_string();
+        assert!(
+            reason.contains("relay-only"),
+            "the last attempt must be named: {reason}"
+        );
     }
 
     #[test]

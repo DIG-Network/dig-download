@@ -660,11 +660,7 @@ impl Job {
             .iter()
             .filter(|p| self.tracker.is_available(&p.provider_peer_id, now))
             .map(|p| {
-                let addrs = p
-                    .addresses
-                    .iter()
-                    .map(|a| format!("{}:{}", a.host, a.port))
-                    .collect();
+                let addrs = p.addresses.iter().map(crate::addr::display).collect();
                 CandidateRef::new(p.provider_peer_id.clone(), addrs)
             })
             .collect();
