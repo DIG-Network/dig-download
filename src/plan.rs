@@ -22,9 +22,22 @@ pub struct ChunkLayout {
     offsets: Vec<u64>,
 }
 
+/// The hard upper bound on the number of chunks a resource layout may declare.
+///
+/// `chunk_lens` arrives from an untrusted peer's first frame and its COUNT sizes the layout's own
+/// vectors, so an absurd count is a one-message allocation attack — bounded here, before any
+/// allocation. 1 Mi chunks covers any real resource at any sane chunk size (the module puller's
+/// [`MAX_MODULE_CHUNK_COUNT`](crate::module::MAX_MODULE_CHUNK_COUNT) mirror).
+pub const MAX_RESOURCE_CHUNK_COUNT: usize = 1024 * 1024;
+
 impl ChunkLayout {
-    /// Build a layout from per-chunk lengths. Zero-length chunks are permitted (an empty resource has
-    /// no chunks; a resource with content has ≥1).
+    /// Build a layout from TRUSTED per-chunk lengths. Zero-length chunks are permitted (an empty
+    /// resource has no chunks; a resource with content has ≥1).
+    ///
+    /// Overflow SATURATES here, which is safe only because the caller already knows the lengths are
+    /// real. For lengths off the wire use [`try_new`](Self::try_new): a saturating sum lets a hostile
+    /// `[1, u64::MAX]` land on exactly `u64::MAX` and pass a consistency check against a declared
+    /// total (#1608).
     pub fn new(chunk_lens: Vec<u64>) -> Self {
         let mut offsets = Vec::with_capacity(chunk_lens.len() + 1);
         let mut acc = 0u64;
@@ -37,6 +50,51 @@ impl ChunkLayout {
             chunk_lens,
             offsets,
         }
+    }
+
+    /// Build a layout from UNTRUSTED per-chunk lengths — the peer-facing constructor.
+    ///
+    /// Every step is total over a hostile input: the chunk COUNT is bounded before any allocation, the
+    /// offset reservation is FALLIBLE (an infallible `Vec::with_capacity` sized by wire input aborts the
+    /// process via the uncatchable `handle_alloc_error`), and the cumulative offsets are CHECKED so an
+    /// overflow is a typed rejection instead of a silent wrap or saturation. A library must never
+    /// delegate this to `[profile.release] overflow-checks`: only the ROOT package's profile applies, so
+    /// in a consumer build a wrapping add is a silent ACCEPT, not a panic (#1608).
+    ///
+    /// # Errors
+    /// [`VerifyError::Metadata`] when the declared chunk count exceeds
+    /// [`MAX_RESOURCE_CHUNK_COUNT`], the offsets cannot be allocated, or the cumulative length
+    /// overflows `u64`.
+    pub fn try_new(chunk_lens: Vec<u64>) -> Result<Self, VerifyError> {
+        if chunk_lens.len() > MAX_RESOURCE_CHUNK_COUNT {
+            return Err(VerifyError::Metadata(format!(
+                "declared chunk_lens count {} exceeds the maximum {MAX_RESOURCE_CHUNK_COUNT}",
+                chunk_lens.len()
+            )));
+        }
+        let mut offsets: Vec<u64> = Vec::new();
+        offsets
+            .try_reserve_exact(chunk_lens.len() + 1)
+            .map_err(|e| {
+                VerifyError::Metadata(format!(
+                    "cannot allocate a {}-entry chunk layout: {e}",
+                    chunk_lens.len() + 1
+                ))
+            })?;
+        let mut acc = 0u64;
+        offsets.push(0);
+        for &len in &chunk_lens {
+            acc = acc.checked_add(len).ok_or_else(|| {
+                VerifyError::Metadata(
+                    "chunk_lens cumulative length overflows u64 (hostile metadata)".into(),
+                )
+            })?;
+            offsets.push(acc);
+        }
+        Ok(ChunkLayout {
+            chunk_lens,
+            offsets,
+        })
     }
 
     /// The number of chunks.

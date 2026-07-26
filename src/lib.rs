@@ -106,9 +106,9 @@ pub use error::{
 pub use gc::{ActiveDownloads, GcConfig, TmpGc};
 pub use locate::{DhtProviderLocator, ProviderLocator};
 pub use module::{
-    module_content_id, module_download_key, ModuleAnchorVerifier, ModuleDownloadConfig,
-    ModuleDownloader, ModuleTransport, DEFAULT_MAX_MODULE_SIZE, MAX_DESCRIPTOR_ATTEMPTS,
-    MAX_MODULE_CHUNK_COUNT,
+    module_content_id, module_download_key, ModuleAnchor, ModuleAnchorVerifier,
+    ModuleDownloadConfig, ModuleDownloader, ModuleTransport, DEFAULT_MAX_MODULE_SIZE,
+    MAX_DESCRIPTOR_ATTEMPTS, MAX_MODULE_CHUNK_COUNT,
 };
 // The fail-OPEN anchor verifier is a TEST double, not part of the production surface (#1576 gate): it
 // exists only under `cfg(test)` / the `testkit` feature so a consumer build cannot bypass the module

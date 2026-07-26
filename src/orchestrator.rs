@@ -83,9 +83,27 @@ pub struct DownloadConfig {
     /// Per-range attempt budget (× ranges) that bounds total retries before terminal
     /// [`DownloadError::NoProviders`], guaranteeing termination against an all-bad provider set.
     pub max_range_attempts: usize,
-    /// Whether to verify the whole reassembled resource against the chain-anchored root at the end
-    /// (retains verified bytes in memory to do so). Disable for large streaming downloads whose store
-    /// verifies on install; keep on for standalone integrity. Default `true`.
+    /// The ceiling on a peer-DECLARED resource `total_length`. The first frame's declared length sizes
+    /// the plan and the range assembler's buffer, and it comes from a peer that has proven nothing yet,
+    /// so a commitment above this bound is REFUSED before any layout exists (#1608). Default
+    /// [`DEFAULT_MAX_RESOURCE_SIZE`](crate::verify::DEFAULT_MAX_RESOURCE_SIZE) (512 MiB); raise it
+    /// explicitly on a host sized for larger resources.
+    pub max_resource_size: u64,
+    /// Whether to bind the whole reassembled resource to the chain-anchored root before promoting it.
+    /// Default `true`; keep it on for standalone integrity.
+    ///
+    /// **Exactly what disabling it subtracts.** It removes the ONLY check that binds assembled CONTENT to
+    /// the commitment: the per-range checks are structural (length + alignment), so right-length wrong
+    /// bytes from any source pass them. Two consequences follow, and neither is obvious from the name:
+    ///
+    /// - freshly-fetched bytes are accepted on their shape alone, so this is only safe when something
+    ///   downstream verifies the artifact (a store that verifies on install);
+    /// - a RESUMED range's staged bytes cannot be bound to anything either, so they are NOT trusted —
+    ///   they are re-fetched. Disabling this therefore costs the resume optimization across a process
+    ///   restart, deliberately: trusting them promoted arbitrary bytes as a verified success.
+    ///
+    /// It does NOT remove the promotion length proof — an incomplete artifact is still refused
+    /// (see [`crate::sink`]) — and it does not disable the per-range structural checks.
     pub verify_whole_resource: bool,
     /// The **selection brain**: which candidate peers to fetch from, and in what order. `None` uses a
     /// fair round-robin [`NullSelector`], keeping dig-download fully usable standalone. dig-node
@@ -111,6 +129,7 @@ impl std::fmt::Debug for DownloadConfig {
             .field("max_backoff", &self.max_backoff)
             .field("max_relocate_attempts", &self.max_relocate_attempts)
             .field("max_range_attempts", &self.max_range_attempts)
+            .field("max_resource_size", &self.max_resource_size)
             .field("verify_whole_resource", &self.verify_whole_resource)
             .field("selector", &self.selector.as_ref().map(|_| "<injected>"))
             .field("range_timeout", &self.range_timeout)
@@ -129,6 +148,7 @@ impl Default for DownloadConfig {
             max_backoff: Duration::from_secs(10),
             max_relocate_attempts: 4,
             max_range_attempts: 6,
+            max_resource_size: crate::verify::DEFAULT_MAX_RESOURCE_SIZE,
             verify_whole_resource: true,
             selector: None,
             range_timeout: Some(DEFAULT_RANGE_TIMEOUT),
@@ -348,8 +368,10 @@ struct Job {
     paused: bool,
     bytes_done: u64,
     /// Streaming SHA-256 of the resource ciphertext for the whole-resource backstop, fed one verified
-    /// range at a time in offset order (only present when `verify_whole_resource` and no ranges were
-    /// resumed from a prior process). Replaces retaining every range + a full concat copy (~2N RAM).
+    /// range at a time in offset order. Present whenever [`DownloadConfig::verify_whole_resource`] is
+    /// set — INCLUDING on a crash-resume, where the ranges a prior process completed are read back from
+    /// staging and fed in before scheduling (#1605), so the backstop is never skipped. Replaces
+    /// retaining every range + a full concat copy (~2N RAM).
     hasher: Option<ResourceHasher>,
     relocate_attempts: usize,
     relocated_since_progress: bool,
@@ -375,31 +397,50 @@ impl Job {
         };
         // A persisted commitment lets a crash-resume skip the meta-probe.
         if !self.resume.chunk_lens.is_empty() {
-            match ResourceCommitment::from_first_frame(
+            match ResourceCommitment::from_first_frame_bounded(
                 self.resume.total_length,
                 self.resume.chunk_lens.clone(),
                 self.resume.root.clone(),
                 self.resume.inclusion_proof.clone(),
+                self.config.max_resource_size,
             ) {
                 Ok(c) => self.commitment = Some(c),
                 Err(_) => self.commitment = None,
             }
         }
 
-        // Protect the staging file from GC while this download is live/paused-resumable.
-        let staging = self.sink.staging_path().map(|p| p.to_path_buf());
-        if let Some(path) = &staging {
-            self.registry.register(path.clone()).await;
-        }
+        // CLAIM the staging file: it is protected from GC while this download is live/paused-resumable,
+        // and — since a staging area is shared by nothing — held EXCLUSIVELY. A second download of the
+        // same target would write over this one by offset, share its checkpoint, and be able to
+        // `truncate` its bytes away, which per-range structural verification cannot detect. Refusing to
+        // start is the only outcome that keeps "the promoted artifact is the verified artifact" true.
+        //
+        // The claim is an RAII guard, so it is released on EVERY exit from this function — including an
+        // unwinding panic, which `tokio::spawn` absorbs. A leaked claim would make its staging path both
+        // permanently GC-exempt and permanently un-downloadable, turning this guard into the very denial
+        // primitive it exists to prevent.
+        let _claim = match self.sink.staging_path().map(|p| p.to_path_buf()) {
+            None => None, // an in-memory sink stages nothing on disk
+            Some(path) => match self.registry.claim(path.clone()) {
+                Some(claim) => Some(claim),
+                None => {
+                    let reason = format!(
+                        "another download is already staging into {}; refusing to share a staging area",
+                        path.display()
+                    );
+                    self.emit(DownloadEvent::Failed {
+                        reason: reason.clone(),
+                    })
+                    .await;
+                    // The claim belongs to the download that holds it — this one releases nothing.
+                    return Err(DownloadError::sink(reason));
+                }
+            },
+        };
 
-        let result = self.run_inner().await;
-
-        // Terminal outcome → release the staging registration (success already renamed it away;
-        // failure/cancel leaves the .download.tmp for GC to reap once stale).
-        if let Some(path) = &staging {
-            self.registry.unregister(path).await;
-        }
-        result
+        // Success renamed the staging file away; failure/cancel leaves the `.download.tmp` for GC to reap
+        // once stale. Either way the claim drops here.
+        self.run_inner().await
     }
 
     async fn run_inner(&mut self) -> Result<u64, DownloadError> {
@@ -421,6 +462,7 @@ impl Job {
         if self.commitment.is_none() {
             self.establish_commitment().await?;
         }
+        self.discard_bytes_staged_for_another_plan().await;
         self.persist_commitment().await?;
 
         // 4. Plan the chunk-aligned ranges; mark the already-verified ones done (resume).
@@ -437,32 +479,20 @@ impl Job {
                 }
             })
             .collect();
-        // Ranges carried over as already-done from persisted resume state: their verified bytes were
-        // written to the sink in a PRIOR process and are NOT in this run's in-RAM `retained` map, so
-        // the whole-resource in-RAM assembly is intentionally partial and the backstop can't run over
-        // it (see below). A range is only ever marked done after passing the per-range length +
-        // alignment check, so a resumed-done range is still known-good.
-        let resumed_ranges = self
-            .ranges
-            .iter()
-            .filter(|r| self.resume.is_done(r.index))
-            .count();
         // The whole-resource backstop hashes ranges incrementally in offset order (O(window) RAM
-        // instead of retaining ~2N bytes — MEDIUM #179). It is only usable on a FRESH download where
-        // every range flows through this process; on a crash-resume the earlier ranges are only in
-        // the sink, so no hasher is created and the backstop is skipped (each range was still
-        // per-range verified).
-        self.hasher = if self.config.verify_whole_resource && resumed_ranges == 0 {
-            Some(ResourceHasher::new())
-        } else {
-            None
-        };
+        // instead of retaining ~2N bytes — MEDIUM #179). It is created whenever the check is enabled —
+        // including on a crash-RESUME, where the earlier ranges live only in the staging area and are
+        // read back into it below (#1605). A resumed download that skipped this check would be
+        // structurally verified ONLY: nothing would bind the assembled bytes to the chain-anchored
+        // root, which is the fail-OPEN window the whole verify-then-decrypt read guarantee rests on.
+        self.hasher = self.config.verify_whole_resource.then(ResourceHasher::new);
         self.bytes_done = self
             .ranges
             .iter()
             .filter(|r| self.resume.is_done(r.index))
             .map(|r| r.length)
             .sum();
+        self.rehydrate_resumed_ranges(&commitment).await;
         self.emit(DownloadEvent::Planned {
             ranges_total: self.ranges.len(),
             total_length: commitment.total_length,
@@ -472,15 +502,14 @@ impl Job {
         // 5–7. Schedule, verify, reassemble.
         self.schedule_loop().await?;
 
-        // Whole-resource integrity backstop (bind to the chain-anchored root). Fail-closed: on a
-        // fresh (non-resumed) download every verified range was fed to the incremental `hasher`, so
-        // its contiguous hashed length MUST equal the committed total_length — `verify_resource_leaf`
-        // returns VerifyError::Length for a short/incomplete assembly rather than being silently
-        // skipped, so a short download can never fall through to a successful finalize (CRITICAL
-        // #179). On a crash-RESUME the earlier ranges live only in the sink's staging file (no hasher
-        // was created), so this backstop is skipped; every range — resumed or freshly fetched — still
-        // passed the per-range length + alignment check, so integrity is not silently lost. The
-        // incremental hash avoids retaining every range + a full concat copy (~2N RAM — MEDIUM #179).
+        // Whole-resource integrity backstop (bind to the chain-anchored root). Fail-closed: EVERY
+        // range that makes up the assembled resource was fed to the incremental `hasher` — freshly
+        // fetched ones as they verified, resumed ones read back from staging before scheduling
+        // (#1605) — so its contiguous hashed length MUST equal the committed total_length.
+        // `verify_resource_leaf` returns VerifyError::Length for a short/incomplete assembly rather
+        // than being silently skipped, so a short download can never fall through to a successful
+        // finalize (CRITICAL #179). The incremental hash avoids retaining every range + a full concat
+        // copy (~2N RAM — MEDIUM #179).
         if let Some(hasher) = self.hasher.take() {
             let hashed_len = hasher.hashed_len();
             let leaf = hasher.finalize();
@@ -488,6 +517,7 @@ impl Job {
                 .verifier
                 .verify_resource_leaf(&commitment, &leaf, hashed_len)
             {
+                self.discard_unverifiable_assembly().await;
                 self.emit(DownloadEvent::Failed {
                     reason: e.to_string(),
                 })
@@ -496,8 +526,22 @@ impl Job {
             }
         }
 
-        // Finalize (a file sink atomically renames its .download.tmp onto the final path).
-        self.sink.finalize().await?;
+        // Promote through the ONE proven-promotion seam: the artifact promoted must be exactly the
+        // artifact verified above, never a longer or shorter staged one (#1612).
+        //
+        // A refusal here is fail-closed AND recoverable: the checkpoint that led to it is discarded with
+        // the bytes it describes, exactly as a failed backstop does. Otherwise a checkpoint that outlived
+        // its staging file (GC reaps `.download.tmp` + its sidecar while the `StateStore` keeps its
+        // checkpoint elsewhere) would make every later fetch of this content fail identically, forever —
+        // fail-closed must never mean permanently DENIED.
+        if let Err(e) = crate::sink::promote_verified(&*self.sink, commitment.total_length).await {
+            self.discard_unverifiable_assembly().await;
+            self.emit(DownloadEvent::Failed {
+                reason: e.to_string(),
+            })
+            .await;
+            return Err(e);
+        }
         // Download complete → drop the resume checkpoint.
         let _ = self.state_store.clear(&self.key).await;
         self.emit(DownloadEvent::Completed {
@@ -505,6 +549,105 @@ impl Job {
         })
         .await;
         Ok(commitment.total_length)
+    }
+
+    /// Abandon a checkpoint (and the bytes it staged) that belongs to a DIFFERENT chunk layout than
+    /// the one just planned.
+    ///
+    /// `done_ranges` are range INDICES, so inheriting them across a re-shaped plan would mark
+    /// arbitrary byte spans "done and verified". The staging area is equally suspect: no write ever
+    /// shortens it, so the abandoned plan's tail would otherwise ride out inside this plan's promotion
+    /// (the module path's analogous reset — #1612). Best-effort: the promotion seam's truncate +
+    /// confirm probe is the enforcement, this only avoids pointless re-verification work.
+    async fn discard_bytes_staged_for_another_plan(&mut self) {
+        let Some(planned) = self.commitment.as_ref().map(|c| c.layout.chunk_lens()) else {
+            return;
+        };
+        if self.resume.chunk_lens.is_empty() || self.resume.chunk_lens == planned {
+            return; // nothing checkpointed, or checkpointed for exactly this plan
+        }
+        tracing::warn!(
+            key = %self.key,
+            "resume checkpoint describes a different chunk layout; discarding it and the bytes it \
+             staged rather than mixing two plans"
+        );
+        self.resume.done_ranges.clear();
+        let _ = self.state_store.clear(&self.key).await;
+        let _ = self.sink.truncate(0).await;
+    }
+
+    /// Feed every range a PRIOR process already completed into this run's whole-resource hasher, by
+    /// reading its bytes back out of the staging area — so a crash-resume ends in the SAME
+    /// chain-binding backstop as a fresh download (#1605).
+    ///
+    /// A resumed range's bytes are not in this process's memory, only in the staging area, and the
+    /// staging area is not a trusted input (it survives a crash, another process, and bit-rot). Each
+    /// range read back is therefore re-checked against the commitment exactly like a freshly-fetched
+    /// one, and the whole-resource hash it feeds is what finally binds it to the chain-anchored root.
+    ///
+    /// A range that cannot be read back (a sink with no read-back support), reads short, or fails its
+    /// per-range check is simply returned to `Pending` and RE-FETCHED — resume is an optimization,
+    /// never a correctness dependency. The consequence is the invariant that matters: when this
+    /// returns, the hasher will see every byte of the resource, so the backstop can never be skipped.
+    async fn rehydrate_resumed_ranges(&mut self, commitment: &ResourceCommitment) {
+        let resumed: Vec<Range> = self
+            .ranges
+            .iter()
+            .filter(|r| matches!(self.range_state[r.index], RangeState::Done))
+            .copied()
+            .collect();
+        for range in resumed {
+            // With no hasher there is NO way to bind these staged bytes to any commitment — the
+            // per-range check below is structural (length + alignment), so right-length garbage passes
+            // it. Trusting staging in that state promoted arbitrary bytes as a verified success, so a
+            // resumed range is instead RE-FETCHED. Staging is never a trusted source of content; whether
+            // the whole-resource backstop is enabled changes the strength of the check, never whether
+            // one happens.
+            let staged = match self.hasher {
+                Some(_) => self.sink.read_at(range.offset, range.length).await,
+                None => Err(DownloadError::sink(
+                    "the whole-resource check is disabled, so staged bytes cannot be bound to the \
+                     commitment; re-fetching this range instead of trusting it",
+                )),
+            };
+            let verified = staged.and_then(|bytes| {
+                self.verifier
+                    .verify_range(commitment, range.chunk_start as u64, range.length, &bytes)
+                    .map(|()| bytes)
+                    .map_err(DownloadError::from)
+            });
+            match verified {
+                Ok(bytes) => {
+                    if let Some(hasher) = self.hasher.as_mut() {
+                        hasher.feed(range.offset, bytes);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        range = range.index,
+                        offset = range.offset,
+                        error = %e,
+                        "resumed range could not be re-verified from staging; re-fetching it so the \
+                         whole-resource check still runs"
+                    );
+                    self.range_state[range.index] = RangeState::Pending;
+                    self.resume.done_ranges.remove(&range.index);
+                    self.bytes_done = self.bytes_done.saturating_sub(range.length);
+                }
+            }
+        }
+    }
+
+    /// Discard the checkpoint + staging bytes of an assembly that failed the whole-resource backstop.
+    ///
+    /// Fail-closed must not mean permanently DENIED: the assembled bytes did not bind to the chain
+    /// root, so keeping them would make every later attempt read the same poisoned prefix back and
+    /// fail identically. Dropping both lets the next attempt re-fetch from scratch. Best-effort by
+    /// design — the verify failure is the outcome the caller must see, so a sink that cannot shorten
+    /// its staging area does not get to mask it.
+    async fn discard_unverifiable_assembly(&self) {
+        let _ = self.state_store.clear(&self.key).await;
+        let _ = self.sink.truncate(0).await;
     }
 
     /// The concurrent scheduler: keep ranges in flight across healthy sources until every range is
@@ -952,11 +1095,12 @@ impl Job {
                     }
                 }
                 if let (Some(tl), Some(cl)) = (f.meta.total_length, f.meta.chunk_lens.clone()) {
-                    match ResourceCommitment::from_first_frame(
+                    match ResourceCommitment::from_first_frame_bounded(
                         tl,
                         cl,
                         f.meta.root.clone(),
                         f.meta.inclusion_proof.clone(),
+                        self.config.max_resource_size,
                     ) {
                         Ok(c) => {
                             self.commitment = Some(c);

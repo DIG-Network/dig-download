@@ -47,14 +47,24 @@ A `RangeRequest { store_id, retrieval_key?, root?, capsule, offset, length }` se
 ascending `offset` order covering the requested range; the caller reassembles by `offset` and
 stops on the frame marked `complete` (or on clean end-of-stream).
 
-**Reassembly window (normative).** A holder MAY serve at its own storage granularity, so a frame MAY
-extend past `offset+length` (a chunk-granular holder answers a 1-byte metadata probe with a whole
-chunk). The caller:
+**Reassembly window (normative).** A holder **MUST NOT serve past `offset+length`** — the served span is
+exactly the requested one, because a holder that streams to the end of a resource regardless of `length`
+is a remote-amplification vector. A caller nevertheless **clips defensively**: it cannot know a holder is
+compliant, and historically a chunk-granular holder answered a 1-byte metadata probe with a whole chunk.
+Clipping is therefore defense-in-depth, NOT the primary bound, and it is never traded for rejection. The
+caller:
 
 - MUST place each frame's bytes at its range-relative `offset`, **clipped** to the requested `length`,
   and MUST stop reading frames once `length` bytes are assembled — so the assembled buffer is bounded
-  by `length` regardless of what the holder streams.
-- MUST NOT reject a frame merely for extending past the window.
+  by `length` regardless of what the holder streams. `length` is NOT self-evidently safe: it derives from
+  the peer-DECLARED `chunk_lens`, so it is bounded in turn by the commitment ceiling (section 4) and the
+  buffer's growth MUST be a FALLIBLE reservation. A frame sparse in a large window (a high `offset`, a few
+  payload bytes) otherwise drives one allocation of the whole window from a single small frame.
+- MUST NOT reject a frame merely for extending past the window. An over-long answer is handled by
+  clipping; a client-side REJECTION of it is forbidden (it makes every chunk-granular holder unusable —
+  the defect that broke the read leg). Verification therefore runs on the CLIPPED range: an
+  exact-length check downstream is a check on the assembled range, never a verdict on what the holder
+  streamed.
 - MUST reject (as a protocol violation) a frame whose `offset` is at or beyond `length`: its bytes
   cannot belong to the requested range.
 - MUST capture the first frame's verification metadata (below) before any window check, so a
@@ -92,8 +102,22 @@ The `ResourceCommitment { layout, total_length, root, inclusion_proof }` is the 
 metadata every range verifies against. It is established ONCE via a meta-probe (fetch a tiny range,
 read its first frame) and is then immutable for the life of the download.
 
+- **Declared-size ceiling (MUST — before anything is believed)** — a declared `total_length` above
+  `max_resource_size` (default `DEFAULT_MAX_RESOURCE_SIZE`, 512 MiB) is REFUSED before the layout is
+  built. The declared length sizes the plan and the range assembler's buffer, and it arrives from a peer
+  that has proven nothing: `plan_ranges` always takes at least one WHOLE chunk regardless of the window,
+  so `chunk_lens: [2^40]` becomes a single 1 TiB range and the assembler then buffers against it. An
+  unbounded declared length is therefore a one-frame memory-exhaustion primitive. Like the module bound,
+  the default is sized to what a modest host can hold; a deployment reading larger resources raises it
+  explicitly.
 - **From-frame validity** — `chunk_lens` MUST sum to `total_length`; otherwise the peer's frame is
-  rejected and the next holder is probed.
+  rejected and the next holder is probed. The sum + cumulative offsets MUST be computed with **CHECKED**
+  arithmetic and the declared chunk COUNT bounded (`MAX_RESOURCE_CHUNK_COUNT`, 1 Mi) with a **FALLIBLE**
+  reservation, all before the layout is built. Saturating or wrapping arithmetic here is a silent ACCEPT,
+  not a panic: `{ total_length: u64::MAX, chunk_lens: [1, u64::MAX] }` SATURATES to exactly `u64::MAX`,
+  matches its declared total, and yields a plan over spans no resource can have. A library MUST NOT
+  delegate this to `[profile.release] overflow-checks` — only the ROOT package's profile applies to a
+  build, so a dependency's is ignored and its validators are unsound in every consumer that omits it.
 - **Root binding to the request (MUST)** — before adopting a peer's first-frame metadata, an
   implementation MUST require the peer-reported `root` to equal the content-id's own generation `root`
   (for `Root` / `Resource` granularities; a bare store carries no root). A peer whose reported root
@@ -176,6 +200,12 @@ When a range's bytes arrive, an implementation MUST, before accepting them:
 3. **Chunk alignment** — the range MUST start at the offset of its declared first chunk and end on a
    chunk boundary, else `VerifyError::Alignment`.
 
+These checks run on the CLIPPED range (§2.2): the exact-length check is a statement about the assembled
+range, NOT a verdict that an over-long holder answer was a violation. A conversion of any wire-derived
+index or length MUST be checked (`usize::try_from`), never a truncating `as` cast — on a 32-bit target a
+truncated absurd chunk index maps onto a VALID one, turning a rejection into a check against the wrong
+chunk.
+
 A range that fails any check is discarded (its source penalized) and re-fetched from another holder. A
 range is marked `Done` ONLY after passing all three checks; consequently a short/incomplete range can
 never be written to the sink as complete nor counted toward progress.
@@ -199,10 +229,18 @@ merkle-proofs read path) MUST be bound to the chain-anchored generation `root` v
   ranges fed in offset order (buffering only the minimal out-of-order window), NOT by retaining every
   range and concatenating a second full-length copy. This bounds transient memory to O(the out-of-order
   window) instead of O(2 × resource size).
-- **Resume exception** — on a crash-resume where earlier ranges were verified in a PRIOR process (their
-  bytes live only in the sink, not this run's memory), the in-memory whole-resource backstop is skipped.
-  This is safe because every range — resumed or freshly fetched — passed the per-range checks of §7; the
-  whole-resource root binding is not silently claimed over bytes not present this run.
+- **A RESUME MUST NOT skip the backstop (MUST).** A resumed download ends in the SAME chain-binding check
+  as a fresh one. The ranges a prior process completed live only in the staging area, so before scheduling
+  they are READ BACK from the sink, re-checked against the commitment exactly like freshly-fetched ranges,
+  and fed into the whole-resource hash. A range that cannot be read back (a sink with no read-back
+  support), reads short, or fails its per-range check is returned to `Pending` and RE-FETCHED. Either way
+  the hash sees every byte of the resource, so there is no path on which a resumed download is
+  structurally verified ONLY — that would be a fail-OPEN window in the read guarantee, since nothing
+  would bind the assembled bytes to the chain-anchored root.
+- **A failed backstop MUST discard the checkpoint and the staged bytes.** Fail-closed MUST NOT mean
+  permanently DENIED: bytes that did not bind to the root are dropped along with their checkpoint so a
+  later attempt re-fetches from scratch instead of re-reading the same poisoned prefix forever. The
+  discard is best-effort; the `Verify` failure is what the caller sees.
 
 ### 8.1 Verifier construction posture (MUST)
 
@@ -231,7 +269,10 @@ ride the mTLS channel unsealed (§5.4 exemption); this transport configures no `
 The transport MUST NOT let a peer exhaust client memory:
 
 - **Bounded range assembly** — range reassembly is bounded by the expected range length; a frame that
-  would overflow the expected length is a transport error.
+  would overflow the expected length is a transport error. That length is itself bounded by the commitment
+  ceiling (section 4), and the assembly buffer MUST grow through a **fallible** reservation, surfacing
+  exhaustion as a recoverable `Transport` error. An infallible `resize` / `vec![0; n]` aborts the process
+  through the uncatchable `handle_alloc_error`, which no peer may be able to trigger.
 - **Bounded trailer drain (MUST)** — after the last frame, any trailer read to close the mux stream
   cleanly MUST be bounded (read-and-discard up to a fixed cap through a small fixed scratch buffer). An
   implementation MUST NOT drain the trailer into an unbounded buffer (e.g. `read_to_end` into a `Vec`):
@@ -275,13 +316,60 @@ A provider record's candidate `host` is an IP **literal** (IPv4, IPv6, or v4-map
   atomically renames the staging file onto the final path. A reader MUST never observe a partial final
   file; a crash MUST leave only a `.download.tmp`, never a corrupt final file.
 - **Explicit shortening** — because writing never shortens a staging area, a sink exposes `truncate(len)`,
-  which reduces it to `len` bytes and never extends it. This is how a caller proves the promoted artifact is
-  the verified one (§17.5b); the trait default is **fail-closed** (an error), matching `read_at`'s default —
-  a sink with no staging area to shorten MUST opt in explicitly (`Ok(())`, asserting it commits whole) rather
-  than inherit a silent no-op, which used to combine with `read_at`'s default to promote an un-truncated tail.
+  which reduces it to `len` bytes and never extends it. The trait default is **fail-closed** (an error): a
+  sink with no staging area to shorten MUST opt in explicitly (`Ok(())`, asserting it commits whole).
+  Overriding `truncate` ALONE does not make a sink promotable — see the next bullet.
+- **Observable staged length (MUST)** — a sink declares whether it can read its own staged bytes back
+  (`supports_read_back`), and a sink that cannot is **REFUSED promotion**. "Read-back unsupported" and
+  "nothing is staged there" both surface as an `Err` from `read_at`, and conflating them is what let an
+  unproven artifact be promoted: a sink overriding `truncate` to `Ok(())` while leaving `read_at` on its
+  default shortens nothing, and its probe error then reads as "clean".
+- **Proven promotion (MUST — the length is proven from BOTH sides)** — EVERY download, resource and module
+  alike, reaches `finalize` through ONE path, which promotes only after proving the staged length is
+  EXACTLY the verified length:
+  1. the sink can observe its staged bytes at all (above), else refuse;
+  2. the LAST verified byte is readable — else the staging area is SHORTER than what was verified;
+  3. no byte AT the verified length is readable — else bytes past the verified end survive.
+  Each violation is a fail-closed `Verify(Metadata)` error, never a promotion. A one-sided check (3 alone)
+  fails OPEN on the short side with the SAME observable signature as the long side — `Ok(total_length)`
+  plus a wrong artifact — and `truncate` cannot save it, since shortening never extends. A short staging
+  area is reachable with no attacker at all: GC reaps a `.download.tmp` and its `.state` sidecar while the
+  `StateStore` keeps its checkpoint elsewhere, so a checkpoint can outlive the bytes it describes.
+- **The completeness guarantee does not depend on `verify_whole_resource` (MUST)** — with the
+  whole-resource backstop disabled, the promotion length proof is the ONLY thing keeping an incomplete
+  artifact off the final path, and it therefore still runs. Disabling the backstop drops CHAIN-ANCHORING,
+  never completeness.
+- **Staged bytes are NEVER trusted as content (MUST)** — a resumed range is only inherited if it can be
+  bound to the commitment; when nothing can bind it (the whole-resource check is disabled, so only the
+  structural per-range checks exist and right-length wrong bytes pass them) the range is RE-FETCHED. A
+  checkpoint routinely outlives the bytes it describes, so inheriting them on the strength of the
+  checkpoint alone promoted arbitrary bytes as a verified success. Disabling the whole-resource check
+  therefore also costs the cross-process resume optimization, deliberately.
+- **A promotion refusal MUST be recoverable** — a refused promotion discards the checkpoint that led to
+  it together with the bytes it describes, on BOTH the resource and module paths, exactly as a failed
+  whole-resource check does. Otherwise a checkpoint that outlived its staging bytes makes every later
+  fetch of that content fail identically, forever: fail-closed MUST NOT mean permanently DENIED.
+- **One download per staging area (MUST)** — a download CLAIMS its staging path exclusively, MUST refuse
+  to start if a live download already holds it, and MUST release the claim on EVERY exit including an
+  unwinding panic (an RAII guard — a leaked claim would make that path both permanently GC-exempt and
+  permanently un-downloadable, i.e. the same denial the claim exists to prevent). Two downloads sharing a
+  staging area write over each other by absolute offset, share one resume checkpoint, and can `truncate`
+  each other's bytes away; per-range verification is structural, so a sibling's right-length bytes are
+  indistinguishable from this download's own.
+  - **Enforcement scope (honest limits).** The registry backing the claim is per-`Downloader`, so two
+    `Downloader`s in one process — or two node processes over one download directory — share no claim and
+    the MUST above is not mechanically enforced across them (there is no lock file). The promotion length
+    proof is what keeps the guarantee: a corrupted or truncated shared staging area is REFUSED rather than
+    promoted, so the outcome degrades to a failed download, never a wrong artifact. A caller running more
+    than one `Downloader` against one directory MUST provide the exclusion itself.
+  - The whole-module puller (`ModuleDownloader`) holds NO registry, so it gets neither GC protection nor
+    this exclusivity; its promotion is protected by the same length proof.
+- **A checkpoint for another plan MUST NOT be inherited** — `done_ranges` are range INDICES, so a
+  checkpoint whose `chunk_lens` differ from the planned layout is discarded together with the bytes it
+  staged, rather than marking arbitrary byte spans verified.
 - **Resume** — per-range progress is checkpointed to a `StateStore`. A paused or crashed download
   resumes into the same staging file and re-fetches ONLY the still-missing ranges; a verified range is
-  never re-fetched.
+  never re-fetched, but it IS re-checked from staging before the §8 backstop.
 - **GC** — a stale `.download.tmp` is reaped by the GC sweep; a live or paused-resumable staging file
   (registered in `ActiveDownloads`) MUST NOT be reaped.
 
@@ -473,9 +561,9 @@ A returned range is accepted only if, after clipping, it fills the requested win
 equals `chunk_hashes[index]`. Otherwise it is discarded and the next holder tried.
 
 - **Clip, do not reject (MUST)** — a frame that OVERSHOOTS the requested window is truncated to the
-  window and then attributed. Holders legitimately answer at their own chunk granularity (§2.2); treating
-  an over-long answer as a violation would make every such holder unusable. A range that is SHORT after
-  clipping is a failure for that holder.
+  window and then attributed. A holder MUST NOT overshoot (§2.2), but a client cannot know a holder is
+  compliant, so clipping is the defensive bound; treating an over-long answer as a violation would make
+  every chunk-granular holder unusable. A range that is SHORT after clipping is a failure for that holder.
 - **Surface every reason (MUST)** — each holder's rejection reason (`transport: …`, `timed out after …`,
   `short range: …`, `chunk hash mismatch`) is recorded and traced as it happens, and the terminal error
   names the failing STEP (`getModuleInfo` / `fetchModuleRange`), the chunk, its byte window, and every
@@ -517,20 +605,58 @@ reshare: the bytes verify per chunk, the pull assembles, and only the final gate
 - Demotion is bounded by `MAX_DESCRIPTOR_ATTEMPTS` (3) and by the supply of un-demoted holders; when it is
   exhausted the pull fails with the **descriptor** failure (a gate `Verify`), never a `NotFound` — blaming
   discovery for a descriptor lie is the ambiguity §17.4's reason-surfacing rule exists to prevent.
-- **Exhaustion with NO verified chunk is attributed to the descriptor (MUST).** Exhaustion is ambiguous:
-  unavailable bytes and an unsatisfiable descriptor are indistinguishable from inside one attempt. A holder
-  that fabricates `chunk_hashes` (rather than `module_hash`) serves ZERO bytes and never reaches a final
-  gate, so treating exhaustion as terminal would let the cheapest possible liar deny a capsule's reshare
-  permanently. The bound is whether ANY chunk has verified under that descriptor:
-  - no chunk has ever verified → the descriptor is the suspect: demote its source and re-handshake
-    (subject to the same `MAX_DESCRIPTOR_ATTEMPTS` + un-demoted-holder bounds);
-  - at least one chunk HAS verified → the descriptor is credible, so the exhaustion is genuinely missing
-    bytes and is terminal.
-  A chunk rehydrated from staging is verified against this descriptor's hashes and therefore counts.
-  **Residual (known, tracked separately, not a poisoning primitive):** the bound flips on the FIRST verified
-  chunk, so a holder that lets exactly one chunk verify (e.g. a descriptor declaring a 1-byte first chunk)
-  can still force every later exhaustion to classify as terminal — a bounded one-chunk denial, not a
-  falsified artifact.
+- **Chunk exhaustion is attributed to the DESCRIPTOR (MUST).** Exhaustion is ambiguous: unavailable bytes
+  and an unsatisfiable descriptor are indistinguishable from inside one attempt. So exhaustion always
+  demotes the descriptor's source and re-handshakes, bounded by `MAX_DESCRIPTOR_ATTEMPTS` and the supply of
+  un-demoted holders — the budget alone guarantees termination.
+  - Whether any chunk had verified MUST NOT gate the retry. A bound that flips on the FIRST verified chunk
+    is bypassable for ONE BYTE: a descriptor declaring `chunk_lens = [1, rest]` serves that single byte
+    (matching its own fabricated first hash), then refuses everything, so no demotion happens and one liar
+    denies the capsule's reshare with honest holders present.
+  - The distinction remains as DIAGNOSIS in the error text — exhaustion after real progress is more likely
+    genuine unavailability, exhaustion with none more likely a fabricated descriptor — never as control flow.
+  - A non-recoverable LOCAL failure (a sink/state fault) stays terminal: that is this node failing, not a
+    holder lying.
+- **A LOCAL failure is never evidence against a holder (MUST) — and blame is a SEPARATE question from
+  what happens next.** A failed allocation (the assembly buffer, the chunk plan), a sink or state-store
+  fault, and an anchor check that could not COMPLETE are outcomes of this node, not claims about a peer,
+  so none of them may record anything durable. What each does NEXT is decided independently:
+  - a sink/state fault or an incomplete anchor check is TERMINAL — the local facility the pull depends on
+    is broken, and another descriptor would meet the same wall;
+  - a failed ALLOCATION is `UnsatisfiableDescriptor`: it demotes the descriptor's source for the current
+    call and tries the next holder's descriptor, bounded by `MAX_DESCRIPTOR_ATTEMPTS`. The declared size
+    is the attacker's choice, so making it terminal hands out a one-message reshare denial — a ~100-byte
+    self-consistent descriptor with an inflated `total_size` (and matching final `chunk_len`) passes the
+    ceiling, fails the reservation, and would kill every pull of that capsule on this node. Remotely
+    inducible pressure is an argument for routing AROUND a descriptor, never for surrendering the pull.
+  Allocation also must not brand: an honest descriptor for a large capsule under memory pressure would
+  otherwise convict an honest holder, and that pressure is itself remotely inducible, since every
+  concurrent pull reserves up to `max_module_size` for an attacker-declared size.
+- **Only a PROVEN-FALSE descriptor earns a DURABLE verdict (MUST).** A final-gate rejection proves the
+  descriptor was false and is attributable to its source. Chunk exhaustion does not: the bytes may be
+  genuinely unavailable, and the holders refusing them need not be the holder that supplied the
+  descriptor. Exhaustion therefore demotes for the CURRENT call only. Persisting it would be remotely
+  INDUCIBLE — DHT provider announcement is unauthenticated, so sybil holders that refuse their assigned
+  chunks would get an HONEST descriptor source blacklisted on the victim for the whole TTL, per capsule,
+  repeatably, until only attacker-supplied descriptors were ever asked for.
+- **A bad-descriptor verdict SHOULD be persisted (holder reputation).** In-call demotion alone re-asks the
+  same liars on the next call or after a restart, each paying up to `MAX_DESCRIPTOR_ATTEMPTS` full attempts.
+  A verdict is recorded per `(target, peer_id)` through the `StateStore` and consulted when ordering /
+  filtering descriptor sources. It is bounded and advisory:
+  - verdicts DECAY (`BAD_DESCRIPTOR_TTL`, 24 h) — a verdict is evidence about a moment, not a label;
+  - the record is capped (`MAX_BAD_DESCRIPTOR_PEERS`, oldest evicted first), so reputation is never itself
+    a growth vector, and only a canonical 64-hex `peer_id` is ever stored (no peer-supplied text as a key);
+  - a demoted holder stays fully usable for CHUNK fetches (chunk bytes are independently hash-attributed,
+    so excluding it would cost availability for no integrity gain);
+  - reputation MUST NOT become a denial primitive: the moment honouring the remembered verdicts would
+    leave NO holder to ask for a descriptor, the memory is dropped for the rest of that call and every
+    located holder becomes askable again. The trigger is "no usable holder remains", NOT "all holders are
+    remembered" — with verdicts on the honest holders and none on a liar, the latter excludes the honest
+    holders, demotes the liar, and then denies a pull the network can serve. Holders demoted in the
+    CURRENT call are never forgiven by this escape;
+  - reputation OUTLIVES the checkpoint — completing a download clears the checkpoint, never the verdicts;
+  - the attempt budget counts attempts made in THIS call, not the size of the demoted set, so a remembered
+    verdict costs the call nothing.
 
 ### 17.5b Promotion (MUST — the promoted artifact IS the verified artifact)
 
@@ -556,7 +682,17 @@ shortened by writing**. So:
 Before `Sink::finalize`, on EVERY pull including a resumed one:
 
 1. The reassembled blob's SHA-256 equals the descriptor's `module_hash`.
-2. `ModuleAnchorVerifier::verify_module_anchor(blob, store_id, root)` returns `true`.
+2. `ModuleAnchorVerifier::verify_module_anchor(blob, store_id, root)` reports `Anchored`.
+
+The anchor answer is THREE-valued (`Anchored` / `NotAnchored` / `Unavailable`), and an implementation that
+consults the chain MUST report `Unavailable` when it could not reach an answer:
+
+- `NotAnchored` is EVIDENCE against the holder that supplied the descriptor: fail-closed, and durable
+  demotion (section 17.5a).
+- `Unavailable` is THIS node's own failure: fail-closed and TERMINAL, attributing nothing to any holder. A
+  two-valued answer forced an outage to be reported as "not anchored", which branded every honest holder
+  tried and then INVERTED descriptor preference toward unremembered (i.e. sybil) peers for the whole
+  reputation TTL.
 
 Both gates run on the single path to `finalize`, and finalize is reached only through the §17.5b promotion
 check. If either gate fails, the pull returns `Verify(Metadata)`, the sink is **NOT finalized** (the staging file is

@@ -204,7 +204,18 @@ pub async fn assemble_range_stream<R: AsyncRead + Unpin>(
         let take = frame.bytes.len().min((max_len - frame.offset) as usize);
         let end = start + take;
         if buf.len() < end {
-            buf.resize(end, 0);
+            // FALLIBLE growth. `max_len` is derived from a peer-DECLARED chunk length, so even bounded
+            // by the commitment's ceiling it can exceed what this host can hold — and an infallible
+            // `resize` aborts the process through the uncatchable `handle_alloc_error` (#1608). A frame
+            // sparse in the window (`offset` near `max_len`, a few bytes of payload) makes that
+            // reachable from ONE small frame, so exhaustion must be an ordinary recoverable error the
+            // scheduler routes around, not a death.
+            buf.try_reserve(end - buf.len())
+                .map_err(|e| DownloadError::Transport {
+                    provider: String::new(),
+                    reason: format!("cannot allocate a {end}-byte range assembly buffer: {e}"),
+                })?;
+            buf.resize(end, 0); // within the reservation above — no further allocation
         }
         buf[start..end].copy_from_slice(&frame.bytes[..take]);
         if frame.complete || buf.len() as u64 >= max_len {
@@ -929,5 +940,35 @@ mod tests {
         let seed: [u8; 32] = Sha256::digest(b"dig-download/tests/fake-node-cert").into();
         let bls_sk = dig_tls::bls::SecretKey::from_seed(&seed);
         std::sync::Arc::new(dig_nat::NodeCert::generate_signed(&bls_sk).unwrap())
+    }
+
+    /// #1608 — the range assembly buffer is sized by a peer-DECLARED length, so its growth must be
+    /// FALLIBLE: `Vec::resize` aborts the process through the uncatchable `handle_alloc_error`, which a
+    /// peer must never be able to trigger. A frame that is SPARSE in a huge window (a high `offset`,
+    /// a few payload bytes) reaches that path from ONE small frame.
+    ///
+    /// An ~18 EiB reservation fails on every host without touching a page, so this is deterministic
+    /// rather than dependent on the CI host's memory or overcommit policy.
+    #[tokio::test]
+    async fn an_unsatisfiable_assembly_buffer_is_a_recoverable_error_not_an_abort() {
+        let f = RangeFrame {
+            offset: u64::MAX - 4,
+            length: 2,
+            bytes: vec![0xAB; 2],
+            complete: false,
+            total_length: Some(u64::MAX),
+            chunk_lens: Some(vec![u64::MAX]),
+            chunk_index: Some(0),
+            inclusion_proof: None,
+            root: None,
+        };
+        let mut cur = std::io::Cursor::new(f.encode());
+        let err = assemble_range_stream(&mut cur, u64::MAX)
+            .await
+            .expect_err("an unsatisfiable window allocation is refused, not fatal");
+        assert!(
+            err.is_recoverable(),
+            "and it is RECOVERABLE, so the scheduler re-fetches the range elsewhere: {err}"
+        );
     }
 }

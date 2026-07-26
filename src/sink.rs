@@ -20,7 +20,7 @@ use std::path::Path;
 
 use async_trait::async_trait;
 
-use crate::error::DownloadError;
+use crate::error::{DownloadError, VerifyError};
 
 /// The destination a download writes verified bytes into. Implementations write `bytes` at byte
 /// `offset` within the resource; [`finalize`](Self::finalize) is called once when every range is done
@@ -49,35 +49,66 @@ pub trait Sink: Send + Sync {
     ///
     /// Only ever SHRINKS: a `len` at or beyond the staged end is a no-op (never zero-extends).
     ///
-    /// The default is **fail-closed**, matching [`read_at`](Self::read_at)'s default: an
-    /// implementation that does not override this returns [`DownloadError::Sink`]. A silent no-op
-    /// default here used to combine with `read_at`'s fail-closed default to fail OPEN — `truncate`
-    /// claimed success without shortening anything, so the module puller's "bytes past the verified
-    /// end" promotion probe read `read_at`'s "unsupported" as "nothing past the end" and promoted
-    /// whatever longer, un-truncated bytes were staged.
+    /// The default is **fail-closed**: an implementation that does not override this returns
+    /// [`DownloadError::Sink`]. A silent no-op default here used to combine with `read_at`'s default to
+    /// fail OPEN — `truncate` claimed success without shortening anything, so the "bytes past the
+    /// verified end" promotion probe read `read_at`'s "unsupported" as "nothing past the end" and
+    /// promoted whatever longer, un-truncated bytes were staged.
     ///
     /// A sink with genuinely no staging area to shorten — a store-write sink that commits the WHOLE
-    /// resource in one shot and can never hold a partially-overwritten tail — MUST opt IN explicitly
-    /// rather than inherit a default:
+    /// resource in one shot and can never hold a partially-overwritten tail — MUST opt IN explicitly:
+    ///
     /// ```ignore
     /// async fn truncate(&self, _len: u64) -> Result<(), DownloadError> {
     ///     Ok(()) // asserts: this sink commits whole, so there is never a tail to shrink
     /// }
+    ///
+    /// // …and it MUST also make its staged length OBSERVABLE, or it can never be promoted — reading
+    /// // THE ARTIFACT `finalize` promotes, never a cache or shadow buffer of it:
+    /// fn supports_read_back(&self) -> bool { true }
+    /// async fn read_at(&self, offset: u64, len: u64) -> Result<Vec<u8>, DownloadError> { … }
     /// ```
+    ///
+    /// **`truncate` alone is not enough.** Overriding it while leaving `read_at` on its default used to
+    /// be the recipe this doc gave, and it fails OPEN: nothing is shortened, the probe's "unsupported"
+    /// reads as "nothing there", and an unproven artifact is promoted. Promotion therefore requires
+    /// [`supports_read_back`](Self::supports_read_back), and a sink that cannot expose its staged bytes
+    /// is refused promotion rather than trusted.
     async fn truncate(&self, _len: u64) -> Result<(), DownloadError> {
         Err(DownloadError::sink("truncation unsupported by this sink"))
     }
 
-    /// Read back `len` bytes previously [`write_at`](Self::write_at)-ten at `offset` from the staging
-    /// area, if this sink supports it.
+    /// Whether this sink can [`read_at`](Self::read_at) its own staged bytes — i.e. whether its staged
+    /// LENGTH is observable, which is what makes a promotion provable.
     ///
-    /// A whole-`.dig`-module pull ([`ModuleDownloader`](crate::ModuleDownloader)) needs the FULL
-    /// assembled blob to run its final whole-blob-hash + chain-anchor gate, so on **resume** it reads
-    /// the already-verified chunks back rather than re-fetching them over the network. Staging sinks
-    /// ([`InMemorySink`], [`FileSink`]) implement it; a sink that cannot read back returns the default
-    /// [`DownloadError::Sink`] "read-back unsupported", and the module puller gracefully degrades by
-    /// RE-FETCHING those chunks (still correct — never a silent partial). Resource downloads never
-    /// call this.
+    /// The default is **`false`**, and a sink that reports `false` is REFUSED promotion. This is the one
+    /// distinction that keeps "read-back unsupported" from being read as "nothing is staged there":
+    /// both surface as an `Err` from `read_at`, and conflating them is precisely how a longer
+    /// un-truncated artifact used to be promoted (and how a SHORTER one would be). An implementation
+    /// that overrides `read_at` MUST override this too.
+    fn supports_read_back(&self) -> bool {
+        false
+    }
+
+    /// Read back `len` bytes previously [`write_at`](Self::write_at)-ten at `offset` from the staging
+    /// area, if this sink supports it (see [`supports_read_back`](Self::supports_read_back)).
+    ///
+    /// Two callers need it. A whole-`.dig`-module pull ([`ModuleDownloader`](crate::ModuleDownloader))
+    /// reads already-verified chunks back on **resume** rather than re-fetching them, and a resumed
+    /// resource download reads its prior process's ranges back to feed the whole-resource backstop
+    /// (#1605). Both degrade gracefully by RE-FETCHING what they cannot read back — never a silent
+    /// partial. [`promote_verified`] additionally uses it to PROVE the staged length equals the verified
+    /// one, and that use does not degrade: it fails closed.
+    ///
+    /// An `Err` means "these bytes are not readable" (absent, short, or unsupported); it never means
+    /// "nothing is staged".
+    ///
+    /// **`read_at` MUST read the artifact [`finalize`](Self::finalize) will promote** — not a write-back
+    /// cache, a shadow buffer, or anything else that merely mirrors it. This is the whole remaining trust
+    /// assumption of [`promote_verified`]: the length proof compares what `read_at` reports against the
+    /// verified length, so a sink answering from a shadow can satisfy the proof while the artifact
+    /// actually promoted keeps a longer tail. Nothing in this crate can enforce that — it is the
+    /// implementer's obligation.
     async fn read_at(&self, _offset: u64, _len: u64) -> Result<Vec<u8>, DownloadError> {
         Err(DownloadError::sink("read-back unsupported by this sink"))
     }
@@ -128,6 +159,67 @@ fn try_zeroed_read_buffer(len: u64) -> Result<Vec<u8>, DownloadError> {
     Ok(buf)
 }
 
+/// Promote a sink's staging area, having PROVEN it holds exactly the `verified_len` bytes the caller's
+/// integrity gates verified — the ONE promotion path for every download in this crate.
+///
+/// Verification runs over the bytes a download ASSEMBLED; [`Sink::finalize`] promotes the STAGING
+/// AREA — and the two are the same artifact only if nothing longer was ever staged. A staging area is
+/// written by offset and never shortened, so a longer earlier attempt (a demoted descriptor's
+/// fabrication, another shape's partial pull, a leftover `.download.tmp`) leaves a tail the verified
+/// bytes do not contain. Promoting that caches an artifact whose hash is not the verified one while
+/// reporting success — the node then re-announces itself as an authoritative source of corrupt
+/// content.
+///
+/// So the staging area is SHORTENED to the verified length and its length is then PROVEN, from BOTH
+/// sides, before finalize:
+///
+/// 1. the sink must be able to observe its own staged bytes at all
+///    ([`Sink::supports_read_back`]) — a sink that cannot is refused, never trusted;
+/// 2. the last verified byte MUST be readable — otherwise the staging area is SHORTER than what was
+///    verified, and promoting it renames a partial artifact onto the final path while reporting
+///    success;
+/// 3. the byte AT `verified_len` MUST NOT be readable — otherwise bytes past the verified end survive.
+///
+/// A one-sided check (3 alone) fails OPEN on the short side, with the same observable signature as the
+/// long side it was written for: `Ok(verified_len)` plus a wrong artifact. `truncate` only ever shrinks,
+/// so it cannot fix a short staging area — only this length proof can catch one.
+///
+/// # Errors
+/// [`DownloadError::Verify`] when the staged length is not exactly `verified_len`, or when the sink
+/// cannot prove its staged length at all; [`DownloadError::Sink`] when the sink cannot shorten its
+/// staging area (a sink with nothing to shorten opts in explicitly — see [`Sink::truncate`]).
+pub(crate) async fn promote_verified(
+    sink: &dyn Sink,
+    verified_len: u64,
+) -> Result<(), DownloadError> {
+    sink.truncate(verified_len).await?;
+
+    let refuse = |reason: String| Err(DownloadError::Verify(VerifyError::Metadata(reason)));
+
+    if !sink.supports_read_back() {
+        return refuse(format!(
+            "this sink cannot read back its staging area, so a promotion of {verified_len} verified \
+             byte(s) cannot be proven to be the verified artifact; refusing to promote"
+        ));
+    }
+    // The LAST verified byte must be there. `truncate` never extends, so a staging area shorter than
+    // the verified length survives it untouched and would otherwise promote as a success.
+    if verified_len > 0 && sink.read_at(verified_len - 1, 1).await.is_err() {
+        return refuse(format!(
+            "staging area is SHORTER than the verified length {verified_len}; refusing to promote a \
+             partial artifact as the verified one"
+        ));
+    }
+    // And nothing may live past it.
+    if sink.read_at(verified_len, 1).await.is_ok() {
+        return refuse(format!(
+            "staging area holds bytes past the verified length {verified_len}; refusing to promote an \
+             artifact that is not the verified one"
+        ));
+    }
+    sink.finalize().await
+}
+
 /// An in-memory [`Sink`] that assembles the resource in a byte buffer — the test sink, and a
 /// reference for the trait shape. Thread-safe (writes from concurrent range tasks).
 #[derive(Debug, Default)]
@@ -175,6 +267,10 @@ impl Sink for InMemorySink {
     async fn finalize(&self) -> Result<(), DownloadError> {
         self.inner.lock().await.finalized = true;
         Ok(())
+    }
+
+    fn supports_read_back(&self) -> bool {
+        true // an in-memory buffer always knows its own length
     }
 
     async fn truncate(&self, len: u64) -> Result<(), DownloadError> {
@@ -277,6 +373,10 @@ impl Sink for FileSink {
             .map_err(DownloadError::sink)?;
         f.write_all(bytes).map_err(DownloadError::sink)?;
         Ok(())
+    }
+
+    fn supports_read_back(&self) -> bool {
+        true // the staging file is readable, so its length is observable
     }
 
     async fn read_at(&self, offset: u64, len: u64) -> Result<Vec<u8>, DownloadError> {
@@ -494,5 +594,90 @@ mod tests {
     fn staging_path_appends_suffix() {
         let p = staging_path_for(Path::new("/data/x.dig"));
         assert!(p.to_string_lossy().ends_with(".dig.download.tmp"));
+    }
+
+    /// The promotion proof is TWO-SIDED, asserted at the seam that owns it.
+    ///
+    /// The short side is the one that fails OPEN if forgotten, with the same observable signature as the
+    /// long side: `truncate` never extends, so a staging area shorter than the verified length survives
+    /// it untouched, and a past-the-end probe on a short area reads EOF — which a one-sided guard treats
+    /// as "clean" and promotes. The orchestrator now re-fetches rather than reaching here with a short
+    /// staging area, so this asserts the seam's own contract, independently of any caller.
+    #[tokio::test]
+    async fn promotion_refuses_a_staging_area_that_is_shorter_than_the_verified_length() {
+        let sink = InMemorySink::new();
+        sink.write_at(0, b"only ten!!").await.unwrap();
+
+        let err = promote_verified(&sink, 40)
+            .await
+            .expect_err("a partial artifact is never promoted as the verified one");
+        assert!(
+            err.to_string().contains("SHORTER than the verified length"),
+            "and it names the side it refused, so this cannot silently become the long-side test: {err}"
+        );
+        assert!(!sink.is_finalized().await);
+    }
+
+    /// The long side, at the same seam: bytes past the verified end are refused too.
+    #[tokio::test]
+    async fn promotion_refuses_a_staging_area_holding_bytes_past_the_verified_length() {
+        let sink = InMemorySink::new();
+        sink.write_at(0, b"eight!!!").await.unwrap();
+        // A sink whose `truncate` works cannot reach the long-side refusal, so drive the seam with one
+        // that reports success without shortening — the shape that must not be trusted.
+        struct NoOpTruncate(InMemorySink);
+        #[async_trait]
+        impl Sink for NoOpTruncate {
+            async fn write_at(&self, offset: u64, bytes: &[u8]) -> Result<(), DownloadError> {
+                self.0.write_at(offset, bytes).await
+            }
+            async fn truncate(&self, _len: u64) -> Result<(), DownloadError> {
+                Ok(())
+            }
+            fn supports_read_back(&self) -> bool {
+                true
+            }
+            async fn read_at(&self, offset: u64, len: u64) -> Result<Vec<u8>, DownloadError> {
+                self.0.read_at(offset, len).await
+            }
+            async fn finalize(&self) -> Result<(), DownloadError> {
+                self.0.finalize().await
+            }
+        }
+        let sink = NoOpTruncate(sink);
+
+        let err = promote_verified(&sink, 4)
+            .await
+            .expect_err("a longer staged artifact is never promoted");
+        assert!(
+            err.to_string().contains("past the verified length"),
+            "names the side it refused: {err}"
+        );
+        assert!(!sink.0.is_finalized().await);
+    }
+
+    /// A sink that cannot observe its staged bytes cannot PROVE a promotion, so it is refused — never
+    /// trusted. "Read-back unsupported" and "nothing is staged there" are indistinguishable as errors,
+    /// which is why the capability is explicit and defaults to false.
+    #[tokio::test]
+    async fn promotion_refuses_a_sink_that_cannot_read_its_staging_area_back() {
+        struct WriteOnly;
+        #[async_trait]
+        impl Sink for WriteOnly {
+            async fn write_at(&self, _offset: u64, _bytes: &[u8]) -> Result<(), DownloadError> {
+                Ok(())
+            }
+            async fn truncate(&self, _len: u64) -> Result<(), DownloadError> {
+                Ok(()) // the documented "I commit whole" opt-in, alone
+            }
+        }
+
+        let err = promote_verified(&WriteOnly, 8)
+            .await
+            .expect_err("an unprovable promotion is refused");
+        assert!(
+            err.to_string().contains("cannot read back"),
+            "names the missing capability rather than guessing: {err}"
+        );
     }
 }
