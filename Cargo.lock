@@ -627,7 +627,7 @@ dependencies = [
 
 [[package]]
 name = "dig-download"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "async-trait",
  "dig-constants 0.8.0",
@@ -635,7 +635,7 @@ dependencies = [
  "dig-download",
  "dig-nat",
  "dig-peer",
- "dig-rpc-protocol 0.5.0",
+ "dig-rpc-protocol",
  "dig-tls",
  "futures",
  "reqwest",
@@ -725,32 +725,21 @@ dependencies = [
 
 [[package]]
 name = "dig-peer"
-version = "0.4.1"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "548f3f44346cfc257d5a9b30ac115d4f2862bc0206eb5b15d34c3a9be4c99dc6"
+checksum = "63ecb58dd9a08742881690cf3eb14a547c7d9217d3211fee82e495a71041dcae"
 dependencies = [
  "chia-protocol",
  "chia-traits 0.26.0",
  "dig-message",
  "dig-nat",
- "dig-rpc-protocol 0.3.1",
+ "dig-rpc-protocol",
  "dig-tls",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
-]
-
-[[package]]
-name = "dig-rpc-protocol"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a390fe48ee8d0dd7a9686f13cd01bb131f853c6f54d7e3c6554ab0dc89aafbe9"
-dependencies = [
- "serde",
- "serde_json",
- "serde_repr",
 ]
 
 [[package]]
