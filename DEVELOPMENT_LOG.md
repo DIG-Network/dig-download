@@ -24,3 +24,22 @@ The same bug was only fatal because the dial considered a provider's FIRST addre
 the record ALSO carried a perfectly dialable `172.31.79.22:9444` that was never tried. §5.2 is IPv6-first
 with IPv4 **fallback**, which means iterating: every candidate (v6, then v4, then relay-only), each
 failure logged with the address it came from, and "unreachable" reported only once the list is exhausted.
+
+## A metadata probe asks for 1 byte; a holder answers with a whole chunk
+
+`establish_commitment` seeds a download by fetching `offset = 0, length = 1` — not because it wants a
+byte, but because the FIRST `RangeFrame` of any range carries the verification metadata
+(`total_length`, `chunk_lens`, `root`, `inclusion_proof`). The bytes are discarded.
+
+Holders serve at their own storage granularity, so a chunk-granular holder answers that probe with a
+whole chunk (e.g. 4096 bytes). An assembler that treats "frame longer than the requested window" as a
+protocol error therefore rejects EVERY such holder, unconditionally — and it throws the result away
+*after* it has already captured the metadata the probe existed to obtain. Every confirmed holder was
+discarded, the download reported `NotFound`, and the read 404'd while packet capture showed the holder
+happily serving bytes.
+
+Rule: a request's `length` is a bound on what the CLIENT keeps, not a promise about how the SERVER
+frames it. Clip an over-long frame to the window and stop once the window is full (that bound is what
+protects memory); reserve the error for a frame starting at or beyond the window, whose bytes cannot
+belong to the range at all. Any request/response boundary where the two sides have different natural
+granularity wants the same shape.

@@ -44,8 +44,21 @@ confirmed holder iff its answer's `available` is `true`.
 
 A `RangeRequest { store_id, retrieval_key?, root?, capsule, offset, length }` selects
 `[offset, offset+length)` of the resource (capsule) ciphertext. The holder streams `RangeFrame`s in
-ascending `offset` order that tile the requested range exactly; the caller reassembles by `offset` and
+ascending `offset` order covering the requested range; the caller reassembles by `offset` and
 stops on the frame marked `complete` (or on clean end-of-stream).
+
+**Reassembly window (normative).** A holder MAY serve at its own storage granularity, so a frame MAY
+extend past `offset+length` (a chunk-granular holder answers a 1-byte metadata probe with a whole
+chunk). The caller:
+
+- MUST place each frame's bytes at its range-relative `offset`, **clipped** to the requested `length`,
+  and MUST stop reading frames once `length` bytes are assembled — so the assembled buffer is bounded
+  by `length` regardless of what the holder streams.
+- MUST NOT reject a frame merely for extending past the window.
+- MUST reject (as a protocol violation) a frame whose `offset` is at or beyond `length`: its bytes
+  cannot belong to the requested range.
+- MUST capture the first frame's verification metadata (below) before any window check, so a
+  metadata-only probe (`length = 1`) succeeds against any granularity.
 
 The **first frame** of a range additionally carries the whole-resource verification metadata:
 `total_length`, `chunk_lens` (per-chunk ciphertext lengths, in order), `chunk_index` (index of the
