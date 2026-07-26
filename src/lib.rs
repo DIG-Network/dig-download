@@ -74,6 +74,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod addr;
 pub mod error;
 pub mod gc;
 pub mod locate;
@@ -93,6 +94,7 @@ pub mod verify;
 // download (no divergent shape).
 pub use dig_dht::{ContentId, ProviderRecord};
 
+pub use addr::{candidate_socket, dial_candidates, AddrError, MAX_DIAL_CANDIDATES};
 pub use error::{DownloadError, VerifyError};
 pub use gc::{ActiveDownloads, GcConfig, TmpGc};
 pub use locate::{DhtProviderLocator, ProviderLocator};
