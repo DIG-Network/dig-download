@@ -148,7 +148,11 @@ impl SourceTracker {
 /// first-frame verification metadata. Stops on the frame marked `complete` or clean end-of-stream.
 ///
 /// Bounded by `max_len` (the expected range length) so a misbehaving peer cannot stream unbounded
-/// bytes into memory. This is the pure, network-free core of [`NatRangeTransport::fetch_range`] and is
+/// bytes into memory: a frame that overshoots the window is CLIPPED to it (servers answer at chunk
+/// granularity, so a 1-byte metadata probe is legitimately served a whole chunk), assembly stops as
+/// soon as the window is full, and only a frame starting at or beyond `max_len` is an error.
+///
+/// This is the pure, network-free core of [`NatRangeTransport::fetch_range`] and is
 /// unit-tested by feeding encoded frames through an in-memory reader.
 pub async fn assemble_range_stream<R: AsyncRead + Unpin>(
     reader: &mut R,
@@ -177,19 +181,33 @@ pub async fn assemble_range_stream<R: AsyncRead + Unpin>(
             };
             first = false;
         }
-        let start = frame.offset as usize;
-        let end = start + frame.bytes.len();
-        if end as u64 > max_len {
+        // A zero-length request asks for metadata ONLY (there is no window to place bytes in), so the
+        // first frame's meta is all it wanted.
+        if max_len == 0 {
+            break;
+        }
+        // A frame that starts at or past the end of the requested window carries bytes that can never
+        // belong to this range — a real protocol violation, not a granularity mismatch.
+        if frame.offset >= max_len {
             return Err(DownloadError::Transport {
                 provider: String::new(),
-                reason: format!("range frame overflows expected length {max_len}"),
+                reason: format!(
+                    "range frame at offset {} starts beyond expected length {max_len}",
+                    frame.offset
+                ),
             });
         }
+        // CLIP an over-long frame instead of rejecting it: a server legitimately answers at CHUNK
+        // granularity, so a 1-byte metadata probe is served a whole chunk (#836). Taking only the
+        // requested window keeps memory bounded by `max_len` AND keeps such a holder usable.
+        let start = frame.offset as usize;
+        let take = frame.bytes.len().min((max_len - frame.offset) as usize);
+        let end = start + take;
         if buf.len() < end {
             buf.resize(end, 0);
         }
-        buf[start..end].copy_from_slice(&frame.bytes);
-        if frame.complete {
+        buf[start..end].copy_from_slice(&frame.bytes[..take]);
+        if frame.complete || buf.len() as u64 >= max_len {
             break;
         }
     }
@@ -712,12 +730,14 @@ mod tests {
         assert_eq!(meta.inclusion_proof, Some("proof".into()));
     }
 
+    /// A frame that STARTS beyond the requested window is a real protocol violation (its bytes can
+    /// never belong to the range) and stays an error.
     #[tokio::test]
-    async fn assemble_rejects_overflowing_frame() {
+    async fn assemble_rejects_frame_starting_beyond_window() {
         let f = RangeFrame {
-            offset: 0,
-            length: 10,
-            bytes: vec![0u8; 10],
+            offset: 8,
+            length: 4,
+            bytes: vec![0u8; 4],
             complete: true,
             total_length: None,
             chunk_lens: None,
@@ -728,6 +748,104 @@ mod tests {
         let mut cur = std::io::Cursor::new(f.encode());
         let err = assemble_range_stream(&mut cur, 5).await;
         assert!(matches!(err, Err(DownloadError::Transport { .. })));
+    }
+
+    /// The #836 metadata probe: `establish_commitment` asks for `length = 1` purely to obtain the
+    /// first-frame metadata, and a chunk-granular server answers with a WHOLE chunk. The assembler
+    /// must clip to the requested window and keep the metadata — erroring here discarded every
+    /// holder and turned a healthy read into a 404.
+    #[tokio::test]
+    async fn assemble_clips_chunk_granular_frame_to_one_byte_probe() {
+        let chunk = vec![0x5Au8; 4096];
+        let f = RangeFrame {
+            offset: 0,
+            length: chunk.len() as u64,
+            bytes: chunk,
+            complete: true,
+            total_length: Some(1_048_576),
+            chunk_lens: Some(vec![4096; 256]),
+            chunk_index: Some(0),
+            inclusion_proof: Some("proof".into()),
+            root: Some("aa".repeat(32)),
+        };
+        let mut cur = std::io::Cursor::new(f.encode());
+        let (bytes, meta) = assemble_range_stream(&mut cur, 1).await.unwrap();
+        assert_eq!(
+            bytes,
+            vec![0x5Au8],
+            "clipped to exactly the requested window"
+        );
+        assert_eq!(meta.total_length, Some(1_048_576));
+        assert_eq!(meta.chunk_lens, Some(vec![4096; 256]));
+        assert_eq!(meta.chunk_index, Some(0));
+        assert_eq!(meta.root, Some("aa".repeat(32)));
+        assert_eq!(meta.inclusion_proof, Some("proof".into()));
+    }
+
+    /// Only the OVERSHOOTING tail is clipped: every earlier frame's bytes survive, in order.
+    #[tokio::test]
+    async fn assemble_clips_only_the_overshooting_last_frame() {
+        let f0 = RangeFrame {
+            offset: 0,
+            length: 3,
+            bytes: b"ABC".to_vec(),
+            complete: false,
+            total_length: Some(9),
+            chunk_lens: Some(vec![3, 6]),
+            chunk_index: Some(0),
+            inclusion_proof: None,
+            root: None,
+        };
+        let f1 = RangeFrame {
+            offset: 3,
+            length: 6,
+            bytes: b"DEFGHI".to_vec(),
+            complete: true,
+            total_length: None,
+            chunk_lens: None,
+            chunk_index: None,
+            inclusion_proof: None,
+            root: None,
+        };
+        let mut wire = f0.encode();
+        wire.extend_from_slice(&f1.encode());
+        let mut cur = std::io::Cursor::new(wire);
+        let (bytes, meta) = assemble_range_stream(&mut cur, 5).await.unwrap();
+        assert_eq!(bytes, b"ABCDE");
+        assert_eq!(meta.total_length, Some(9));
+    }
+
+    /// Once the requested window is full the assembler stops reading, even without a `complete`
+    /// frame — it never buffers past `max_len`.
+    #[tokio::test]
+    async fn assemble_stops_once_the_window_is_full() {
+        let f0 = RangeFrame {
+            offset: 0,
+            length: 4,
+            bytes: b"WXYZ".to_vec(),
+            complete: false,
+            total_length: Some(8),
+            chunk_lens: Some(vec![4, 4]),
+            chunk_index: Some(0),
+            inclusion_proof: None,
+            root: None,
+        };
+        let f1 = RangeFrame {
+            offset: 4,
+            length: 4,
+            bytes: b"nope".to_vec(),
+            complete: true,
+            total_length: None,
+            chunk_lens: None,
+            chunk_index: None,
+            inclusion_proof: None,
+            root: None,
+        };
+        let mut wire = f0.encode();
+        wire.extend_from_slice(&f1.encode());
+        let mut cur = std::io::Cursor::new(wire);
+        let (bytes, _) = assemble_range_stream(&mut cur, 4).await.unwrap();
+        assert_eq!(bytes, b"WXYZ");
     }
 
     #[tokio::test]
