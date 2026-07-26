@@ -14,6 +14,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use dig_dht::{CandidateAddr, ContentId, PeerId, ProviderRecord};
 use dig_nat::{AvailabilityAnswer, AvailabilityItem, AvailabilityResponse};
+use dig_rpc_protocol::types::ModuleInfo;
 use tokio::sync::Mutex;
 
 use crate::error::DownloadError;
@@ -408,12 +409,370 @@ pub fn mock_peer_hex(n: u8) -> String {
     PeerId::from_bytes([n; 32]).to_hex()
 }
 
+/// Build a mock provider record carrying an ARBITRARY `provider_peer_id` string, bypassing the
+/// [`ProviderRecord::new`] canonicalization the way a record deserialized straight off the wire does.
+///
+/// `ProviderRecord::provider_peer_id` is a plain `String`, so a hostile peer can publish any text it
+/// likes there. Tests use this to prove that peer-supplied text never reaches a log/error verbatim
+/// (#1603).
+pub fn mock_provider_with_peer_id(peer_id: &str, content: &ContentId) -> ProviderRecord {
+    let mut record = mock_provider(1, content);
+    record.provider_peer_id = peer_id.to_string();
+    record
+}
+
 /// A throwaway content id (resource granularity) for tests. Its generation `root` is `[0xAB; 32]`
 /// (hex `"ab".repeat(32)`) so it MATCHES the root [`MockContent`] reports in each range's first
 /// frame — the orchestrator cross-checks the peer-reported root against the content-id root
 /// (HIGH #179), so the two must agree for an honest download to proceed.
 pub fn mock_content_id() -> ContentId {
     ContentId::resource([1; 32], [0xAB; 32], [3; 32])
+}
+
+// ===========================================================================
+// Whole-`.dig`-module pull doubles (#1576) — drive a `ModuleDownloader` with NO real network.
+// ===========================================================================
+
+/// An in-memory [`ModuleTransport`](crate::module::ModuleTransport) over a known "true" module blob:
+/// it answers `dig.getModuleInfo` with the blob's descriptor and `dig.fetchModuleRange` with the
+/// requested window — with configurable per-holder misbehaviour (a holder that TAMPERS a chunk, a
+/// success BUDGET that starves the pull mid-way to model an interrupt, and a corrupted whole-blob
+/// `module_hash`) so a test can exercise the fail-closed + resume paths. Every fetch is recorded as
+/// `(peer_id, offset)` so a test can assert the pull was MULTI-SOURCE and did not re-fetch a resumed
+/// chunk.
+pub struct MockModuleTransport {
+    store_id: String,
+    root: String,
+    blob: Vec<u8>,
+    chunk_size: usize,
+    tamper_peer: Option<String>,
+    corrupt_module_hash: bool,
+    overserve: bool,
+    declared_total_size: Option<u64>,
+    wrong_descriptor_for: Option<String>,
+    alternate_module_for: Option<(String, Vec<u8>)>,
+    fabricated_chunk_hashes_for: Option<String>,
+    budget: Option<Arc<AtomicUsize>>,
+    fetches: Mutex<Vec<(String, u64)>>,
+    info_calls: Mutex<Vec<String>>,
+}
+
+impl MockModuleTransport {
+    /// A transport serving `blob` for `(store_id, root)` split into `chunk_size`-byte chunks, with no
+    /// misbehaviour.
+    pub fn serving(store_id: &str, root: &str, blob: Vec<u8>, chunk_size: usize) -> Self {
+        MockModuleTransport {
+            store_id: store_id.to_string(),
+            root: root.to_string(),
+            blob,
+            chunk_size,
+            tamper_peer: None,
+            corrupt_module_hash: false,
+            overserve: false,
+            declared_total_size: None,
+            wrong_descriptor_for: None,
+            alternate_module_for: None,
+            fabricated_chunk_hashes_for: None,
+            budget: None,
+            fetches: Mutex::new(Vec::new()),
+            info_calls: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Every `fetchModuleRange` answers with MORE bytes than the requested window (the whole enclosing
+    /// chunk plus the following one, where the blob allows it) — the legitimate chunk-granular server
+    /// of the §2.2 clip contract, NOT a liar. A puller must CLIP to the requested window and keep
+    /// using this holder (#836 / dig-download 0.7.4).
+    pub fn overserving(mut self) -> Self {
+        self.overserve = true;
+        self
+    }
+
+    /// `getModuleInfo` declares `total_size` (and a matching final `chunk_lens` entry) far larger than
+    /// the bytes actually served — models a hostile descriptor whose declared size would drive the
+    /// puller's assembly buffer allocation.
+    pub fn declaring_total_size(mut self, total_size: u64) -> Self {
+        self.declared_total_size = Some(total_size);
+        self
+    }
+
+    /// This holder serves corrupted bytes for every chunk (flips the first byte) — models a lying
+    /// source a puller must reject + route around.
+    pub fn tampering(mut self, peer_id: &str) -> Self {
+        self.tamper_peer = Some(peer_id.to_string());
+        self
+    }
+
+    /// `getModuleInfo` reports a wrong whole-blob `module_hash` (per-chunk hashes stay honest) — models
+    /// a descriptor that passes every per-chunk check yet fails the whole-blob gate.
+    pub fn with_corrupt_module_hash(mut self) -> Self {
+        self.corrupt_module_hash = true;
+        self
+    }
+
+    /// ONLY `peer_id`'s `getModuleInfo` answers with a WELL-FORMED but WRONG descriptor (honest
+    /// per-chunk hashes + lengths, a wrong whole-blob `module_hash`), while every other holder answers
+    /// honestly — models the descriptor-source attack: one holder winning the `getModuleInfo` race can
+    /// otherwise deny the pull permanently even though honest holders are present.
+    pub fn lying_descriptor_from(mut self, peer_id: &str) -> Self {
+        self.wrong_descriptor_for = Some(peer_id.to_string());
+        self
+    }
+
+    /// ONLY `peer_id` answers BOTH module calls out of a wholly FABRICATED alternate `module` —
+    /// a self-consistent descriptor (its own `total_size`, `chunk_lens`, `chunk_hashes` and
+    /// `module_hash`) plus bytes that match it — while every other holder serves the real blob.
+    ///
+    /// This is the descriptor liar that survives every per-chunk check AND the whole-blob hash gate,
+    /// dying only at the chain-anchor gate. When the fabricated module is LARGER than the real one it
+    /// is also the cache-poisoning probe: the pull stages the long fabrication, then re-pulls a
+    /// SHORTER honest module, so the promoted artifact must be proven equal to the verified one.
+    pub fn serving_alternate_module_from(mut self, peer_id: &str, module: Vec<u8>) -> Self {
+        self.alternate_module_for = Some((peer_id.to_string(), module));
+        self
+    }
+
+    /// ONLY `peer_id` answers `getModuleInfo` with FABRICATED `chunk_hashes` (honest lengths + total,
+    /// so the descriptor is well-formed) and then serves NO bytes at all.
+    ///
+    /// The cheapest reshare-denial liar: nobody can satisfy those chunk hashes, so the pull EXHAUSTS
+    /// its holders on chunk 0 and never reaches a final gate — the descriptor source must still be
+    /// demoted and another holder's descriptor tried.
+    pub fn fabricating_chunk_hashes_from(mut self, peer_id: &str) -> Self {
+        self.fabricated_chunk_hashes_for = Some(peer_id.to_string());
+        self
+    }
+
+    /// Only `n` `fetchModuleRange` calls succeed; the rest error — models an interrupt after partial
+    /// progress so a test can assert resume re-fetches ONLY the missing chunks.
+    pub fn with_success_budget(mut self, n: usize) -> Self {
+        self.budget = Some(Arc::new(AtomicUsize::new(n)));
+        self
+    }
+
+    /// A snapshot of every `(peer_id, offset)` served (to assert multi-source + no-refetch-on-resume).
+    pub async fn fetches(&self) -> Vec<(String, u64)> {
+        self.fetches.lock().await.clone()
+    }
+
+    /// The `peer_id` of every `getModuleInfo` handshake served, in order — so a test can assert a
+    /// lying descriptor source was DEMOTED and a different holder re-handshaked.
+    pub async fn module_info_calls(&self) -> Vec<String> {
+        self.info_calls.lock().await.clone()
+    }
+
+    /// The honest, self-consistent descriptor of an arbitrary `module` blob at this transport's chunk
+    /// size — no misbehaviour applied.
+    fn descriptor_of(&self, module: &[u8]) -> ModuleInfo {
+        let mut chunk_hashes = Vec::new();
+        let mut chunk_lens = Vec::new();
+        for chunk in module.chunks(self.chunk_size.max(1)) {
+            chunk_hashes.push(hex_sha256(chunk));
+            chunk_lens.push(chunk.len() as u64);
+        }
+        ModuleInfo {
+            total_size: module.len() as u64,
+            module_hash: hex_sha256(module),
+            chunk_hashes,
+            chunk_lens,
+        }
+    }
+
+    /// The descriptor this transport reports for the real blob (the honest chunk layout + hashes,
+    /// plus whichever descriptor misbehaviour was configured).
+    fn descriptor(&self) -> ModuleInfo {
+        let ModuleInfo {
+            chunk_hashes,
+            mut chunk_lens,
+            ..
+        } = self.descriptor_of(&self.blob);
+        let module_hash = if self.corrupt_module_hash {
+            "0".repeat(64)
+        } else {
+            hex_sha256(&self.blob)
+        };
+        // An inflated `total_size` is reported with a matching inflated FINAL chunk length, so the
+        // descriptor stays internally self-consistent and the puller's size guard — not its
+        // consistency check — is what has to catch it.
+        let mut total_size = self.blob.len() as u64;
+        if let Some(inflated) = self.declared_total_size {
+            let last = chunk_lens.last_mut().expect("blob yields >= 1 chunk");
+            *last += inflated.saturating_sub(total_size);
+            total_size = inflated;
+        }
+        ModuleInfo {
+            total_size,
+            module_hash,
+            chunk_hashes,
+            chunk_lens,
+        }
+    }
+
+    /// A self-consistent descriptor whose whole-blob `module_hash` is wrong — it plans + attributes
+    /// every chunk correctly and only fails at the final whole-blob gate.
+    fn lying_descriptor(&self) -> ModuleInfo {
+        ModuleInfo {
+            module_hash: "0".repeat(64),
+            ..self.descriptor()
+        }
+    }
+
+    /// A well-formed descriptor whose per-chunk hashes are FABRICATED (honest lengths, honest
+    /// whole-blob hash) — no holder can ever satisfy it, so the pull exhausts its holders on the first
+    /// chunk instead of reaching a final gate.
+    fn fabricated_chunk_hash_descriptor(&self) -> ModuleInfo {
+        let mut info = self.descriptor();
+        info.chunk_hashes = info
+            .chunk_hashes
+            .iter()
+            .enumerate()
+            .map(|(i, _)| hex_sha256(format!("fabricated-chunk-{i}").as_bytes()))
+            .collect();
+        info
+    }
+
+    /// The blob `provider_peer_id` serves bytes out of — the fabricated alternate module for the
+    /// configured liar, the real blob for everyone else.
+    fn served_blob(&self, provider_peer_id: &str) -> &[u8] {
+        match &self.alternate_module_for {
+            Some((peer, module)) if peer == provider_peer_id => module,
+            _ => &self.blob,
+        }
+    }
+}
+
+#[async_trait]
+impl crate::module::ModuleTransport for MockModuleTransport {
+    async fn get_module_info(
+        &self,
+        provider_peer_id: &str,
+        store_id: &str,
+        root: &str,
+    ) -> Result<ModuleInfo, DownloadError> {
+        self.info_calls
+            .lock()
+            .await
+            .push(provider_peer_id.to_string());
+        if store_id != self.store_id || root != self.root {
+            // The crate's OWN idiom stamps the raw `provider_peer_id` into the error (see
+            // `source.rs`), and the real sub-family-4 adapter will mirror it — so the mock must too,
+            // or the #1603 sentinel test defends nothing.
+            return Err(DownloadError::transport(
+                provider_peer_id,
+                "unknown (store_id, root)",
+            ));
+        }
+        if let Some(wrong) = self.wrong_descriptor_for.as_deref() {
+            if wrong == provider_peer_id {
+                return Ok(self.lying_descriptor());
+            }
+        }
+        if let Some(fabricator) = self.fabricated_chunk_hashes_for.as_deref() {
+            if fabricator == provider_peer_id {
+                return Ok(self.fabricated_chunk_hash_descriptor());
+            }
+        }
+        if let Some((peer, module)) = &self.alternate_module_for {
+            if peer == provider_peer_id {
+                return Ok(self.descriptor_of(module));
+            }
+        }
+        Ok(self.descriptor())
+    }
+
+    async fn fetch_module_range(
+        &self,
+        provider_peer_id: &str,
+        _store_id: &str,
+        _root: &str,
+        offset: u64,
+        length: u64,
+    ) -> Result<Vec<u8>, DownloadError> {
+        if let Some(budget) = &self.budget {
+            // `fetch_sub` returns the PREVIOUS value; 0 means the budget was already spent.
+            if budget.fetch_sub(1, Ordering::SeqCst) == 0 {
+                budget.fetch_add(1, Ordering::SeqCst); // keep it pinned at 0
+                return Err(DownloadError::transport(provider_peer_id, "budget spent"));
+            }
+        }
+        self.fetches
+            .lock()
+            .await
+            .push((provider_peer_id.to_string(), offset));
+
+        if self.fabricated_chunk_hashes_for.as_deref() == Some(provider_peer_id) {
+            // The cheapest liar spends NO bandwidth: it publishes a descriptor nobody can satisfy and
+            // then serves nothing at all.
+            return Err(DownloadError::transport(
+                provider_peer_id,
+                "serving nothing",
+            ));
+        }
+
+        let served = self.served_blob(provider_peer_id);
+        let start = (offset as usize).min(served.len());
+        let mut window = length as usize;
+        if self.overserve {
+            // Answer at chunk granularity beyond the request — the legitimate over-long frame.
+            window += self.chunk_size.max(1);
+        }
+        let end = (start + window).min(served.len());
+        let mut bytes = served[start..end].to_vec();
+        if self.tamper_peer.as_deref() == Some(provider_peer_id) && !bytes.is_empty() {
+            bytes[0] ^= 0xFF;
+        }
+        Ok(bytes)
+    }
+}
+
+/// The 64-hex SHA-256 of `bytes` (test-side mirror of the puller's chunk/module content-id).
+fn hex_sha256(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(64);
+    for b in digest {
+        out.push(char::from_digit((b >> 4) as u32, 16).unwrap());
+        out.push(char::from_digit((b & 0x0f) as u32, 16).unwrap());
+    }
+    out
+}
+
+/// A [`ModuleAnchorVerifier`](crate::module::ModuleAnchorVerifier) that REJECTS every blob — models
+/// content that assembles + whole-blob-hashes cleanly yet is not the chain-anchored module.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RejectAllModuleAnchor;
+
+impl crate::module::ModuleAnchorVerifier for RejectAllModuleAnchor {
+    fn verify_module_anchor(&self, _module: &[u8], _store_id: &str, _root: &str) -> bool {
+        false
+    }
+}
+
+/// A [`ModuleAnchorVerifier`](crate::module::ModuleAnchorVerifier) that accepts EXACTLY one blob —
+/// the genuine, chain-anchored module — and rejects every other, however self-consistent.
+///
+/// This is what the real chain-anchor gate does, so it is the double a test needs whenever a holder
+/// fabricates a WHOLE module (a self-consistent descriptor plus matching bytes): such a fabrication
+/// passes the per-chunk and whole-blob-hash checks and can only be caught here.
+#[derive(Debug, Clone)]
+pub struct OnlyThisModuleAnchor(Vec<u8>);
+
+impl OnlyThisModuleAnchor {
+    /// An anchor gate that accepts only `module`.
+    pub fn new(module: Vec<u8>) -> Self {
+        OnlyThisModuleAnchor(module)
+    }
+}
+
+impl crate::module::ModuleAnchorVerifier for OnlyThisModuleAnchor {
+    fn verify_module_anchor(&self, module: &[u8], _store_id: &str, _root: &str) -> bool {
+        module == self.0.as_slice()
+    }
+}
+
+/// Build `n` mock holders (peers `1..=n`) of `content` — the multi-source holder set for a module pull.
+pub fn mock_providers(n: u8, content: &ContentId) -> Vec<ProviderRecord> {
+    (1..=n).map(|i| mock_provider(i, content)).collect()
 }
 
 #[cfg(test)]

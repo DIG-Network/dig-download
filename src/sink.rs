@@ -39,6 +39,49 @@ pub trait Sink: Send + Sync {
         Ok(())
     }
 
+    /// Reduce the staging area to exactly `len` bytes, discarding anything beyond it.
+    ///
+    /// A staging area is APPEND-OR-OVERWRITE by offset and is never shortened by writing, so bytes
+    /// from a LONGER earlier attempt — a demoted descriptor's fabrication, or a leftover file from a
+    /// differently-shaped pull — outlive the attempt that wrote them. Promotion is only meaningful if
+    /// the promoted artifact IS the verified one, so the module puller shortens the staging area to the
+    /// verified length before finalizing, and resets it to 0 when it abandons a plan.
+    ///
+    /// Only ever SHRINKS: a `len` at or beyond the staged end is a no-op (never zero-extends).
+    ///
+    /// The default is **fail-closed**, matching [`read_at`](Self::read_at)'s default: an
+    /// implementation that does not override this returns [`DownloadError::Sink`]. A silent no-op
+    /// default here used to combine with `read_at`'s fail-closed default to fail OPEN — `truncate`
+    /// claimed success without shortening anything, so the module puller's "bytes past the verified
+    /// end" promotion probe read `read_at`'s "unsupported" as "nothing past the end" and promoted
+    /// whatever longer, un-truncated bytes were staged.
+    ///
+    /// A sink with genuinely no staging area to shorten — a store-write sink that commits the WHOLE
+    /// resource in one shot and can never hold a partially-overwritten tail — MUST opt IN explicitly
+    /// rather than inherit a default:
+    /// ```ignore
+    /// async fn truncate(&self, _len: u64) -> Result<(), DownloadError> {
+    ///     Ok(()) // asserts: this sink commits whole, so there is never a tail to shrink
+    /// }
+    /// ```
+    async fn truncate(&self, _len: u64) -> Result<(), DownloadError> {
+        Err(DownloadError::sink("truncation unsupported by this sink"))
+    }
+
+    /// Read back `len` bytes previously [`write_at`](Self::write_at)-ten at `offset` from the staging
+    /// area, if this sink supports it.
+    ///
+    /// A whole-`.dig`-module pull ([`ModuleDownloader`](crate::ModuleDownloader)) needs the FULL
+    /// assembled blob to run its final whole-blob-hash + chain-anchor gate, so on **resume** it reads
+    /// the already-verified chunks back rather than re-fetching them over the network. Staging sinks
+    /// ([`InMemorySink`], [`FileSink`]) implement it; a sink that cannot read back returns the default
+    /// [`DownloadError::Sink`] "read-back unsupported", and the module puller gracefully degrades by
+    /// RE-FETCHING those chunks (still correct — never a silent partial). Resource downloads never
+    /// call this.
+    async fn read_at(&self, _offset: u64, _len: u64) -> Result<Vec<u8>, DownloadError> {
+        Err(DownloadError::sink("read-back unsupported by this sink"))
+    }
+
     /// The staging (`.download.tmp`) path this sink writes into before finalize, if any. The
     /// orchestrator registers it with the [`ActiveDownloads`](crate::gc::ActiveDownloads) registry so
     /// GC does not reap a live/paused-resumable download's staging file. In-memory sinks return
@@ -46,6 +89,43 @@ pub trait Sink: Send + Sync {
     fn staging_path(&self) -> Option<&Path> {
         None
     }
+}
+
+/// The `[start, end)` usize bounds of a read-back window, or a typed error if the span cannot exist.
+///
+/// `offset` / `len` are derived from a peer-supplied module descriptor, so the conversion and the
+/// addition must both be CHECKED: on a 32-bit target `as usize` silently truncates, and `start + len`
+/// can wrap — either turning a hostile span into a read of the wrong bytes instead of a rejection.
+fn read_back_bounds(offset: u64, len: u64) -> Result<(usize, usize), DownloadError> {
+    let end = offset
+        .checked_add(len)
+        .ok_or_else(|| span_too_large(offset, len))?;
+    let start = usize::try_from(offset).map_err(|_| span_too_large(offset, len))?;
+    let end = usize::try_from(end).map_err(|_| span_too_large(offset, len))?;
+    Ok((start, end))
+}
+
+fn span_too_large(offset: u64, len: u64) -> DownloadError {
+    DownloadError::sink(format!(
+        "read-back span [{offset}, +{len}) does not fit this platform's address space"
+    ))
+}
+
+/// Allocate a `len`-byte read-back buffer FALLIBLY.
+///
+/// `len` comes from an untrusted descriptor's chunk length, and `vec![0u8; len]` aborts the process
+/// via `handle_alloc_error` — an uncatchable death. `try_reserve` makes exhaustion an ordinary
+/// [`DownloadError::Sink`] the puller can route around.
+fn try_zeroed_read_buffer(len: u64) -> Result<Vec<u8>, DownloadError> {
+    let len = usize::try_from(len).map_err(|_| span_too_large(0, len))?;
+    let mut buf: Vec<u8> = Vec::new();
+    buf.try_reserve_exact(len).map_err(|e| {
+        DownloadError::sink(format!(
+            "cannot allocate a {len}-byte read-back buffer: {e}"
+        ))
+    })?;
+    buf.resize(len, 0); // within the reservation above — no further allocation
+    Ok(buf)
 }
 
 /// An in-memory [`Sink`] that assembles the resource in a byte buffer — the test sink, and a
@@ -82,17 +162,41 @@ impl InMemorySink {
 impl Sink for InMemorySink {
     async fn write_at(&self, offset: u64, bytes: &[u8]) -> Result<(), DownloadError> {
         let mut inner = self.inner.lock().await;
-        let end = offset as usize + bytes.len();
+        // Same CHECKED conversion as `read_at`: a write offset is descriptor-derived too, and one
+        // unchecked `as usize` pair is all it takes to place bytes at a wrapped index.
+        let (start, end) = read_back_bounds(offset, bytes.len() as u64)?;
         if inner.buf.len() < end {
             inner.buf.resize(end, 0);
         }
-        inner.buf[offset as usize..end].copy_from_slice(bytes);
+        inner.buf[start..end].copy_from_slice(bytes);
         Ok(())
     }
 
     async fn finalize(&self) -> Result<(), DownloadError> {
         self.inner.lock().await.finalized = true;
         Ok(())
+    }
+
+    async fn truncate(&self, len: u64) -> Result<(), DownloadError> {
+        let mut inner = self.inner.lock().await;
+        if let Ok(len) = usize::try_from(len) {
+            if inner.buf.len() > len {
+                inner.buf.truncate(len);
+            }
+        }
+        Ok(())
+    }
+
+    async fn read_at(&self, offset: u64, len: u64) -> Result<Vec<u8>, DownloadError> {
+        let inner = self.inner.lock().await;
+        let (start, end) = read_back_bounds(offset, len)?;
+        if inner.buf.len() < end {
+            return Err(DownloadError::sink(format!(
+                "read-back past staged end: want [{start}, {end}), have {}",
+                inner.buf.len()
+            )));
+        }
+        Ok(inner.buf[start..end].to_vec())
     }
 }
 
@@ -172,6 +276,57 @@ impl Sink for FileSink {
         f.seek(SeekFrom::Start(offset))
             .map_err(DownloadError::sink)?;
         f.write_all(bytes).map_err(DownloadError::sink)?;
+        Ok(())
+    }
+
+    async fn read_at(&self, offset: u64, len: u64) -> Result<Vec<u8>, DownloadError> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut guard = self.file.lock().await;
+        // On a cross-process resume the staging file exists on disk but is not yet open in THIS
+        // process — open it read/write (never truncating) so a subsequent write_at reattaches. A READ
+        // never CREATES: an absent staging file must surface as "nothing staged", not as a 0-byte file
+        // conjured as a side effect of reading.
+        if guard.is_none() {
+            let f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .truncate(false)
+                .open(&self.tmp_path)
+                .map_err(DownloadError::sink)?;
+            *guard = Some(f);
+        }
+        let f = guard.as_mut().expect("file opened above");
+        f.seek(SeekFrom::Start(offset))
+            .map_err(DownloadError::sink)?;
+        let mut buf = try_zeroed_read_buffer(len)?;
+        f.read_exact(&mut buf).map_err(|e| {
+            DownloadError::sink(format!("read-back of {len} bytes at {offset} failed: {e}"))
+        })?;
+        Ok(buf)
+    }
+
+    async fn truncate(&self, len: u64) -> Result<(), DownloadError> {
+        let mut guard = self.file.lock().await;
+        if guard.is_none() {
+            // Nothing staged in this process. An ABSENT staging file has nothing to shorten and must
+            // not be conjured (same rule as `read_at`); a present one from an earlier attempt is
+            // opened WITHOUT truncating so a `set_len` below is the only length change.
+            if !self.tmp_path.exists() {
+                return Ok(());
+            }
+            let f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .truncate(false)
+                .open(&self.tmp_path)
+                .map_err(DownloadError::sink)?;
+            *guard = Some(f);
+        }
+        let f = guard.as_mut().expect("file opened above");
+        let staged = f.metadata().map_err(DownloadError::sink)?.len();
+        if staged > len {
+            f.set_len(len).map_err(DownloadError::sink)?;
+        }
         Ok(())
     }
 
@@ -270,6 +425,68 @@ mod tests {
         sink2.finalize().await.unwrap();
         assert_eq!(std::fs::read(&final_path).unwrap(), b"ABCDEF");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A read-back span derived from a hostile descriptor must be REJECTED, never turned into a
+    /// wrapped/truncated index or an infallible 18-EiB allocation (which aborts the process).
+    #[tokio::test]
+    async fn an_absurd_read_back_span_is_a_typed_error_not_an_abort() {
+        let sink = InMemorySink::new();
+        sink.write_at(0, b"eight!!!").await.unwrap();
+        let err = sink
+            .read_at(1, u64::MAX)
+            .await
+            .expect_err("an unsatisfiable span is refused");
+        assert!(matches!(err, DownloadError::Sink(_)), "typed error: {err}");
+    }
+
+    /// Reading back an ABSENT staging file must not CREATE it: a read has no business leaving a
+    /// 0-byte file behind (it would also make a later GC/resume see phantom staging).
+    #[tokio::test]
+    async fn read_back_never_creates_the_staging_file() {
+        let dir = temp_dir("no-create");
+        let sink = FileSink::new(dir.join("resource.dig"));
+        assert!(sink.read_at(0, 4).await.is_err());
+        assert!(
+            !sink.tmp_path().exists(),
+            "a read did not conjure a staging file"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `truncate` only ever SHRINKS the staging area — it never zero-extends a short one into a
+    /// wrong-length artifact.
+    #[tokio::test]
+    async fn truncate_shrinks_and_never_extends() {
+        let sink = InMemorySink::new();
+        sink.write_at(0, b"ABCDEF").await.unwrap();
+        sink.truncate(3).await.unwrap();
+        assert_eq!(sink.contents().await, b"ABC");
+        sink.truncate(99).await.unwrap();
+        assert_eq!(sink.contents().await, b"ABC", "a longer len is a no-op");
+    }
+
+    #[tokio::test]
+    async fn file_sink_truncate_shrinks_the_staging_file() {
+        let dir = temp_dir("truncate");
+        let final_path = dir.join("resource.dig");
+        let sink = FileSink::new(&final_path);
+        sink.write_at(0, b"ABCDEF").await.unwrap();
+        sink.truncate(3).await.unwrap();
+        sink.finalize().await.unwrap();
+        assert_eq!(std::fs::read(&final_path).unwrap(), b"ABC");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Truncating an ABSENT staging file is a no-op that does not conjure one (same rule as `read_at`:
+    /// a phantom 0-byte staging file would confuse GC + resume).
+    #[tokio::test]
+    async fn truncate_never_creates_the_staging_file() {
+        let dir = temp_dir("truncate-no-create");
+        let sink = FileSink::new(dir.join("resource.dig"));
+        sink.truncate(0).await.unwrap();
+        assert!(!sink.tmp_path().exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

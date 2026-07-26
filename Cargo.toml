@@ -20,7 +20,7 @@
 # by dig-node (see the implementers' note in the crate docs).
 [package]
 name = "dig-download"
-version = "0.7.4"
+version = "0.8.0"
 edition = "2021"
 rust-version = "1.75.0"
 license = "Apache-2.0 OR MIT"
@@ -47,6 +47,14 @@ dig-constants = "0.8"
 # defines its OWN `PeerId`/`ProviderRecord` types (NOT re-exported from dig-nat).
 # NC-7: prefer the crates.io release over bare-git.
 dig-dht = "0.5.1"
+
+# WIRE — the whole-`.dig`-module pull descriptor + method names (#1576). `ModuleInfo`
+# (`total_size` / `module_hash` / `chunk_hashes` / `chunk_lens`) is the canonical byte-contract a
+# `getModuleInfo` handshake returns; the `ModuleDownloader` consumes it directly rather than
+# re-declaring the shape (single source of truth, no drift vs the dig-node serve leg). Foundation-level
+# (L00), zero DIG deps — a legal downward edge from L30. NC-7: prefer the crates.io release over
+# bare-git.
+dig-rpc-protocol = "0.5"
 
 # REACH + FETCH — the mTLS peer transport the range fetch rides: `dig.getAvailability` +
 # `dig.fetchRange` over dig-nat mux streams, plus the wire shapes (`RangeRequest`, `RangeFrame`,
@@ -100,7 +108,17 @@ tracing = "0.1"
 # tree unless a consumer wants the built-in probe); the trait-based ladder works without it.
 http-probe = ["dep:reqwest"]
 
+# The in-memory test harness (`testkit`) AND the fail-OPEN `AcceptAnyModuleAnchor` it pairs with. OFF by
+# default so a production consumer build cannot even name the no-op anchor verifier that would bypass the
+# module pull's sole root of trust (#1576 security gate); a consumer unit-testing its own download wiring
+# enables it as a dev-dependency feature.
+testkit = []
+
 [dev-dependencies]
+# Self-dev-dependency so this crate's OWN integration tests (a separate crate) see the `testkit`
+# feature, while a normal consumer build still gets it off by default.
+dig-download = { path = ".", features = ["testkit"] }
+
 # The in-memory harness spins up mock providers + mock range sources + an in-memory sink/state store
 # in one process (NO real network). test-util drives the backoff timers deterministically.
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "test-util"] }

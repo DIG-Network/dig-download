@@ -274,6 +274,11 @@ A provider record's candidate `host` is an IP **literal** (IPv4, IPv6, or v4-map
   NEVER truncating, so a resume reattaches to the partial file) and, on finalize, flushes + syncs +
   atomically renames the staging file onto the final path. A reader MUST never observe a partial final
   file; a crash MUST leave only a `.download.tmp`, never a corrupt final file.
+- **Explicit shortening** — because writing never shortens a staging area, a sink exposes `truncate(len)`,
+  which reduces it to `len` bytes and never extends it. This is how a caller proves the promoted artifact is
+  the verified one (§17.5b); the trait default is **fail-closed** (an error), matching `read_at`'s default —
+  a sink with no staging area to shorten MUST opt in explicitly (`Ok(())`, asserting it commits whole) rather
+  than inherit a silent no-op, which used to combine with `read_at`'s default to promote an un-truncated tail.
 - **Resume** — per-range progress is checkpointed to a `StateStore`. A paused or crashed download
   resumes into the same staging file and re-fetches ONLY the still-missing ranges; a verified range is
   never re-fetched.
@@ -393,3 +398,174 @@ within a short timeout:
   `rpc.dig.net` (dual-mode: mTLS for node-class clients, plain HTTPS+CORS for browsers). `TransportMode`
   is the explicit-enum seam (`Https` default, `Mtls`) that flips the transport to mTLS once the
   gateway's mTLS endpoint exists — an additive change, not a break to the ladder logic.
+
+---
+
+## 17. Whole-`.dig`-module pull (`module`, the reshare leg)
+
+`ModuleDownloader` pulls the ENTIRE `.dig` module blob for one `(store_id, root)` generation from
+PEERS, so a node that read one resource can become a complete resharer of the capsule. It delivers
+**whole-module semantics over the ranged transport** — the same multi-source, resumable, per-source
+attributable machinery as §§5–10, addressed at the module blob rather than a resource within it.
+
+### 17.1 Injection seams (MUST)
+
+- **`ModuleTransport`** — the two peer calls, and the ONLY network the engine performs:
+  - `get_module_info(provider_peer_id, store_id, root) -> ModuleInfo` (`dig.getModuleInfo`).
+  - `fetch_module_range(provider_peer_id, store_id, root, offset, length) -> Vec<u8>`
+    (`dig.fetchModuleRange`).
+- **`ModuleAnchorVerifier`** — `verify_module_anchor(module, store_id, root) -> bool`, binding an
+  assembled blob to its on-chain generation root. There is **NO fail-open production default**, and none is
+  reachable: the no-op `AcceptAnyModuleAnchor` is compiled ONLY under `cfg(test)` or the explicit `testkit`
+  feature, so a default consumer build cannot name it. A production caller MUST inject a real
+  chain-anchored verifier (it is a required positional argument of `ModuleDownloader::new`).
+
+`ModuleInfo` (`total_size`, `module_hash`, `chunk_hashes`, `chunk_lens`) is the **dig-rpc-protocol**
+wire type, re-exported unchanged — this crate MUST NOT declare a second copy of the descriptor.
+
+### 17.2 Normative order
+
+1. **Locate** holders via `ProviderLocator::find_providers` on the capsule `ContentId`
+   (`ContentId::root(store_id, root)`). An empty holder set is `NotFound`.
+2. **Describe** — `get_module_info` against each holder until one answers; the descriptor is validated
+   into a chunk plan (§17.3).
+3. **Load** the resume checkpoint under the module-scoped key `module:<store_id>:<root>`, which MUST NOT
+   collide with the resource `download_key` keyspace. A checkpoint whose `chunk_lens` differ from the
+   current descriptor is discarded whole, never partially reused.
+4. **Rehydrate** each checkpointed chunk from staging, re-attributing it (§17.5).
+5. **Fetch** every still-missing chunk in ascending order, round-robin across holders from a per-chunk
+   starting offset, attributing each on arrival (§17.4). Each accepted chunk is written to the sink and
+   checkpointed before the next is requested.
+6. **Gate, then finalize** (§17.6).
+
+### 17.3 Descriptor validation (MUST — before allocation)
+
+Descriptor validation is **TOTAL**: for EVERY `ModuleInfo` a hostile holder can send, validation MUST
+terminate in either a chunk plan or a `Verify(Metadata)` rejection. It MUST NOT panic, abort, or wrap.
+
+A `ModuleInfo` is rejected with `Verify(Metadata)` unless ALL hold, checked in this order:
+
+- `total_size <= max_module_size` (`DEFAULT_MAX_MODULE_SIZE` = **512 MiB**). The descriptor is UNTRUSTED and
+  `total_size` sizes the assembly buffer, so this bound MUST be checked **before any allocation** — an
+  unbounded declared size is a one-message memory-exhaustion attack. The default is deliberately sized to
+  what a modest host can hold: a ceiling above real host memory bounds nothing. A deployment that reshares
+  larger capsules raises `max_module_size` explicitly.
+- `chunk_lens` is non-empty (without it no byte→chunk mapping, hence no per-chunk check, exists).
+- `chunk_lens.len() <= MAX_MODULE_CHUNK_COUNT` (1 Mi). The declared COUNT sizes the plan's own vectors, so an
+  absurd count is the same one-message allocation attack as an absurd `total_size`; it MUST be bounded
+  before the lengths are copied.
+- `chunk_lens.len() == chunk_hashes.len()`.
+- `chunk_lens` sums exactly to `total_size`, computed with **CHECKED** arithmetic; a sum that would overflow
+  `u64` is a rejection. Unchecked, `{ total_size: 0, chunk_lens: [1, u64::MAX] }` WRAPS to a sum of 0,
+  matches its declared total, and passes every other check — then either aborts the process inside the
+  summation (where overflow checks are on) or yields spans that index past the assembled blob.
+- Cumulative chunk offsets are likewise accumulated with **CHECKED** arithmetic.
+
+**Allocation is FALLIBLE (MUST).** Every allocation sized by the descriptor — the assembly buffer, the chunk
+plan, a staging read-back buffer — MUST use a fallible reservation and surface exhaustion as a
+`Verify(Metadata)` / `Sink` error. An infallible `vec![0; n]` aborts the process (`handle_alloc_error`),
+which an untrusted descriptor MUST never be able to cause. A declared size or span that does not fit the
+platform's `usize` is likewise a rejection, never a truncating conversion.
+
+### 17.4 Per-chunk attribution (MUST — fail-closed)
+
+A returned range is accepted only if, after clipping, it fills the requested window AND its SHA-256
+equals `chunk_hashes[index]`. Otherwise it is discarded and the next holder tried.
+
+- **Clip, do not reject (MUST)** — a frame that OVERSHOOTS the requested window is truncated to the
+  window and then attributed. Holders legitimately answer at their own chunk granularity (§2.2); treating
+  an over-long answer as a violation would make every such holder unusable. A range that is SHORT after
+  clipping is a failure for that holder.
+- **Surface every reason (MUST)** — each holder's rejection reason (`transport: …`, `timed out after …`,
+  `short range: …`, `chunk hash mismatch`) is recorded and traced as it happens, and the terminal error
+  names the failing STEP (`getModuleInfo` / `fetchModuleRange`), the chunk, its byte window, and every
+  per-holder reason. A swallowed reason resurfacing as an unrelated message is a defect, not a nicety.
+- **Sentinel untrusted identifiers (MUST)** — a `provider_peer_id` and the descriptor's hashes are
+  free-form peer-supplied strings. Any such value reaching a log or an error message is rendered as
+  lowercase 64-hex only when it IS canonical 64-hex, else as `<non-canonical-{label}>`. A log an attacker
+  can write is not evidence. The rendering lives in `DownloadError`'s own `Display`, so a raw identifier is
+  **unrepresentable** in an error string however the error was constructed — sanitizing only at the
+  reporting call site is insufficient, because a wrapped `Transport` error carries the raw id back out.
+- **Escape untrusted TEXT (MUST)** — a foreign error's message may carry peer-supplied content (a remote
+  reason, a returned status line, a peer-reported first-frame `root` quoted by a `VerifyError`). Control
+  characters AND Unicode bidirectional-formatting characters in it are ESCAPED and its length is bounded
+  before it reaches an error or a log, so one holder reason is always exactly ONE line, reads in the order
+  it is written, and cannot forge a log line. This applies to EVERY variant that carries foreign text,
+  including a WRAPPED `VerifyError`, and it is applied in `Display`. `Debug` MUST delegate to that same
+  `Display` rather than printing raw fields: `Debug` is emitted by `tracing`'s `?field` and by every
+  `unwrap`/`expect` panic, so a derived one would be an unsanitized second door.
+- **Relocate once** — when every known holder has failed one chunk, `find_providers` is re-queried and
+  newly-discovered holders appended before the pull gives up on that chunk.
+
+### 17.5 Resume (MUST NOT trust staging)
+
+A checkpointed chunk is read back from the sink and **re-attributed against `chunk_hashes` exactly like a
+freshly-fetched one**. The staging file survives crashes, other processes, and bit-rot, so it is not a
+trusted input. A chunk that cannot be read back, reads short, or fails its hash is left NOT done, is
+re-fetched, and the checkpoint is corrected to match. Resume is an OPTIMIZATION and MUST NEVER be a
+correctness dependency, and MUST NEVER skip the §17.6 gates.
+
+### 17.5a Descriptor-source demotion (MUST)
+
+The descriptor defines the WHOLE plan, and holder order is deterministic, so a holder that answers
+`get_module_info` first with a **well-formed but WRONG** descriptor MUST NOT be able to deny a capsule's
+reshare: the bytes verify per chunk, the pull assembles, and only the final gates (§17.6) reject it.
+
+- A pull whose assembled blob fails EITHER final gate, or whose descriptor is unusable, MUST **demote that
+  descriptor's source** and re-handshake `get_module_info` with a holder that has not been demoted,
+  discarding the checkpoint the rejected plan produced.
+- Demotion is bounded by `MAX_DESCRIPTOR_ATTEMPTS` (3) and by the supply of un-demoted holders; when it is
+  exhausted the pull fails with the **descriptor** failure (a gate `Verify`), never a `NotFound` — blaming
+  discovery for a descriptor lie is the ambiguity §17.4's reason-surfacing rule exists to prevent.
+- **Exhaustion with NO verified chunk is attributed to the descriptor (MUST).** Exhaustion is ambiguous:
+  unavailable bytes and an unsatisfiable descriptor are indistinguishable from inside one attempt. A holder
+  that fabricates `chunk_hashes` (rather than `module_hash`) serves ZERO bytes and never reaches a final
+  gate, so treating exhaustion as terminal would let the cheapest possible liar deny a capsule's reshare
+  permanently. The bound is whether ANY chunk has verified under that descriptor:
+  - no chunk has ever verified → the descriptor is the suspect: demote its source and re-handshake
+    (subject to the same `MAX_DESCRIPTOR_ATTEMPTS` + un-demoted-holder bounds);
+  - at least one chunk HAS verified → the descriptor is credible, so the exhaustion is genuinely missing
+    bytes and is terminal.
+  A chunk rehydrated from staging is verified against this descriptor's hashes and therefore counts.
+  **Residual (known, tracked separately, not a poisoning primitive):** the bound flips on the FIRST verified
+  chunk, so a holder that lets exactly one chunk verify (e.g. a descriptor declaring a 1-byte first chunk)
+  can still force every later exhaustion to classify as terminal — a bounded one-chunk denial, not a
+  falsified artifact.
+
+### 17.5b Promotion (MUST — the promoted artifact IS the verified artifact)
+
+The gates in §17.6 verify the assembled blob; `Sink::finalize` promotes the STAGING AREA. Those are the
+same artifact only if nothing longer was ever staged, and a staging area is written by offset and **never
+shortened by writing**. So:
+
+- **The promoted artifact MUST be byte-identical to the verified one.** Before finalize the staging area
+  MUST be reduced to the verified length (`Sink::truncate`), and a staged length ≠ the verified length is a
+  **fail-closed `Verify(Metadata)` error, never a promotion**. `Sink::truncate` only ever shrinks; it never
+  zero-extends.
+- **An abandoned plan's bytes MUST be discarded with its checkpoint.** On descriptor demotion (§17.5a) the
+  sink is RESET alongside the checkpoint, and a pull whose checkpoint does not resume the current plan
+  (absent, or a different shape) resets the sink before staging. Otherwise a longer earlier attempt —
+  a demoted holder's fabrication, or a leftover file from another shape — survives as a tail on a later,
+  shorter promotion.
+- Violating this is a cache-poisoning primitive, not a cosmetic length bug: the promoted `.dig` would hash
+  to something other than `module_hash` while the pull reports success, so the reshare leg would announce
+  the node as a holder of content every downstream peer rejects.
+
+### 17.6 Final gates (MUST — fail-closed, both, every time)
+
+Before `Sink::finalize`, on EVERY pull including a resumed one:
+
+1. The reassembled blob's SHA-256 equals the descriptor's `module_hash`.
+2. `ModuleAnchorVerifier::verify_module_anchor(blob, store_id, root)` returns `true`.
+
+Both gates run on the single path to `finalize`, and finalize is reached only through the §17.5b promotion
+check. If either gate fails, the pull returns `Verify(Metadata)`, the sink is **NOT finalized** (the staging file is
+never promoted, so nothing is served or announced), and the checkpoint is left in place. There is no path
+by which a module is finalized without both gates passing — an unanchored module is a clean miss, never a
+serve. This is what makes reshare safe: only chain-anchored bytes can ever be re-announced.
+
+### 17.7 Implementation status
+
+This crate ships the ENGINE and the two seams. The production `ModuleTransport` adapter over the peer
+client is wired by dig-node once module client methods exist on the shared peer client; the in-memory
+`testkit::MockModuleTransport` is the reference double.
