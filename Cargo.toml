@@ -20,7 +20,7 @@
 # by dig-node (see the implementers' note in the crate docs).
 [package]
 name = "dig-download"
-version = "0.8.0"
+version = "0.8.1"
 edition = "2021"
 rust-version = "1.75.0"
 license = "Apache-2.0 OR MIT"
@@ -70,11 +70,19 @@ dig-nat = "0.11"
 
 # REACH + FETCH via the shared client — dig-download talks to peers through `DigPeer`, the one DIG
 # Network peer client (#1283), rather than driving dig-nat directly: `DigPeer::connect_with_runtime`
-# (peer_id-PINNED mTLS over the full NAT ladder) + `get_availability` / `fetch_range`. dig-peer 0.4
+# (peer_id-PINNED mTLS over the full NAT ladder) + `get_availability` / `fetch_range`. dig-peer 0.5
 # re-exports the SAME dig-nat 0.11 / dig-tls 0.3 shapes this crate already uses (`PeerTarget`,
 # `RangeRequest`, `AvailabilityItem`/`AvailabilityResponse`, `NodeCert`, `PeerId`), so the tree still
 # carries exactly ONE dig-nat + dig-tls instance. NC-7: prefer the crates.io release over bare-git.
-dig-peer = "0.4.1"
+#
+# Pinned to 0.5 to collapse a `ModuleInfo` SHAPE SKEW, not merely to stay current (#1576). dig-peer 0.4
+# pulled dig-rpc-protocol 0.3 while this crate consumes 0.5 — the major that carries the module wire —
+# so the resolved tree held TWO `ModuleInfo` types either side of a trust boundary, on the very field
+# (`chunk_lens`/`chunk_hashes`) that drives the whole pull plan. That is the #836 `serde_bytes`-vs-base64
+# class of defect, which cost six blind diagnosis rounds. dig-peer 0.5 is on dig-rpc-protocol 0.5, so
+# the tree now carries exactly ONE. dig-peer 0.5 also adds the `get_module_info` / `fetch_module_range`
+# client methods dig-node's `ModuleTransport` adapter is built on.
+dig-peer = "0.5.0"
 
 # Async runtime for the orchestrator task + the concurrent range fan-out + backoff timers.
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync", "io-util"] }
