@@ -609,9 +609,9 @@ dependencies = [
 
 [[package]]
 name = "dig-dht"
-version = "0.7.0"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4dcc1c46d868c6fd308bf34a00b96d4874b8f0f20a1a6b701093940e38fd820f"
+checksum = "3e0effb120e4932d05b28e3211d3f7a47dff62aea394a3bed239334ea8ee558a"
 dependencies = [
  "async-trait",
  "dig-ip",
@@ -627,7 +627,7 @@ dependencies = [
 
 [[package]]
 name = "dig-download"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "async-trait",
  "dig-constants 0.8.0",
@@ -695,9 +695,9 @@ dependencies = [
 
 [[package]]
 name = "dig-nat"
-version = "0.13.0"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f2093ca487bf797e12bacff33a0cc92484879d53d0087ea8e3503e6b2ffc26f7"
+checksum = "b1935057b8b49a73074eba083d43b02c2b16e872e387f627614d8725c347a858"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -725,9 +725,9 @@ dependencies = [
 
 [[package]]
 name = "dig-peer"
-version = "0.6.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "500f0090661cc9a6fe476e44fa2cf5436633e1cced658ef03b4c13cbc2bda79d"
+checksum = "d6de94e87ca139b5a61a09c6d22c94d825ac9280bd0b1fe91b9ea3daa3451c7a"
 dependencies = [
  "chia-protocol",
  "chia-traits 0.26.0",
