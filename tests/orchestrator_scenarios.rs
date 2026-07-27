@@ -16,35 +16,34 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use dig_download::testkit::{
-    mock_content_id, mock_peer_hex, mock_provider, Behavior, MockContent, MockProviderLocator,
-    MockRangeTransport, MockSelector,
+    mock_content_id, mock_peer_hex, mock_provider, AvailabilityClaim, Behavior, MockContent,
+    MockProviderLocator, MockRangeTransport, MockSelector,
 };
 use dig_download::{
     DownloadConfig, DownloadError, DownloadEvent, DownloadOptions, Downloader, FileSink,
     InMemorySink, InMemoryStateStore, MerkleVerifier, ProofVerifier, ProviderLocator, RangeResult,
-    RangeTransport, Sink, SourceSelector, StateStore, Verifier,
+    RangeTransport, ResourceCommitment, Sink, SourceSelector, StateStore, Verifier,
 };
 
 /// A fast test config: tiny ranges (one chunk each) + short backoffs so retries + rebalancing run
 /// quickly in real time.
 fn test_config(window: u64) -> DownloadConfig {
-    DownloadConfig {
-        window,
-        max_concurrency: 8,
-        max_inflight_per_source: 1,
-        base_backoff: Duration::from_millis(1),
-        max_backoff: Duration::from_millis(20),
-        max_relocate_attempts: 4,
-        max_range_attempts: 8,
-        verify_whole_resource: true,
-        max_resource_size: 64 * 1024,
-        // Disable the per-range timeout + periodic refresh by default so the existing scenarios stay
-        // deterministic (individual tests below opt into them). Selection uses the default
-        // round-robin unless a test injects a selector.
-        selector: None,
-        range_timeout: None,
-        refresh_interval: None,
-    }
+    // `DownloadConfig` is `#[non_exhaustive]`, so it is built the way the type documents for consumers:
+    // from `Default`, overriding only what this harness needs. Every field the harness does not name
+    // therefore tracks the production default automatically — which is the point of the attribute.
+    let mut config = DownloadConfig::default();
+    config.window = window;
+    config.max_inflight_per_source = 1;
+    config.base_backoff = Duration::from_millis(1);
+    config.max_backoff = Duration::from_millis(20);
+    config.max_range_attempts = 8;
+    config.max_resource_size = 64 * 1024;
+    // Disable the per-range timeout + periodic refresh by default so the existing scenarios stay
+    // deterministic (individual tests below opt into them). Selection uses the default round-robin
+    // unless a test injects a selector.
+    config.range_timeout = None;
+    config.refresh_interval = None;
+    config
 }
 
 fn downloader(
@@ -360,9 +359,20 @@ async fn commitment_rejects_peer_reporting_a_wrong_root() {
     );
     let sink = Arc::new(InMemorySink::new());
     let result = join_ok(dl.download(cid, sink.clone(), DownloadOptions::default())).await;
+    // `MetadataProbeFailed`, not `NotFound`: holders WERE discovered and confirmed, and the reason the
+    // download failed is that the only one of them served a wrong-generation layout. Reporting that as
+    // "content not found" is the ambiguity #1586 kept chasing, so this pins the specific error AND that
+    // its text names why the holder was rejected — a generic error would satisfy a weaker matcher.
+    let Err(DownloadError::MetadataProbeFailed {
+        holders, reasons, ..
+    }) = &result
+    else {
+        panic!("a peer reporting a wrong root must not seed the commitment; got {result:?}");
+    };
+    assert_eq!(*holders, 1, "the one confirmed holder was probed");
     assert!(
-        matches!(result, Err(DownloadError::NotFound { .. })),
-        "a peer reporting a wrong root must not seed the commitment; got {result:?}"
+        reasons[0].contains("serves generation root"),
+        "the failure must name WHY this holder was rejected; got {reasons:?}"
     );
     assert_ne!(sink.contents().await, content.bytes);
 }
@@ -803,7 +813,10 @@ async fn slow_range_times_out_and_is_reported_timedout() {
     // be reported TimedOut to the selector, and (with no other holder) the download exhausts.
     let content = MockContent::even(20, 2);
     let transport = Arc::new(MockRangeTransport::new(content.clone()));
-    transport.set_delay(Duration::from_millis(200)).await;
+    // RANGE fetches only: the metadata probe is now bounded by the same timeout, so delaying it too would
+    // fail the download before a single range was scheduled and this test would stop measuring the range
+    // timeout it is named for.
+    transport.set_range_delay(Duration::from_millis(200)).await;
     let cid = mock_content_id();
     let providers = vec![mock_provider(1, &cid)];
     let selector = MockSelector::new();
@@ -1269,10 +1282,15 @@ async fn an_absurd_declared_resource_length_is_refused_before_any_plan_exists() 
     let sink = Arc::new(InMemorySink::new());
     let result = join_ok(dl.download(cid, sink.clone(), DownloadOptions::default())).await;
 
+    let Err(DownloadError::MetadataProbeFailed { reasons, .. }) = &result else {
+        panic!(
+            "an over-ceiling commitment is never adopted, so no holder can seed the download; got \
+             {result:?}"
+        );
+    };
     assert!(
-        matches!(result, Err(DownloadError::NotFound { .. })),
-        "an over-ceiling commitment is never adopted, so no holder can seed the download; got \
-         {result:?}"
+        reasons[0].contains("exceeds the maximum"),
+        "the failure must name the ceiling that refused it; got {reasons:?}"
     );
     assert!(
         sink.contents().await.is_empty(),
@@ -1465,4 +1483,442 @@ async fn a_refused_promotion_discards_its_checkpoint_so_a_later_attempt_can_succ
     assert_eq!(std::fs::read(&final_path).unwrap(), content.bytes);
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---- #1670: layout adoption from an untrusted holder ------------------------------------------
+//
+// A resource layout is adopted from one holder before any work that could disprove it. The two gates
+// available at that moment — the root match and the `chunk_lens`-sums-to-`total_length` check — both
+// compare fields that SAME holder supplied, so a holder willing to lie consistently passes both.
+//
+// FIXTURE SIZING. The honest resource is 4,096 B in 8 chunks of 512, so the sybil's 64-byte layout is a
+// genuine strict prefix and the honest plan spans several ranges. A fixture whose honest resource was
+// itself 64 bytes would make the sybil's layout indistinguishable from the truth, and every test below
+// would pass while proving nothing.
+const HONEST_SIZE: usize = 4096;
+const HONEST_CHUNKS: usize = 8;
+
+/// The sybil of #1670: a self-consistent 64-byte layout under the CORRECT root, declaring the honest shape
+/// in the cheap availability answer and lying only in the range frame.
+///
+/// `AvailabilityClaim::Honest` is the load-bearing choice. Its two channels DISAGREE, so nothing built from
+/// what holders declare can separate it from an honest holder — which is precisely why the attributability
+/// vote that once tried to is gone. It remains the right double for the baseline tests: it is adoptable, it
+/// is refuted only by the chain anchor, and it denies the read.
+fn layout_sybil() -> Behavior {
+    Behavior::ShortLayout {
+        total_length: 64,
+        chunk_lens: vec![64],
+        availability: AvailabilityClaim::Honest,
+    }
+}
+
+/// Honest content + a verifier bound to its true leaf — the chain anchor, and the only check that can
+/// refute an adopted layout.
+fn anchored_fixture() -> (MockContent, Arc<dyn Verifier>) {
+    let content = MockContent::even(HONEST_SIZE, HONEST_CHUNKS);
+    let verifier: Arc<dyn Verifier> = Arc::new(MerkleVerifier::with_proof_verifier(Arc::new(
+        OnlyLeaf(MerkleVerifier::resource_leaf(&content.bytes)),
+    )));
+    (content, verifier)
+}
+
+#[tokio::test]
+async fn a_lone_honest_holder_is_probed_exactly_once() {
+    // The no-degradation property. Quorum is an ordering hint and never a gate, so a resource with ONE
+    // holder must behave exactly as it did before any of this existed: one probe, no extra round trips,
+    // no agreement threshold to fail.
+    let (content, verifier) = anchored_fixture();
+    // The premise `metadata_probes` rests on: a planned range covers at least one whole chunk, so no
+    // planned range can be 1 byte and the 1-byte probe is unambiguous.
+    assert!(
+        content.chunk_lens.iter().all(|&len| len > 1),
+        "the probe counter distinguishes probes by length == 1"
+    );
+
+    let transport = Arc::new(MockRangeTransport::new(content.clone()));
+    let cid = mock_content_id();
+    let dl = downloader(
+        transport.clone(),
+        Arc::new(MockProviderLocator::fixed(vec![mock_provider(1, &cid)])),
+        Arc::new(InMemoryStateStore::new()),
+        verifier,
+        test_config(1024),
+    );
+
+    let sink = Arc::new(InMemorySink::new());
+    let total = join_ok(dl.download(cid, sink.clone(), DownloadOptions::default()))
+        .await
+        .expect("a single honest holder must still serve the whole resource");
+    assert_eq!(total, HONEST_SIZE as u64);
+    assert_eq!(sink.contents().await, content.bytes);
+    assert_eq!(
+        transport.metadata_probes().await,
+        1,
+        "exactly ONE metadata probe — a lone holder pays nothing for any of the adoption machinery"
+    );
+}
+
+#[tokio::test]
+async fn a_layout_needing_a_paged_prologue_is_named_as_a_reader_limit_not_a_generic_failure() {
+    // The Part C honesty fix. A holder whose first frame declares a `chunk_count` larger than the entries
+    // it carries has a layout that needs a paged prologue, which this reader does not reassemble yet.
+    // Before this it surfaced as an all-holders-failed `NotFound`, which reads as "nobody has this
+    // content" — the ambiguity that cost four #1586 investigations.
+    //
+    // The error deliberately does NOT accuse the holder of failing to page. The metadata probe asks for a
+    // 1-byte range and so stops after the first frame, which means a conforming pager and a holder that
+    // would never have paged are INDISTINGUISHABLE from here. Naming it as a holder fault would blame a
+    // peer that did nothing wrong — the false-attribution class, arrived at from the reviewer's finding
+    // that the earlier phrasing handed a conforming sender a protocol-violation verdict.
+    let content = MockContent::even(HONEST_SIZE, HONEST_CHUNKS);
+    let transport = Arc::new(MockRangeTransport::new(content.clone()));
+    let cid = mock_content_id();
+    transport
+        .set_behavior(
+            &mock_peer_hex(1),
+            Behavior::UnderDeliveredPrologue {
+                declared_chunk_count: 5_000,
+            },
+        )
+        .await;
+    let dl = downloader(
+        transport.clone(),
+        Arc::new(MockProviderLocator::fixed(vec![mock_provider(1, &cid)])),
+        Arc::new(InMemoryStateStore::new()),
+        Arc::new(MerkleVerifier::insecure_structural_only()),
+        test_config(1024),
+    );
+
+    let sink = Arc::new(InMemorySink::new());
+    let result = join_ok(dl.download(cid, sink.clone(), DownloadOptions::default())).await;
+    let Err(DownloadError::MetadataProbeFailed { reasons, .. }) = &result else {
+        panic!("an unassemblable layout must be reported as such; got {result:?}");
+    };
+    // Compared against the WHOLE rendered error rather than fragments of it. A substring check on a phrase
+    // that must be present, plus a negative check on a phrase that must be absent, both pass for wordings
+    // nobody intended — and the negative form is the weaker of the two, since it only rules out one way of
+    // saying the wrong thing. Pinning the full Display output makes any reword a deliberate edit here.
+    let expected = DownloadError::PagedPrologueUnsupported {
+        provider: mock_peer_hex(1),
+        chunk_count: 5_000,
+        delivered: HONEST_CHUNKS as u64,
+    }
+    .to_string();
+    assert!(
+        reasons[0].contains(&expected),
+        "the failure must render exactly as the typed error — naming what THIS READER could not do, and \
+         both counts so the gap is visible.\n  expected: {expected}\n  got:      {reasons:?}"
+    );
+}
+
+/// Candidates are probed in DISCOVERY's order: no declaration, and no silence, buys a position.
+///
+/// The honest holder is placed FIRST by the locator and must stay there, so this costs exactly one probe.
+/// Three sybils that declare NOTHING are the sharpest form of the property, because silence is the cheapest
+/// claim available: an ordering keyed on declared shape sorted them to the minimum key while being the one
+/// group its own demotion could never act on, which is what made silence beat lying. There is no such
+/// ordering now, and this is the regression guard against one returning.
+#[tokio::test]
+async fn candidates_are_probed_in_discovery_order_so_no_claim_buys_a_position() {
+    let (content, verifier) = anchored_fixture();
+    let transport = Arc::new(MockRangeTransport::new(content.clone()));
+    let cid = mock_content_id();
+    for peer in 2u8..=4 {
+        transport
+            .set_behavior(
+                &mock_peer_hex(peer),
+                Behavior::ShortLayout {
+                    total_length: 64,
+                    chunk_lens: vec![64],
+                    availability: AvailabilityClaim::Silent,
+                },
+            )
+            .await;
+    }
+    let dl = downloader(
+        transport.clone(),
+        Arc::new(MockProviderLocator::fixed(
+            (1u8..=4).map(|n| mock_provider(n, &cid)).collect(),
+        )),
+        Arc::new(InMemoryStateStore::new()),
+        verifier,
+        test_config(1024),
+    );
+    let sink = Arc::new(InMemorySink::new());
+    let total = join_ok(dl.download(cid, sink.clone(), DownloadOptions::default()))
+        .await
+        .expect(
+            "declaring nothing must not buy a position; silence is the cheapest claim there is",
+        );
+    assert_eq!(total, HONEST_SIZE as u64);
+    assert_eq!(sink.contents().await, content.bytes);
+    assert_eq!(
+        transport.metadata_probes().await,
+        1,
+        "an undeclared shape must never outrank a declared one"
+    );
+}
+
+/// A holder that accepts the metadata probe and then never answers must not pin the download.
+///
+/// The probe is the one fetch that runs before the scheduler exists, so nothing else could interrupt it:
+/// it was not wrapped in `range_timeout` and never polls the control channel, so `cancel()` could not
+/// reach it either. The job hung forever holding the `ActiveDownloads` claim, which makes its staging path
+/// both permanently GC-exempt and permanently un-downloadable.
+#[tokio::test]
+async fn a_holder_that_stalls_the_metadata_probe_cannot_pin_the_download() {
+    let (content, _) = anchored_fixture();
+    let transport = Arc::new(MockRangeTransport::new(content));
+    // Delays the PROBE as well as the ranges — the case the range-only delay deliberately excludes.
+    transport.set_delay(Duration::from_secs(30)).await;
+    let cid = mock_content_id();
+    let mut cfg = test_config(1024);
+    cfg.range_timeout = Some(Duration::from_millis(20));
+    let dl = downloader(
+        transport,
+        Arc::new(MockProviderLocator::fixed(vec![mock_provider(1, &cid)])),
+        Arc::new(InMemoryStateStore::new()),
+        Arc::new(MerkleVerifier::insecure_structural_only()),
+        cfg,
+    );
+    let sink = Arc::new(InMemorySink::new());
+    // `join_ok`'s own 10s bound is what fails a regression here instead of hanging the suite.
+    let result = join_ok(dl.download(cid, sink, DownloadOptions::default())).await;
+    let Err(DownloadError::MetadataProbeFailed { reasons, .. }) = &result else {
+        panic!("a stalled probe must end the download, not pin it; got {result:?}");
+    };
+    assert!(
+        reasons[0].contains("timed out"),
+        "and must name the timeout as the cause; got {reasons:?}"
+    );
+}
+
+// ---- layout adoption: what the restored baseline does, and what it deliberately does NOT ------
+//
+// #1670 stays OPEN. A holder positioned first in the provider order can declare a short but
+// self-consistent layout for the correct root, and the download will fail. The attributability + retry
+// mechanism that was meant to fix it is NOT here: every version of it had to vote over
+// `dig.getAvailability`'s `total_length` / `chunk_count`, which are OPTIONAL wire fields that cost a
+// keypair to forge and that honest holders legitimately omit — production dig-node sends neither at
+// capsule granularity. Each version produced a cheaper denial than the one it fixed, plus an egress
+// amplifier and a terminal error naming HONEST peers as culprits.
+//
+// So these tests pin the two things that must be true of the baseline: INTEGRITY holds against every
+// such holder, and no declaration by anyone can multiply the work a refutation costs. The second is the
+// regression guard against re-introducing an amplifier without the evidence to justify it.
+
+/// A first-position holder serving a self-consistent SHORT layout is REFUTED, and the download fails.
+///
+/// This is #1670, unfixed and pinned as such: the read is denied, repeatably, for the cost of a few bytes.
+/// What the test proves is the half that IS solid — integrity. The short layout passes every gate available
+/// at adoption time (the sum check and the root match, asserted below so the fixture cannot be proving the
+/// pre-existing rejection path instead), the download proceeds, and the chain-anchored leaf check refuses
+/// it. Nothing forged is ever promoted.
+///
+/// If this ever starts SUCCEEDING, #1670 has been fixed and this test should be replaced by one asserting
+/// how. If it starts failing with a different error, the anchored check is no longer what catches it.
+#[tokio::test]
+async fn a_first_position_short_layout_is_refuted_and_denies_the_read() {
+    let (content, verifier) = anchored_fixture();
+    assert!(
+        ResourceCommitment::from_first_frame(64, vec![64], Some(content.root.clone()), None)
+            .is_ok(),
+        "the short layout must be genuinely ADOPTABLE, or this exercises the wrong path"
+    );
+
+    let transport = Arc::new(MockRangeTransport::new(content.clone()));
+    let cid = mock_content_id();
+    transport
+        .set_behavior(&mock_peer_hex(1), layout_sybil())
+        .await;
+    let dl = downloader(
+        transport.clone(),
+        Arc::new(MockProviderLocator::fixed(
+            (1u8..=3).map(|n| mock_provider(n, &cid)).collect(),
+        )),
+        Arc::new(InMemoryStateStore::new()),
+        verifier,
+        test_config(1024),
+    );
+
+    let sink = Arc::new(InMemorySink::new());
+    let result = join_ok(dl.download(cid, sink.clone(), DownloadOptions::default())).await;
+    assert!(
+        matches!(result, Err(DownloadError::Verify(_))),
+        "a truncated-prefix layout must be caught by the chain-anchored check; got {result:?}"
+    );
+    assert!(
+        sink.contents().await.is_empty(),
+        "and the bytes it staged are discarded, so a later attempt does not read them back"
+    );
+}
+
+/// A refutation adopts a layout exactly ONCE. Asserted on the PROBE COUNT, because that is the only
+/// instrument that discriminates.
+///
+/// # The fetch count does not discriminate, and a previous version of this test proved it
+///
+/// This began as a fetch-count assertion (`<= 10`) against a fixture of three corrupt holders plus one
+/// dissenting record. The security gate restored the entire removed mechanism — `refutable_layout_source`,
+/// the retry loop and its budget — REJECTED-DESIGN: `max_commitment_attempts: 3` — kept the test, and
+/// measured **7 fetches / 1 probe on both
+/// the restored code and the shipped code**. It then built two further fixtures hunting a discriminator and
+/// got identical numbers again, and reported that no fetch-count fixture distinguishes them.
+///
+/// The cause was the fixture, not the bound. `Behavior::Corrupt` declares the TRUE shape, so three corrupt
+/// holders backed the refuted shape 3-to-1 against the single rival, the removed minority rule computed
+/// `refuted_backing >= best_rival`, declined to attribute, and returned terminally in one attempt with no
+/// extra fetches at all. The guard never reached the branch it existed to catch.
+///
+/// Two further reasons that fixture was worse than merely weak, worth stating so the mistake is not
+/// repeated: its `AvailabilityClaim` noise is **inert by construction**, since nothing in production reads
+/// availability's shape fields any more and varying them cannot change shipped behaviour; and its headroom
+/// was baseline 7 against a bound of 10, deterministic in practice but with a theoretical worst case near
+/// 37 — loose where it did not matter and tight where it did.
+///
+/// # Why the probe count is structural
+///
+/// One metadata probe is issued per candidate tried, and candidates are tried inside `establish_commitment`,
+/// which a download without a retry loop calls exactly ONCE. So `probes == 1` says both "the first candidate
+/// seeded the layout" and "no second layout was ever adopted" — the second being the invariant that the
+/// removed mechanism violated by construction. It is independent of the retry BUDGET, of how many ranges the
+/// resource has, and of how the declarations happen to fall.
+///
+/// # The fixture is built so the removed rule WOULD have retried
+///
+/// This is what the previous version got wrong. The layout is adopted from holder 1, which declares the true
+/// shape; holders 2 and 3 declare a short one. REJECTED-DESIGN: the refuted shape is backed 1-to-2, a
+/// strict MINORITY,
+/// which is exactly the condition under which the removed rule attributed the refutation, excluded holder 1
+/// and re-established. Restored, that path costs three probes; shipped, it costs one.
+#[tokio::test]
+async fn a_refutation_adopts_a_layout_exactly_once() {
+    let (content, verifier) = anchored_fixture();
+    let transport = Arc::new(MockRangeTransport::new(content.clone()));
+    let cid = mock_content_id();
+    // Holder 1 is FIRST, declares the true shape (so it seeds on the first probe), and serves corrupt bytes
+    // (so the anchored check refutes the assembly).
+    transport
+        .set_behavior(&mock_peer_hex(1), Behavior::Corrupt)
+        .await;
+    // Two holders declaring a DIFFERENT shape, out-declaring holder 1 two-to-one. This is what makes the
+    // refuted shape a minority and so makes the removed attribution rule fire.
+    for peer in 2u8..=3 {
+        transport
+            .set_behavior(
+                &mock_peer_hex(peer),
+                Behavior::ShortLayout {
+                    total_length: 64,
+                    chunk_lens: vec![64],
+                    availability: AvailabilityClaim::OwnShortShape,
+                },
+            )
+            .await;
+    }
+    let dl = downloader(
+        transport.clone(),
+        Arc::new(MockProviderLocator::fixed(
+            (1u8..=3).map(|n| mock_provider(n, &cid)).collect(),
+        )),
+        Arc::new(InMemoryStateStore::new()),
+        verifier,
+        test_config(1024),
+    );
+
+    let sink = Arc::new(InMemorySink::new());
+    let result = join_ok(dl.download(cid, sink.clone(), DownloadOptions::default())).await;
+    assert!(
+        matches!(result, Err(DownloadError::Verify(_))),
+        "forged content is refused as an integrity failure; got {result:?}"
+    );
+
+    // THE guard. Anything above 1 means a second layout was adopted.
+    assert_eq!(
+        transport.metadata_probes().await,
+        1,
+        "a download adopts a layout ONCE: more than one probe means a retry loop re-established the \
+         commitment, which is the mechanism removed here"
+    );
+    assert!(
+        sink.contents().await.is_empty(),
+        "and the bytes the refuted assembly staged are discarded"
+    );
+}
+
+/// A capsule-granularity read where EVERY honest holder is silent about the shape.
+///
+/// The case that broke the removed vote, and the sharper lesson from it: the harness could express a SILENT
+/// sybil but not a silent HONEST holder, and no test used `ContentId::Root`. Production dig-node populates
+/// `total_length` / `chunk_count` only at resource granularity, so at capsule granularity honest holders
+/// answer `{available}` alone — which the vote read as "nobody backs this shape" and turned into an
+/// attribution against them.
+///
+/// A CONTROL, not a proof, and worth labelling as such: with the vote removed there is no wrong
+/// implementation left for this to refute, so it cannot fail for the reason that motivated it. What it does
+/// earn is real coverage — no other test exercises `ContentId::Root` at all — and it fails loudly if any
+/// future change reintroduces a dependence on holders declaring a shape.
+///
+/// The lesson it records is about fixtures rather than about this code: silence was expressible as a SYBIL
+/// and never as an HONEST holder, which is why three designs in a row were tested against an adversary that
+/// declares and shipped against an honest population that does not.
+#[tokio::test]
+async fn a_capsule_read_from_silent_honest_holders_completes() {
+    let content = MockContent::even(HONEST_SIZE, HONEST_CHUNKS);
+    let transport = Arc::new(MockRangeTransport::new(content.clone()));
+    // `ContentId::Root` — capsule granularity, the production path where the shape fields are absent.
+    // 0xab repeated is the root `MockContent` reports, so the caller's requested generation matches what
+    // the holders serve — the root binding is a separate property, tested elsewhere.
+    let cid = dig_download::ContentId::root([1u8; 32], [0xabu8; 32]);
+    let dl = downloader(
+        transport.clone(),
+        Arc::new(MockProviderLocator::fixed(
+            (1u8..=2).map(|n| mock_provider(n, &cid)).collect(),
+        )),
+        Arc::new(InMemoryStateStore::new()),
+        Arc::new(MerkleVerifier::insecure_structural_only()),
+        test_config(1024),
+    );
+
+    let sink = Arc::new(InMemorySink::new());
+    let total = join_ok(dl.download(cid, sink.clone(), DownloadOptions::default()))
+        .await
+        .expect("a capsule read must not depend on holders declaring a shape");
+    assert_eq!(total, HONEST_SIZE as u64);
+    assert_eq!(sink.contents().await, content.bytes);
+}
+
+/// A holder that OMITS `root` must not have its layout adopted.
+///
+/// The root guard only fired when the request's root and the holder's were BOTH present, so a holder that
+/// simply said nothing skipped it — the same denial as a wrong root, reached by omitting the field instead
+/// of lying in it, and paid for with a whole wasted fetch before the anchored check caught it.
+#[tokio::test]
+async fn a_holder_that_states_no_generation_root_is_not_adopted() {
+    let (content, _) = anchored_fixture();
+    let transport = Arc::new(MockRangeTransport::new(content));
+    let cid = mock_content_id();
+    transport
+        .set_behavior(&mock_peer_hex(1), Behavior::NoRoot)
+        .await;
+    let dl = downloader(
+        transport.clone(),
+        Arc::new(MockProviderLocator::fixed(vec![mock_provider(1, &cid)])),
+        Arc::new(InMemoryStateStore::new()),
+        Arc::new(MerkleVerifier::insecure_structural_only()),
+        test_config(1024),
+    );
+    let sink = Arc::new(InMemorySink::new());
+    let result = join_ok(dl.download(cid, sink.clone(), DownloadOptions::default())).await;
+    let Err(DownloadError::MetadataProbeFailed { reasons, .. }) = &result else {
+        panic!("a root-less layout must be refused BEFORE the fetch; got {result:?}");
+    };
+    assert!(
+        reasons[0].contains("states no generation root"),
+        "the failure names the omission; got {reasons:?}"
+    );
+    assert!(
+        sink.contents().await.is_empty(),
+        "and nothing was fetched against it"
+    );
 }

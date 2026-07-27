@@ -69,6 +69,35 @@ caller:
   cannot belong to the requested range.
 - MUST capture the first frame's verification metadata (below) before any window check, so a
   metadata-only probe (`length = 1`) succeeds against any granularity.
+- MUST re-check every LATER frame against the identity the first frame declared, and MUST fail the fetch
+  on any disagreement. Reading the first frame and discarding the rest lets a holder declare an honest
+  shape on the frame the commitment binds to and a different one on every frame after it, and be believed
+  on the first — a revision nothing downstream can recover, because the commitment is already adopted.
+  The rule is over the CLASS of revision, not one direction of one field: a changed value MUST be
+  rejected, and so MUST a value that appears only on a later frame after the first frame left it unstated,
+  since that withholds it from the frame the reader binds to. A later frame that merely OMITS an identity
+  field asserts nothing and MUST be accepted. `chunk_index` is the exception: it is per-FRAME, so it may
+  advance but MUST NOT rewind (frames arrive in ascending `offset`). A reader MUST NOT enforce
+  `chunk_index` as invariant — doing so rejects every conforming multi-frame stream.
+- MUST reject a later frame that RESTATES a once-per-stream prologue field, whether or not it agrees.
+  Refusing the restatement rather than comparing it is what makes "the first frame said A, a later frame
+  said B" inexpressible instead of merely unpersuasive. The two prologue fields differ in what counts as a
+  restatement, and conflating them refuses conforming senders:
+  - `inclusion_proof` has NO paged form — there is only ever one proof — so ANY later frame carrying it is
+    restating.
+  - `chunk_lens` DOES have a paged form, so "MUST NOT be repeated" forbids re-covering entries an earlier
+    page already filled; it does NOT forbid a later frame from carrying the NEXT page. The field that
+    distinguishes them is `chunk_lens_offset`: a page whose offset is below the highest already-filled entry
+    (including an absent offset, which means 0) MUST be rejected, and a page at or above it is a conforming
+    continuation. An implementation MUST NOT read the rule as "only the first frame may carry `chunk_lens`":
+    that hands a conforming paging holder a protocol-violation verdict.
+- MUST terminate against a holder that streams without progressing. Every exit from the reassembly loop
+  depends on the window filling or the holder setting `complete`, so a non-final frame that does not extend
+  the assembled prefix — an empty payload, or a re-send of an already-written offset — MUST be rejected. The
+  rule is over the CLASS (a frame that extends nothing), not over the empty-payload instance of it, because
+  a re-send carries real bytes and advances just as little. Otherwise a holder streams indefinitely on a few
+  dozen bytes per frame while the download holds its staging claim, making that staging path both permanently
+  GC-exempt and permanently un-downloadable.
 
 A range's frames additionally carry whole-resource verification metadata, and it splits into **two
 sets with different rules** — conforming to the wrong one produces a verification miss on a
@@ -95,7 +124,9 @@ per-chunk AES-GCM-SIV needs the whole array — so a partial array is not a degr
 that decrypts every chunk to garbage. The sum check in section 4 ("`chunk_lens` MUST sum to
 `total_length`") is what enforces this: a single page of a paged prologue sums short and is rejected.
 Reassembling a paged prologue across frames is NOT yet implemented by this crate; such a resource is
-refused rather than mis-read.
+refused rather than mis-read, and the refusal is NAMED: a holder that declares a `chunk_count` larger
+than the number of `chunk_lens` entries it delivers MUST be rejected as `PagedPrologueUnsupported` — reporting it
+as a generic all-holders-failed result cannot be told apart from "nobody holds this content".
 
 ---
 
@@ -106,10 +137,11 @@ An implementation MUST perform, in order:
 1. **Guard** — reject a bare `Store` content id (`NotDownloadable`).
 2. **Discover** — `ProviderLocator::find_providers(content)` returns candidate holders.
 3. **Confirm** — `dig.getAvailability` per candidate; keep only confirmed holders. Zero confirmed
-   holders after discovery ⇒ `DownloadError::NotFound`. A `NotFound`'s `content` MUST name the step
-   that failed — `no providers located for …` (discovery/confirm found nobody) versus
-   `could not read resource metadata for … — the metadata probe failed on all N confirmed holder(s)`
-   (§4) — so a probe failure is never reported as a discovery miss.
+   holders after discovery ⇒ `DownloadError::NotFound`, whose `content` MUST say `no providers located
+   for …`. A holder set that IS confirmed but cannot seed a layout is a different step and MUST use the
+   distinct `MetadataProbeFailed` (§4), so a probe failure is never reported as a discovery miss. The
+   confirm step also RETAINS each holder's declared `total_length` / `chunk_count` for §4's adoption
+   order rather than reading only `available`.
 4. **Establish the commitment** (§4) — unless resumed from persisted state.
 5. **Plan** (§5) — partition the resource into chunk-aligned ranges; mark resume-done ranges done.
 6. **Schedule** (§6) — fan ranges across holders concurrently, verify (§7) each, retry/rebalance.
@@ -120,9 +152,17 @@ An implementation MUST perform, in order:
 
 ## 4. The resource commitment
 
-The `ResourceCommitment { layout, total_length, root, inclusion_proof }` is the trusted per-resource
-metadata every range verifies against. It is established ONCE via a meta-probe (fetch a tiny range,
-read its first frame) and is then immutable for the life of the download.
+The `ResourceCommitment { layout, total_length, root, inclusion_proof }` is the
+per-resource metadata every range verifies against. It is established via a meta-probe (fetch a tiny
+range, read its first frame) and is immutable for the life of an ATTEMPT.
+
+**It is a PROVISIONAL hypothesis, not trusted metadata (normative framing).** Every gate below except the
+root binding compares fields the SAME unproven holder supplied, so a holder willing to lie consistently
+passes all of them; the root binding only proves the holder named the right generation. The single check
+that can refute an adopted layout is the chain-anchored whole-resource check of section 8, and it cannot
+run until the resource has been fetched against that layout. An implementation MUST NOT treat adoption as
+verification, and MUST NOT infer from a later refutation which holder was at fault — see the terminal-refutation
+requirement below for why that inference is not available.
 
 - **Declared-size ceiling (MUST — before anything is believed)** — a declared `total_length` above
   `max_resource_size` (default `DEFAULT_MAX_RESOURCE_SIZE`, 512 MiB) is REFUSED before the layout is
@@ -143,9 +183,49 @@ read its first frame) and is then immutable for the life of the download.
 - **Root binding to the request (MUST)** — before adopting a peer's first-frame metadata, an
   implementation MUST require the peer-reported `root` to equal the content-id's own generation `root`
   (for `Root` / `Resource` granularities; a bare store carries no root). A peer whose reported root
-  differs MUST be skipped, NOT adopted. This binds the plan's ground truth to the caller's request
-  rather than to whichever peer answers the meta-probe first. If no holder reports the requested root,
-  the commitment cannot be established ⇒ `NotFound`.
+  differs MUST be skipped, NOT adopted, and so MUST a holder that OMITS `root` entirely — a holder that
+  will not say which generation it serves cannot be checked against the request at all, and adopting it
+  costs a whole wasted fetch before the anchored check rejects it. This binds the plan's ground truth to
+  the caller's request
+  rather than to whichever peer answers the meta-probe first. If no holder can seed a layout, the failure
+  MUST be reported as `MetadataProbeFailed` — naming how many holders were probed and WHY each was
+  rejected — and MUST NOT be reported as `NotFound`: holders were found and confirmed, so "content not
+  found" names the wrong step.
+- **A whole-resource refutation is TERMINAL and attributes to nobody (MUST)** — when the chain-anchored
+  check of section 8 rejects an assembly, the download fails. An implementation MUST NOT exclude the holder
+  that supplied the layout, MUST NOT record its declared shape, and MUST NOT re-adopt a layout and retry.
+  - The reason is an absence of evidence, not a preference. Deciding whether the SHAPE or the BYTES were
+    wrong is not possible: per-range verification is length and alignment only, with no per-chunk hash, so
+    nothing in this protocol identifies which holder served bad bytes.
+  - **Standing in a vote over peer DECLARATIONS for that missing evidence is FORBIDDEN.** `total_length` and
+    `chunk_count` in a `dig.getAvailability` answer are OPTIONAL fields: an attacker forges one for the price
+    of a keypair and an announce, and an honest holder legitimately omits them — a conforming node populates
+    them only at resource granularity, so at capsule granularity the honest population is SILENT. Any rule
+    reading them is therefore decided by whoever chooses to declare. Three such rules were implemented and
+    each produced a cheaper denial than the one it replaced, together with an egress amplifier (measured at
+    up to one whole transfer per retry attempt, pulled from honest holders, triggered by one anonymous record
+    — measured as 5 range fetches becoming 15 and 19 on two fixtures) and a terminal error
+    naming honest peers as culprits.
+  - **Consequence, stated rather than hidden: #1670 is OPEN.** A holder positioned first in the provider
+    order can deny a read repeatably by declaring a short but self-consistent layout under the correct root.
+    Integrity is never at risk — the anchored check is exactly what catches it, and nothing unverified is
+    promoted — so this is availability only. Closing it requires per-chunk attribution, which is a format
+    change, not a scheduling change.
+- **Adoption ORDER (MUST be discovery's order)** — candidates MUST be probed in the order discovery produced.
+  Every confirmed holder MUST remain eligible to seed the layout, and a resource with exactly ONE holder MUST
+  be probed once and adopted immediately with no extra round trip. An implementation MUST NOT reorder
+  candidates on anything a peer declares, and MUST NOT impose an agreement THRESHOLD — a threshold fails
+  precisely when a resource has one honest holder, the normal state of newly published content.
+  - The general rule, which the three rejected attributability rules also violated: an ordering may DEMOTE a
+    candidate on evidence and MUST NEVER PROMOTE one on a declaration. "Eligible" is satisfied only nominally
+    by an order that never reaches a holder within the retry budget; eligible-but-unreachable is a gate in
+    effect. Ranking by the most-agreed declared shape, and ranking by declared-shape group SIZE with a key
+    tiebreak, are both specifically forbidden — and a holder that declares NOTHING MUST NOT outrank one that
+    declares something, since silence is the cheapest claim available.
+- **Probe bounding (MUST)** — the metadata probe MUST be bounded by the same per-fetch timeout as an ordinary
+  range fetch. It runs BEFORE the scheduler exists and does not poll the control channel, so nothing else can
+  interrupt it: an unbounded probe lets a holder that accepts the stream and then trickles frames pin the
+  download indefinitely while it holds the staging claim.
 - **Consistency of later ranges** — every subsequent range's first-frame `total_length` / `chunk_lens`
   / `root`, when present, MUST equal the commitment's; a mismatch is a `VerifyError::Metadata`
   (recoverable — the source is penalized and the range re-fetched).
@@ -201,9 +281,10 @@ is NEVER re-fetched (the resume invariant).
 - **Termination (MUST)** — the download MUST terminate. It ends with `NoProviders { needed }` when the
   provider set is exhausted (no live holder for a still-missing range, or the retry budget
   `ranges.len() × max_range_attempts` is exceeded), and with `Cancelled` on `cancel()`.
-- **Recoverable vs terminal** — `Transport`, `Verify`, and `Timeout` errors are recoverable per range
-  (retry elsewhere). `Sink`, `State`, `NoProviders`, `NotFound`, `NotDownloadable`, `Cancelled`,
-  `TaskEnded` are terminal for the download.
+- **Recoverable vs terminal** — `Transport`, `Verify`, `Timeout`, and `PagedPrologueUnsupported` errors are
+  recoverable per range/holder (retry elsewhere). `Sink`, `State`, `NoProviders`, `NotFound`,
+  `MetadataProbeFailed`, `NotDownloadable`, `Cancelled`, `TaskEnded` are terminal for the
+  download.
 
 ---
 
@@ -399,6 +480,9 @@ A provider record's candidate `host` is an IP **literal** (IPv4, IPv6, or v4-map
 
 ## 11. Progress and control
 
+`Planned` is emitted exactly ONCE per download: the resource layout is established once and never re-adopted,
+so `ranges_total` and `total_length` are fixed for the life of the download and byte progress is monotonic.
+
 A download exposes a live `DownloadEvent` stream (`Planned`, `RangeCompleted`, `RangeFailed`,
 `ProvidersRefreshed`, `Paused`, `Resumed`, `Completed`, `Failed`) and `pause()` / `resume()` /
 `cancel()` / `join()`. `pause` issues no new fetches (in-flight fetches finish, progress is
@@ -409,9 +493,25 @@ checkpointed); `cancel` ends the download with `Cancelled`.
 ## 12. Error catalogue (stable)
 
 `DownloadError`: `Transport { provider, reason }`, `Timeout { provider }`, `Verify(VerifyError)`,
-`NoProviders { needed }`, `NotFound { content }`, `Cancelled`, `State(reason)`, `Sink(reason)`,
-`NotDownloadable`, `TaskEnded`. `Transport`, `Timeout`, and `Verify` are recoverable per range; the
-rest are terminal.
+`NoProviders { needed }`, `NotFound { content }`, `MetadataProbeFailed { content, holders, reasons }`,
+`PagedPrologueUnsupported { provider, chunk_count, delivered }`,
+`Cancelled`, `State(reason)`, `Sink(reason)`,
+`NotDownloadable`, `TaskEnded`. `Transport`, `Timeout`, `Verify`, and `PagedPrologueUnsupported` are recoverable
+per range/holder; the rest are terminal. An error raised by the pure reassembly core carries an empty
+`provider` for the transport to ATTRIBUTE; the transport MUST fill it in rather than WRAP the error in a
+fresh `Transport`, since wrapping flattens the typed variants and makes the recoverability distinction above
+unobservable.
+
+The three named failures exist because a single generic "every holder failed" result cannot be acted on.
+`NotFound` MUST mean discovery found no holder. `MetadataProbeFailed` MUST mean holders WERE confirmed and
+none could seed a layout, and MUST carry the per-holder reason. A refutation by the chain anchor MUST surface
+as `Verify(VerifyError::Root)` (or `Length`), never re-described as a discovery or compatibility failure. An
+implementation MUST NOT collapse these into one error.
+
+`PagedPrologueUnsupported` names a READER limitation and MUST NOT be phrased as a holder fault. A holder
+paging its prologue is conforming, and the 1-byte metadata probe legitimately receives only the first page,
+so a conforming pager and a holder that would never have paged are indistinguishable from the adoption
+path — attributing it would blame a peer that did nothing wrong.
 
 `VerifyError`: `Length { expected, actual }`, `Metadata(reason)`, `Alignment(reason)`, `Root`,
 `MissingMetadata(reason)`. Every `VerifyError` is recoverable at the range level (the source is

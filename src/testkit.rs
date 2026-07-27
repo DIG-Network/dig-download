@@ -100,13 +100,11 @@ impl MockContent {
             Some((declared_total, declared_lens)) => (*declared_total, declared_lens.clone()),
             None => (self.bytes.len() as u64, self.chunk_lens.clone()),
         };
-        RangeMeta {
-            total_length: Some(total_length),
-            chunk_lens: Some(chunk_lens),
-            chunk_index: Some(self.chunk_index_at(offset)),
-            root: Some(self.root.clone()),
-            inclusion_proof: self.inclusion_proof.clone(),
-        }
+        let chunk_count = chunk_lens.len() as u64;
+        RangeMeta::default()
+            .declaring_layout(total_length, chunk_lens, chunk_count)
+            .declaring_anchor(self.root.clone(), self.inclusion_proof.clone())
+            .declaring_chunk_index(self.chunk_index_at(offset))
     }
 }
 
@@ -136,6 +134,80 @@ pub enum Behavior {
     /// metadata than the content-id's root — a peer trying to shape the commitment to a different
     /// (attacker-chosen) generation. Must be rejected before the commitment is adopted (HIGH #179).
     WrongRoot,
+    /// Declares a SHORT but internally self-consistent resource layout in its range frames, under the
+    /// CORRECT generation root, while serving honest bytes for whatever range it is asked for — the
+    /// #1670 layout-adoption sybil.
+    ///
+    /// This is the adversary the sum check cannot see: `total_length` genuinely equals the sum of
+    /// `chunk_lens`, and the root genuinely matches the caller's content id, so every gate available at
+    /// adoption time passes. Only the chain-anchored whole-resource check refutes it, long after the
+    /// layout has shaped the plan.
+    ///
+    /// # Why the availability claim is a SEPARATE, THREE-STATE field
+    ///
+    /// A double that cannot express the adversary reports every ranking as safe. This one was a `bool`,
+    /// and the missing third state hid a working exploit through three review rounds: a holder that simply
+    /// **omits** `total_length`/`chunk_count` from its cheap answer. Silence is strictly cheaper than
+    /// lying, and it is the variant that bypasses any rule whose rationale names a behaviour ("repeats the
+    /// lie in the cheap answer") — so the only holders such a rule can act on are the honest ones, which
+    /// do answer.
+    ///
+    /// The three states pick out three different adversaries, and each isolates a different property:
+    ///
+    /// - [`AvailabilityClaim::Honest`] — agrees in the cheap answer, lies only in the range frame. The
+    ///   strong adversary: no declaration-based ordering can tell it from an honest holder.
+    /// - [`AvailabilityClaim::OwnShortShape`] — repeats its lie, so it is an open dissenter.
+    /// - [`AvailabilityClaim::Silent`] — declares nothing at all.
+    ///
+    /// `total_length` is per-holder, so N sybils declaring N DISTINCT shapes is expressible by giving each
+    /// its own value — the shape-diversity exploit, where every group is a singleton and any size- or
+    /// key-based ranking falls through to a tiebreak the attacker chooses.
+    ShortLayout {
+        /// The `total_length` to declare (must equal the sum of `chunk_lens` to be adoptable).
+        total_length: u64,
+        /// The `chunk_lens` to declare.
+        chunk_lens: Vec<u64>,
+        /// What this holder says about the shape in its cheap `dig.getAvailability` answer.
+        availability: AvailabilityClaim,
+    },
+    /// Declares a `chunk_count` LARGER than the number of `chunk_lens` entries it delivers, and never
+    /// pages the rest — a holder whose prologue no conforming reader can complete.
+    ///
+    /// A layout too large to state on one frame is served as a paged prologue. A holder that declares the
+    /// full count and then pages nothing has served a layout that can never be assembled, which is a
+    /// distinct fault from serving one that is merely wrong and must be diagnosable as such.
+    UnderDeliveredPrologue {
+        /// The inflated `chunk_count` to declare.
+        declared_chunk_count: u64,
+    },
+    /// Serves correct bytes but OMITS the generation `root` from its frames.
+    ///
+    /// The root guard fired only when the request root and the holder's were BOTH present, so silence
+    /// skipped it. A double that can only serve a WRONG root cannot express that — which is why this is
+    /// its own behaviour rather than a variant of [`Behavior::WrongRoot`].
+    NoRoot,
+    /// Answers `dig.getAvailability` with `available: true` and then fails every `fetchRange`.
+    ///
+    /// Distinct from [`Behavior::AlwaysFail`], which reports itself UNAVAILABLE and so never becomes a
+    /// confirmed holder. This one is confirmed, counts as an un-excluded candidate, and still cannot seed
+    /// a layout — the cheapest way to make a retry find a candidate it cannot use.
+    AvailableThenRefuses,
+}
+
+/// What a [`Behavior::ShortLayout`] holder says about the resource shape in its cheap
+/// `dig.getAvailability` answer — a channel INDEPENDENT of what it serves in a range frame.
+///
+/// The two channels are separately attacker-controlled, which is exactly why they are modelled
+/// separately: a rule that reads one and acts on the other can be driven from whichever the attacker
+/// prefers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AvailabilityClaim {
+    /// Declares the TRUE shape, and lies only in the range frame.
+    Honest,
+    /// Declares its own short shape, so its two channels agree (an open dissenter).
+    OwnShortShape,
+    /// Declares NOTHING — omits `total_length` and `chunk_count` entirely. The cheapest claim there is.
+    Silent,
 }
 
 /// A mock [`RangeTransport`] serving [`MockContent`] with per-provider [`Behavior`], recording fetch
@@ -146,7 +218,11 @@ pub struct MockRangeTransport {
     behaviors: Mutex<HashMap<String, Behavior>>,
     provider_attempts: Mutex<HashMap<String, usize>>,
     offset_attempts: Mutex<HashMap<u64, usize>>,
+    /// How many 1-byte metadata probes have been served — see [`MockRangeTransport::metadata_probes`].
+    probe_count: Mutex<usize>,
     delay: Mutex<Option<std::time::Duration>>,
+    /// Whether the artificial delay also applies to the 1-byte metadata probe.
+    delay_probes: Mutex<bool>,
 }
 
 impl MockRangeTransport {
@@ -157,13 +233,27 @@ impl MockRangeTransport {
             behaviors: Mutex::new(HashMap::new()),
             provider_attempts: Mutex::new(HashMap::new()),
             offset_attempts: Mutex::new(HashMap::new()),
+            probe_count: Mutex::new(0),
             delay: Mutex::new(None),
+            delay_probes: Mutex::new(true),
         }
     }
 
-    /// Add an artificial per-fetch delay (so a test can reliably pause a download mid-flight).
+    /// Add an artificial per-fetch delay to EVERY fetch, including the metadata probe (so a test can
+    /// reliably pause a download mid-flight).
     pub async fn set_delay(&self, delay: std::time::Duration) {
         *self.delay.lock().await = Some(delay);
+        *self.delay_probes.lock().await = true;
+    }
+
+    /// Delay only the RANGE fetches, serving the metadata probe promptly.
+    ///
+    /// The probe is now bounded by `DownloadConfig::range_timeout` as well, so a blanket delay makes a
+    /// download fail at the probe and never schedule a range at all. A test about the RANGE timeout needs
+    /// the probe to get through, or it silently stops exercising the thing it names.
+    pub async fn set_range_delay(&self, delay: std::time::Duration) {
+        *self.delay.lock().await = Some(delay);
+        *self.delay_probes.lock().await = false;
     }
 
     /// Set `peer_id`'s behaviour (default [`Behavior::Honest`]).
@@ -182,6 +272,17 @@ impl MockRangeTransport {
             .get(peer_id)
             .copied()
             .unwrap_or(0)
+    }
+
+    /// How many METADATA PROBES have been made — the 1-byte fetches the orchestrator uses to read a
+    /// holder's declared layout, counted across all providers.
+    ///
+    /// Identified by `length == 1`, which separates a probe from a planned range **on the premise that no
+    /// planned range is 1 byte long**. That holds because a range always covers at least one whole chunk,
+    /// so any fixture whose chunks are larger than one byte satisfies it — assert it in the test if the
+    /// count is load-bearing there, rather than trusting the premise silently.
+    pub async fn metadata_probes(&self) -> usize {
+        *self.probe_count.lock().await
     }
 
     /// Total fetch attempts made for the range starting at `offset` (0 means never fetched — used to
@@ -213,7 +314,27 @@ impl RangeTransport for MockRangeTransport {
         items: Vec<AvailabilityItem>,
     ) -> Result<AvailabilityResponse, DownloadError> {
         let behavior = self.behavior(&provider.provider_peer_id).await;
+        // `AvailableThenRefuses` is deliberately HELD: its whole purpose is to be a confirmed candidate
+        // that cannot serve.
         let held = !matches!(behavior, Behavior::Unavailable | Behavior::AlwaysFail);
+        // What THIS holder claims the resource's shape is, on the cheap channel. `None` means the holder
+        // stayed SILENT — which the harness could not express before, and which is the cheapest way to
+        // sit outside any rule keyed on a declared shape.
+        let claimed: Option<(u64, u64)> = match &behavior {
+            Behavior::ShortLayout {
+                availability: AvailabilityClaim::Silent,
+                ..
+            } => None,
+            Behavior::ShortLayout {
+                total_length,
+                chunk_lens,
+                availability: AvailabilityClaim::OwnShortShape,
+            } => Some((*total_length, chunk_lens.len() as u64)),
+            _ => Some((
+                self.content.bytes.len() as u64,
+                self.content.chunk_lens.len() as u64,
+            )),
+        };
         let answers = items
             .iter()
             .map(|_| {
@@ -222,11 +343,15 @@ impl RangeTransport for MockRangeTransport {
                 } else {
                     AvailabilityAnswer::unavailable()
                 };
-                answer
+                let answer = answer
                     .with_roots(vec![self.content.root.clone()])
-                    .with_total_length(self.content.bytes.len() as u64)
-                    .with_chunk_count(self.content.chunk_lens.len() as u64)
-                    .with_complete(true)
+                    .with_complete(true);
+                match claimed {
+                    Some((total_length, chunk_count)) => answer
+                        .with_total_length(total_length)
+                        .with_chunk_count(chunk_count),
+                    None => answer,
+                }
             })
             .collect();
         Ok(AvailabilityResponse::new(answers))
@@ -250,15 +375,23 @@ impl RangeTransport for MockRangeTransport {
             .await
             .entry(req.offset)
             .or_insert(0) += 1;
+        if req.length == 1 {
+            *self.probe_count.lock().await += 1;
+        }
 
+        let is_probe = req.length == 1;
         if let Some(d) = *self.delay.lock().await {
-            tokio::time::sleep(d).await;
+            if !is_probe || *self.delay_probes.lock().await {
+                tokio::time::sleep(d).await;
+            }
         }
 
         let behavior = self.behavior(&peer).await;
         let fail = || DownloadError::transport(&peer, "mock: source failed");
         match behavior {
-            Behavior::Unavailable | Behavior::AlwaysFail => return Err(fail()),
+            Behavior::Unavailable | Behavior::AlwaysFail | Behavior::AvailableThenRefuses => {
+                return Err(fail())
+            }
             Behavior::DropAfter(n) if attempts > n => return Err(fail()),
             _ => {}
         }
@@ -290,9 +423,33 @@ impl RangeTransport for MockRangeTransport {
             _ => {}
         }
         let mut meta = self.content.meta(req.offset);
-        if matches!(behavior, Behavior::WrongRoot) {
-            // Report a root that differs from both the honest content root and the content-id root.
-            meta.root = Some("cd".repeat(32));
+        match &behavior {
+            Behavior::WrongRoot => {
+                // A root differing from both the honest content root and the content-id root.
+                meta.root = Some("cd".repeat(32));
+            }
+            Behavior::ShortLayout {
+                total_length,
+                chunk_lens,
+                ..
+            } => {
+                // The honest root is kept DELIBERATELY: a wrong root is already rejected before
+                // adoption, so a sybil that changes it never reaches the path under test.
+                meta = meta.declaring_layout(
+                    *total_length,
+                    chunk_lens.clone(),
+                    chunk_lens.len() as u64,
+                );
+            }
+            Behavior::UnderDeliveredPrologue {
+                declared_chunk_count,
+            } => {
+                meta.chunk_count = Some(*declared_chunk_count);
+            }
+            Behavior::NoRoot => {
+                meta.root = None;
+            }
+            _ => {}
         }
         Ok(FetchedRange {
             request_offset: req.offset,

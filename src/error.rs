@@ -136,6 +136,61 @@ pub enum DownloadError {
         content: String,
     },
 
+    /// Holders WERE located and confirmed, but not one of them could seed the resource layout. Terminal.
+    ///
+    /// This is the named replacement for reporting that outcome as a generic
+    /// [`NotFound`](Self::NotFound). The two failures are not the same event and must not read the
+    /// same: "nobody has this content" is a discovery result, while "several holders have it and every
+    /// one of them served metadata this reader cannot use" is a compatibility or hostility result, and
+    /// only the second is actionable by whoever operates the holders. Collapsing them cost four separate
+    /// #1586 investigations.
+    ///
+    /// `reasons` carries the per-holder cause, which was previously written to a `tracing::debug!` and
+    /// then dropped — so the one fact that identifies the fault survived only if debug logging happened
+    /// to be on.
+    #[error(
+        "no confirmed holder could seed the resource layout for {} — probed {holders}, all failed: {}",
+        sanitize_untrusted_text(content, MAX_ERROR_CONTEXT_CHARS),
+        sanitize_untrusted_text(&reasons.join("; "), MAX_ERROR_REASON_CHARS)
+    )]
+    MetadataProbeFailed {
+        /// The content id whose layout could not be established.
+        content: String,
+        /// How many confirmed holders were probed.
+        holders: usize,
+        /// One `peer_id: reason` line per probed holder, in probe order.
+        reasons: Vec<String>,
+    },
+
+    /// The resource's `chunk_lens` layout is delivered as a **paged prologue**, which this reader does
+    /// not yet reassemble. **Recoverable per holder**: the range is retried elsewhere and the adoption
+    /// path probes the next holder.
+    ///
+    /// # This names a READER limitation, not a holder fault
+    ///
+    /// Deliberately not phrased as an accusation, because this reader cannot tell the two apart and
+    /// guessing would blame a conforming peer. A holder paging its prologue is doing exactly what the
+    /// wire contract prescribes for a layout too large to state on one frame. Meanwhile the metadata
+    /// probe asks for a 1-byte range, so it legitimately receives only the FIRST page and stops — which
+    /// looks identical to a holder that declared a large `chunk_count` and then paged nothing. Since the
+    /// same observation has an innocent and a guilty explanation, the error reports what THIS reader
+    /// could not do.
+    ///
+    /// Reassembling the prologue across frames removes this error entirely (`SPEC.md` §2.2).
+    #[error(
+        "provider {} serves a {chunk_count}-entry chunk_lens layout as a paged prologue ({delivered} \
+         entries so far); this reader does not yet reassemble a paged prologue",
+        hex64_or_sentinel(provider, "peer-id")
+    )]
+    PagedPrologueUnsupported {
+        /// The provider `peer_id` (64-hex) whose layout could not be assembled.
+        provider: String,
+        /// The whole array's declared entry count.
+        chunk_count: u64,
+        /// How many entries had been delivered when the reader gave up.
+        delivered: u64,
+    },
+
     /// The download was cancelled via [`DownloadHandle::cancel`](crate::DownloadHandle::cancel).
     /// Terminal (by request).
     #[error("download cancelled")]
@@ -194,13 +249,50 @@ impl DownloadError {
 
     /// Whether this error is **recoverable per range** (the download can continue by retrying the
     /// range elsewhere) rather than terminal for the whole download.
+    ///
+    /// [`PagedPrologueUnsupported`](Self::PagedPrologueUnsupported) is recoverable for the same reason a
+    /// transport failure is: it rules out ONE holder's stream, not the content. The other new variants
+    /// are terminal — each already reports that every holder was tried.
     pub fn is_recoverable(&self) -> bool {
         matches!(
             self,
             DownloadError::Transport { .. }
                 | DownloadError::Verify(_)
                 | DownloadError::Timeout { .. }
+                | DownloadError::PagedPrologueUnsupported { .. }
         )
+    }
+
+    /// Fill in an as-yet-unattributed `provider` with the peer the failure came from, leaving every other
+    /// variant untouched.
+    ///
+    /// The pure reassembly core cannot know which peer it is reading, so it raises errors with an empty
+    /// `provider` for the transport layer to stamp. Stamping must not be done by WRAPPING, which is what
+    /// this replaced: re-wrapping every reassembly failure into a [`Transport`](Self::Transport) flattened
+    /// the typed ones, so a variant the reassembler raised deliberately — and that
+    /// [`is_recoverable`](Self::is_recoverable) treats specially — could never be observed by a caller.
+    ///
+    /// An already-attributed error is returned unchanged, so stamping twice cannot relabel a failure onto
+    /// the wrong peer.
+    pub fn attributed_to(self, peer_id: &str) -> Self {
+        match self {
+            DownloadError::Transport { provider, reason } if provider.is_empty() => {
+                DownloadError::Transport {
+                    provider: peer_id.to_string(),
+                    reason,
+                }
+            }
+            DownloadError::PagedPrologueUnsupported {
+                provider,
+                chunk_count,
+                delivered,
+            } if provider.is_empty() => DownloadError::PagedPrologueUnsupported {
+                provider: peer_id.to_string(),
+                chunk_count,
+                delivered,
+            },
+            other => other,
+        }
     }
 }
 

@@ -97,6 +97,23 @@ impl ResourceHasher {
 /// The default ceiling on a peer-DECLARED resource `total_length` — 512 MiB, the resource-side
 /// counterpart of [`DEFAULT_MAX_MODULE_SIZE`](crate::module::DEFAULT_MAX_MODULE_SIZE).
 ///
+/// # It is a HOST-MEMORY bound, not a statement about layout capability
+///
+/// Worth separating, because the two were once read as one number and the reading was wrong in a way
+/// that invited "fixing" this constant. This bounds how large a resource this host is willing to size a
+/// plan and a range buffer for. It says nothing about how large a resource the FRAMING can describe —
+/// that is a wire property, bounded by how many `chunk_lens` entries a stream can carry
+/// (dig-nat's `MAX_CHUNK_LENS_PER_FRAME`, paged to `MAX_RESOURCE_CHUNK_COUNT`), and it is owned by
+/// dig-nat rather than by this crate.
+///
+/// The two limits therefore move for different reasons and must not be reconciled by lowering this one.
+/// While the layout ceiling was one frame's worth of entries the framing was the tighter of the two, so
+/// a resource inside this bound could still be unreadable; the paged prologue lifts the layout ceiling
+/// far above 512 MiB, so the constraint that binds is once again this one — host memory — which is
+/// exactly what it was always for. Lowering it would ALSO be a real break: it is the `pub const`
+/// default of a public config field, so any deployment relying on it would silently start refusing
+/// resources it reads today.
+///
 /// The first frame's declared length sizes everything downstream of it (the plan, and the assembler's
 /// per-range buffer), and it arrives from a peer that has proven nothing yet, so it MUST be bounded
 /// before it is believed. Like the module bound, it is deliberately sized to what a modest host can
@@ -113,7 +130,30 @@ pub const DEFAULT_MAX_RESOURCE_SIZE: u64 = 512 * 1024 * 1024;
 /// Established from the first frame of the first fetched range (or an availability answer + the first
 /// frame). Immutable for the life of the download: a range whose first-frame metadata disagrees with
 /// this commitment is rejected as a different/forged generation.
+///
+/// # Adoption is NOT verification
+///
+/// Every gate available when a layout is adopted — the root match against the caller's content id, and the
+/// `chunk_lens`-sums-to-`total_length` consistency check — is satisfiable by a holder that lies consistently,
+/// because both compare fields the SAME untrusted holder supplied. Only [`Verifier::verify_resource_leaf`]
+/// binds the layout to the chain, and it cannot run until the whole resource has been fetched against that
+/// layout. So a commitment is a HYPOTHESIS about the resource's shape, and a holder positioned first in the
+/// provider order can therefore deny a read by declaring a short but self-consistent layout for the correct
+/// root (#1670, OPEN).
+///
+/// That denial is not fixable from here. Attributing the later refutation to the holder that supplied the
+/// layout requires distinguishing "the shape was wrong" from "the bytes were wrong", and nothing in the
+/// system can: per-range verification is length and alignment only, with no per-chunk hash. Three successive
+/// attempts to stand a vote over peer DECLARATIONS in for that missing evidence each produced a cheaper
+/// denial than the one they replaced, because those declarations are optional wire fields that cost an
+/// attacker a keypair to forge and that honest holders legitimately omit. #1670 is re-scoped onto per-chunk
+/// attribution, which is the only thing that can name a bad holder.
+///
+/// `#[non_exhaustive]`: the adoption path is expected to gain provenance once that evidence exists. Build one
+/// with [`from_first_frame`](Self::from_first_frame) or
+/// [`from_first_frame_bounded`](Self::from_first_frame_bounded).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ResourceCommitment {
     /// The chunk boundaries (`chunk_lens` → offsets).
     pub layout: ChunkLayout,

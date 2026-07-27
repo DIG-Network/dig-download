@@ -20,20 +20,89 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::error::DownloadError;
 
-/// The verification metadata a range's **first frame** carries (L7 §9): the whole-resource shape a
-/// downloader uses to establish or check the [`ResourceCommitment`](crate::verify::ResourceCommitment).
+/// The verification metadata a range's frames carry (L7 §9): the whole-resource shape a downloader
+/// uses to establish or check the [`ResourceCommitment`](crate::verify::ResourceCommitment).
+///
+/// # Read this as "the stream's declared identity", not "frame 1's fields"
+///
+/// [`total_length`](Self::total_length), [`chunk_lens`](Self::chunk_lens),
+/// [`chunk_count`](Self::chunk_count) and [`root`](Self::root) describe the WHOLE resource, so every
+/// frame of a conforming stream repeats the same values. [`assemble_range_stream`] therefore captures
+/// them from the first frame and RE-CHECKS every later frame against them — a holder that revises its
+/// declared shape mid-stream is rejected rather than silently believed on whichever frame arrived
+/// first. [`chunk_index`](Self::chunk_index) is the one field that legitimately varies per frame; see
+/// its own note.
+///
+/// `#[non_exhaustive]`: the L7 range preamble gains optional fields as the wire grows (`chunk_count`
+/// and the paged prologue are recent additions), and each one arrives here. Build one with
+/// [`from_frame`](Self::from_frame) or from [`Default`] plus the `declaring_*` setters.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct RangeMeta {
     /// The full resource ciphertext length.
     pub total_length: Option<u64>,
-    /// Per-chunk ciphertext lengths of the whole resource, in order.
+    /// Per-chunk ciphertext lengths of the whole resource, in order. For a resource whose layout is
+    /// too large to state on one frame this is one PAGE of the array rather than all of it — which is
+    /// why [`chunk_count`](Self::chunk_count) exists to say how many entries the whole array has.
     pub chunk_lens: Option<Vec<u64>>,
-    /// Index into `chunk_lens` of the first chunk in the range.
+    /// How many entries the whole resource's `chunk_lens` array has.
+    ///
+    /// Present so a reader can tell a COMPLETE single-frame layout from one page of a paged prologue:
+    /// `chunk_lens.len() < chunk_count` means the array continues on later frames. Absent means the
+    /// holder declared no count, and `chunk_lens` is taken to be the whole array (the pre-paging
+    /// shape, which stays readable — §5.1).
+    pub chunk_count: Option<u64>,
+    /// Index into `chunk_lens` of the first chunk in THIS frame.
+    ///
+    /// Unlike the other fields this is per-frame, not per-resource: a chunk-aligned continuation frame
+    /// states where it begins. Frames arrive in ascending byte offset, so the declared index is
+    /// non-decreasing across a conforming stream.
     pub chunk_index: Option<u64>,
     /// The chain-anchored generation root (64-hex).
     pub root: Option<String>,
     /// The whole-resource merkle inclusion proof (base64), or `None` for a capsule.
     pub inclusion_proof: Option<String>,
+}
+
+impl RangeMeta {
+    /// The verification metadata one [`RangeFrame`] declares.
+    pub fn from_frame(frame: &RangeFrame) -> Self {
+        RangeMeta {
+            total_length: frame.total_length,
+            chunk_lens: frame.chunk_lens.clone(),
+            chunk_count: frame.chunk_count,
+            chunk_index: frame.chunk_index,
+            root: frame.root.clone(),
+            inclusion_proof: frame.inclusion_proof.clone(),
+        }
+    }
+
+    /// Declare the whole-resource shape (`total_length` + `chunk_lens` + the array's `chunk_count`).
+    /// The `#[non_exhaustive]` construction path for a test fixture or a non-dig-nat transport.
+    pub fn declaring_layout(
+        mut self,
+        total_length: u64,
+        chunk_lens: Vec<u64>,
+        chunk_count: u64,
+    ) -> Self {
+        self.total_length = Some(total_length);
+        self.chunk_count = Some(chunk_count);
+        self.chunk_lens = Some(chunk_lens);
+        self
+    }
+
+    /// Declare the chain anchor (`root` + the whole-resource `inclusion_proof`).
+    pub fn declaring_anchor(mut self, root: String, inclusion_proof: Option<String>) -> Self {
+        self.root = Some(root);
+        self.inclusion_proof = inclusion_proof;
+        self
+    }
+
+    /// Declare which chunk of the resource this frame's bytes begin at.
+    pub fn declaring_chunk_index(mut self, chunk_index: u64) -> Self {
+        self.chunk_index = Some(chunk_index);
+        self
+    }
 }
 
 /// A fetched, reassembled byte range: the assembled ciphertext for the requested `[offset, offset+len)`
@@ -143,14 +212,167 @@ impl SourceTracker {
     }
 }
 
+/// The whole-resource identity a range stream declared on its FIRST frame, enforced against every
+/// later frame of the same stream.
+///
+/// # Why a later frame has to be checked at all
+///
+/// The L7 frame contract splits its optional fields in two (dig-nat `mux.rs`, `SPEC.md` §5.1.1):
+/// `total_length` / `root` / `chunk_count` / `chunk_index` are **identity — every frame**, while
+/// `chunk_lens` / `inclusion_proof` are **prologue — once per stream** and MUST NOT be repeated.
+/// Reading only frame 1 and discarding the rest, as this reader used to, means a holder can declare an
+/// honest shape on the frame the commitment binds to and a different one on every frame after it, and
+/// be believed on the first. Nothing downstream recovers that: the commitment was already adopted.
+///
+/// # The rule is over the class, not over one behaviour
+///
+/// A revision is a revision whichever direction it goes and whichever field carries it, so this rejects
+/// **any** disagreement with frame 1 — a changed value, and equally a value APPEARING on a later frame
+/// that frame 1 left unstated, since the reader binds to frame 1 and a late arrival is information it
+/// deliberately withheld from the frame that mattered. A later frame that simply OMITS an identity field
+/// is allowed: it asserts nothing, so there is nothing to disbelieve, and refusing it would reject a
+/// holder whose only fault is terseness while gaining no property.
+#[derive(Debug, Default)]
+struct StreamIdentity {
+    root: Option<String>,
+    total_length: Option<u64>,
+    chunk_count: Option<u64>,
+    /// The highest `chunk_index` declared so far. Frames arrive in ascending byte offset and this names
+    /// the frame's own first chunk, so it may ADVANCE but never rewind — the one identity-adjacent
+    /// field that legitimately differs per frame.
+    highest_chunk_index: Option<u64>,
+    /// One past the last `chunk_lens` entry any accepted page has filled — the boundary that separates a
+    /// conforming NEXT page from a restatement of ground already covered.
+    prologue_frontier: u64,
+}
+
+/// What a conforming LATER frame turned out to be.
+#[derive(Debug, PartialEq, Eq)]
+enum LaterFrame {
+    /// A continuation carrying bytes and no prologue — the ordinary case.
+    Continuation,
+    /// A NEW `chunk_lens` page: conforming, and the next installment of a paged prologue.
+    NewProloguePage {
+        /// The entry the page begins at.
+        offset: u64,
+        /// How many entries it carries.
+        entries: usize,
+    },
+}
+
+impl StreamIdentity {
+    /// Capture the identity the stream's first frame declares.
+    fn from_first_frame(frame: &RangeFrame) -> Self {
+        let page_entries = frame.chunk_lens.as_ref().map_or(0, Vec::len) as u64;
+        StreamIdentity {
+            root: frame.root.clone(),
+            total_length: frame.total_length,
+            chunk_count: frame.chunk_count,
+            highest_chunk_index: frame.chunk_index,
+            prologue_frontier: frame
+                .chunk_lens_offset
+                .unwrap_or(0)
+                .saturating_add(page_entries),
+        }
+    }
+
+    /// Check one LATER frame against the captured identity, advancing the chunk-index and prologue
+    /// frontiers, and classify what the frame is.
+    ///
+    /// `Err` names the field and both values, because "the holder revised its declared shape" is only
+    /// actionable if the reader can say which declaration moved.
+    fn check_later_frame(&mut self, frame: &RangeFrame) -> Result<LaterFrame, String> {
+        check_unrevised("root", self.root.as_deref(), frame.root.as_deref())?;
+        check_unrevised("total_length", self.total_length, frame.total_length)?;
+        check_unrevised("chunk_count", self.chunk_count, frame.chunk_count)?;
+
+        // `inclusion_proof` is once-per-stream with NO paged form — there is only ever one proof — so any
+        // later frame carrying it is restating, whether or not it agrees. Refusing the restatement rather
+        // than comparing it is what makes "frame 1 said A, frame 5 said B" inexpressible instead of
+        // merely unpersuasive.
+        if frame.inclusion_proof.is_some() {
+            return Err("a later frame restates inclusion_proof, which is once-per-stream".into());
+        }
+
+        if let Some(index) = frame.chunk_index {
+            if let Some(highest) = self.highest_chunk_index {
+                if index < highest {
+                    return Err(format!(
+                        "chunk_index {index} rewinds below {highest}; frames arrive in ascending offset"
+                    ));
+                }
+            }
+            self.highest_chunk_index = Some(index);
+        }
+
+        // `chunk_lens` is the one prologue field WITH a paged form, so "MUST NOT be repeated" cannot be
+        // read as "only the first frame may carry it" — the wire contract explicitly has successive frames
+        // each carry a page, stamped with the offset it starts at. What is forbidden is restating ground
+        // already covered; what is prescribed is advancing past it. The field that tells those apart is
+        // `chunk_lens_offset`, so the rule is stated over it.
+        //
+        // Reading the ban as first-frame-only would hand a CONFORMING paging holder a protocol-violation
+        // verdict, and the paging work would then have to delete this branch outright. Classifying the
+        // frame instead means that work only changes what the CALLER does with a new page.
+        let Some(page) = &frame.chunk_lens else {
+            return Ok(LaterFrame::Continuation);
+        };
+        // Absent means "begins at 0" per the wire contract, which the first frame's page already covered,
+        // so an unstamped later page lands below the frontier and is caught here as the restatement it is.
+        let offset = frame.chunk_lens_offset.unwrap_or(0);
+        if offset < self.prologue_frontier {
+            return Err(format!(
+                "a later frame's chunk_lens page at offset {offset} re-covers entries below {}, which an \
+                 earlier page already filled; a paged prologue must ADVANCE, never restate",
+                self.prologue_frontier
+            ));
+        }
+        self.prologue_frontier = offset.saturating_add(page.len() as u64);
+        Ok(LaterFrame::NewProloguePage {
+            offset,
+            entries: page.len(),
+        })
+    }
+
+    /// How many `chunk_lens` entries the stream has delivered so far.
+    fn entries_delivered(&self) -> u64 {
+        self.prologue_frontier
+    }
+}
+
+/// Reject a later frame's `declared` value for an identity `field` unless it agrees with what the
+/// first frame `committed` — including the case where the first frame committed nothing at all.
+fn check_unrevised<T: PartialEq + std::fmt::Debug>(
+    field: &str,
+    committed: Option<T>,
+    declared: Option<T>,
+) -> Result<(), String> {
+    match (committed, declared) {
+        (_, None) => Ok(()), // asserts nothing
+        (Some(committed), Some(declared)) if committed == declared => Ok(()),
+        (Some(committed), Some(declared)) => Err(format!(
+            "{field} changed mid-stream: first frame declared {committed:?}, a later frame {declared:?}"
+        )),
+        (None, Some(declared)) => Err(format!(
+            "{field} {declared:?} appears only on a later frame; the first frame left it unstated"
+        )),
+    }
+}
+
 /// Reassemble a `dig.fetchRange` frame stream into `(bytes, meta)`: read [`RangeFrame`]s in ascending
 /// offset order, placing each frame's bytes at its (range-relative) offset and capturing the
-/// first-frame verification metadata. Stops on the frame marked `complete` or clean end-of-stream.
+/// stream's declared verification metadata. Stops on the frame marked `complete` or clean
+/// end-of-stream.
 ///
 /// Bounded by `max_len` (the expected range length) so a misbehaving peer cannot stream unbounded
 /// bytes into memory: a frame that overshoots the window is CLIPPED to it (servers answer at chunk
 /// granularity, so a 1-byte metadata probe is legitimately served a whole chunk), assembly stops as
 /// soon as the window is full, and only a frame starting at or beyond `max_len` is an error.
+///
+/// The returned [`RangeMeta`] is the FIRST frame's declaration, and every later frame is checked
+/// against it — a holder that revises `root` / `total_length` / `chunk_count`
+/// mid-stream, or restates the once-per-stream prologue, fails the whole fetch instead of being
+/// believed on frame 1. Nothing beneath this reader performs that check.
 ///
 /// This is the pure, network-free core of [`NatRangeTransport::fetch_range`] and is
 /// unit-tested by feeding encoded frames through an in-memory reader.
@@ -160,7 +382,10 @@ pub async fn assemble_range_stream<R: AsyncRead + Unpin>(
 ) -> Result<(Vec<u8>, RangeMeta), DownloadError> {
     let mut buf: Vec<u8> = Vec::new();
     let mut meta = RangeMeta::default();
-    let mut first = true;
+    let mut identity: Option<StreamIdentity> = None;
+    // One past the furthest byte any frame has contributed — the progress the termination guard at the
+    // bottom of the loop requires each non-final frame to advance.
+    let mut byte_frontier: u64 = 0;
     loop {
         let frame = RangeFrame::decode(reader)
             .await
@@ -171,15 +396,30 @@ pub async fn assemble_range_stream<R: AsyncRead + Unpin>(
         let Some(frame) = frame else {
             break; // clean end-of-stream
         };
-        if first {
-            meta = RangeMeta {
-                total_length: frame.total_length,
-                chunk_lens: frame.chunk_lens.clone(),
-                chunk_index: frame.chunk_index,
-                root: frame.root.clone(),
-                inclusion_proof: frame.inclusion_proof.clone(),
-            };
-            first = false;
+        match identity.as_mut() {
+            None => {
+                meta = RangeMeta::from_frame(&frame);
+                identity = Some(StreamIdentity::from_first_frame(&frame));
+            }
+            Some(identity) => {
+                let verdict = identity.check_later_frame(&frame).map_err(|reason| {
+                    DownloadError::Transport {
+                        provider: String::new(),
+                        reason,
+                    }
+                })?;
+                if let LaterFrame::NewProloguePage { .. } = verdict {
+                    // The holder is CONFORMING and this reader is the limitation, so the error says so
+                    // rather than blaming it. This is the single line the paged-prologue work replaces
+                    // with `ChunkLensAssembler::accept_page`, which is why the classification above is
+                    // written to survive that change instead of being deleted by it.
+                    return Err(DownloadError::PagedPrologueUnsupported {
+                        provider: String::new(),
+                        chunk_count: identity.chunk_count.unwrap_or_default(),
+                        delivered: identity.entries_delivered(),
+                    });
+                }
+            }
         }
         // A zero-length request asks for metadata ONLY (there is no window to place bytes in), so the
         // first frame's meta is all it wanted.
@@ -221,6 +461,29 @@ pub async fn assemble_range_stream<R: AsyncRead + Unpin>(
         if frame.complete || buf.len() as u64 >= max_len {
             break;
         }
+
+        // TERMINATION. Every loop exit above depends on the window filling or the holder saying it is
+        // done, so a frame that does neither and advances nothing lets the holder stream forever: a
+        // `{ offset: 0, bytes: [], complete: false }` frame with all identity omitted satisfies every
+        // check — omission is conforming by design — while `take` is 0 and `buf` never grows. A holder
+        // re-sending the SAME low offset does the same thing with non-empty bytes. Either one hangs the
+        // job on a few dozen bytes per frame, holding the staging claim that this crate's own comment
+        // calls the denial primitive the claim exists to prevent.
+        //
+        // The guard is over the CLASS — a frame that does not extend the assembled prefix — rather than
+        // over the empty-payload instance of it, so the re-send variant is caught by the same rule.
+        // Bytes arrive in ascending offset, so a conforming continuation always extends past the frontier.
+        if end as u64 <= byte_frontier {
+            return Err(DownloadError::Transport {
+                provider: String::new(),
+                reason: format!(
+                    "a frame at offset {} extends the range to {end}, past nothing (already at \
+                     {byte_frontier}), and does not complete it; the stream cannot progress",
+                    frame.offset
+                ),
+            });
+        }
+        byte_frontier = end as u64;
     }
     Ok((buf, meta))
 }
@@ -498,10 +761,11 @@ impl RangeTransport for NatRangeTransport {
         };
         let (bytes, meta) = assemble_range_stream(&mut stream, req.length)
             .await
-            .map_err(|e| {
-                // Re-stamp the (empty) provider on the reassembly error with the real provider id.
-                DownloadError::transport(&provider.provider_peer_id, e)
-            })?;
+            // ATTRIBUTE the reassembly error to this provider rather than WRAPPING it in a fresh
+            // `Transport`. Wrapping flattened every typed variant the reassembler raises deliberately —
+            // including `PagedPrologueUnsupported` — so a caller could never observe one, and the
+            // `is_recoverable` arm for it was unreachable.
+            .map_err(|e| e.attributed_to(&provider.provider_peer_id))?;
         // Drain any trailer so the mux stream closes cleanly — BOUNDED, so a peer that keeps the
         // stream open and streams filler after the last frame cannot exhaust our memory (MEDIUM
         // #179). Never read_to_end into an unbounded Vec.
@@ -521,13 +785,13 @@ mod tests {
     use dig_nat::PeerId;
 
     /// The generation root every conforming fixture frame is stamped with (64-hex, as the wire
-    /// requires). Identity travels on EVERY frame in dig-nat 0.13, so it is named once here rather
+    /// requires). Identity travels on EVERY frame since dig-nat 0.13, so it is named once here rather
     /// than re-spelled per fixture.
     fn test_root() -> String {
         "aa".repeat(32)
     }
 
-    /// Encode a fixture frame, surfacing the dig-nat 0.13 ceiling refusal as a test failure.
+    /// Encode a fixture frame, surfacing the dig-nat framing-ceiling refusal as a test failure.
     ///
     /// `RangeFrame::encode` became FALLIBLE in 0.13 (#1640): the encode side now refuses a frame a
     /// conforming decoder would have to reject. A fixture that trips it is a fixture bug, so the
@@ -908,7 +1172,8 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 
-    /// A resource whose layout does not fit ONE frame arrives as a dig-nat 0.13 **paged prologue**, and
+    /// A resource whose layout does not fit ONE frame arrives as a **paged prologue** (dig-nat 0.13 and
+    /// later), and
     /// dig-download does not yet reassemble the pages (tracked separately — obtaining a paged layout is a
     /// wire-shape decision, not a dependency bump). What must hold regardless is that the partial page is
     /// REFUSED rather than adopted: `chunk_lens` is a DECRYPT input, so a truncated array is not a
@@ -1017,5 +1282,480 @@ mod tests {
             err.is_recoverable(),
             "and it is RECOVERABLE, so the scheduler re-fetches the range elsewhere: {err}"
         );
+    }
+    // ---- mid-stream identity revision (Obligation 2 of #1668) ----------------------------------
+    //
+    // The truthful CONTROL for this whole group is `assemble_reassembles_ordered_frames` above: a
+    // conforming two-frame stream that RESTATES the identity set on its continuation frame and is
+    // accepted. Without it a guard that rejected every multi-frame stream would satisfy every
+    // rejection test below while breaking the reader outright.
+
+    /// A conforming two-frame stream, and the ONE later-frame field each test varies from it.
+    ///
+    /// Built as a pair so every rejection differs from an ACCEPTED stream by exactly one field. A
+    /// fixture assembled independently per test drifts, and then a rejection can no longer be
+    /// attributed to the field under test.
+    fn identity_pair() -> (RangeFrame, RangeFrame) {
+        let first = RangeFrame::data(0, b"ABC".to_vec())
+            .with_identity(test_root(), 6, 2)
+            .with_chunk_lens_page(0, vec![3, 3])
+            .with_chunk_index(0)
+            .with_inclusion_proof("proof");
+        let second = RangeFrame::data(3, b"DEF".to_vec())
+            .with_complete(true)
+            .with_identity(test_root(), 6, 2)
+            .with_chunk_index(1);
+        (first, second)
+    }
+
+    /// Assemble a two-frame stream and return the rejection reason, panicking if it was ACCEPTED.
+    async fn reject_reason(first: &RangeFrame, second: &RangeFrame) -> String {
+        let mut wire = encode(first);
+        wire.extend_from_slice(&encode(second));
+        let mut cur = std::io::Cursor::new(wire);
+        match assemble_range_stream(&mut cur, 6).await {
+            Err(DownloadError::Transport { reason, .. }) => reason,
+            other => panic!("a revised identity must be rejected; got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_later_frame_revising_the_root_is_rejected() {
+        let (first, mut second) = identity_pair();
+        second.root = Some("bb".repeat(32));
+        let reason = reject_reason(&first, &second).await;
+        assert!(
+            reason.contains("root changed mid-stream"),
+            "must name the revised field, not fail generically; got {reason}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_later_frame_revising_the_total_length_is_rejected() {
+        let (first, mut second) = identity_pair();
+        second.total_length = Some(7);
+        let reason = reject_reason(&first, &second).await;
+        assert!(
+            reason.contains("total_length changed mid-stream"),
+            "got {reason}"
+        );
+    }
+
+    /// A revised `chunk_count` is the case NOTHING beneath this reader catches: dig-nat's
+    /// `ChunkLensAssembler` is constructed with one count and never sees a later frame's declaration,
+    /// so if this check is absent the revision is simply invisible.
+    #[tokio::test]
+    async fn a_later_frame_revising_the_chunk_count_is_rejected() {
+        let (first, mut second) = identity_pair();
+        second.chunk_count = Some(3);
+        let reason = reject_reason(&first, &second).await;
+        assert!(
+            reason.contains("chunk_count changed mid-stream"),
+            "got {reason}"
+        );
+    }
+
+    /// Revising DOWNWARD, to pin the guard from BOTH sides.
+    ///
+    /// A check written as "the count may not grow" passes every test above and is bypassed by this one.
+    /// The property is that the declared shape may not CHANGE, in either direction.
+    #[tokio::test]
+    async fn a_later_frame_revising_the_chunk_count_downward_is_also_rejected() {
+        let (first, mut second) = identity_pair();
+        second.chunk_count = Some(1);
+        let reason = reject_reason(&first, &second).await;
+        assert!(
+            reason.contains("chunk_count changed mid-stream"),
+            "a revision is a revision in EITHER direction; got {reason}"
+        );
+    }
+
+    /// An identity field the first frame left UNSTATED, arriving later.
+    ///
+    /// The commitment binds to the first frame, so a holder that withholds a value from that frame and
+    /// supplies it afterwards has revised the declaration the reader actually bound to. A guard written
+    /// only as "the values must match" accepts this, because there is nothing to compare against.
+    #[tokio::test]
+    async fn an_identity_field_appearing_only_on_a_later_frame_is_rejected() {
+        let (mut first, second) = identity_pair();
+        first.chunk_count = None;
+        let reason = reject_reason(&first, &second).await;
+        assert!(
+            reason.contains("appears only on a later frame"),
+            "got {reason}"
+        );
+    }
+
+    /// A `chunk_lens` page RESTATING entries an earlier page already filled — rejected whether or not it
+    /// agrees.
+    ///
+    /// The guard is stated over `chunk_lens_offset`, not over "is this the first frame". The reader never
+    /// compares a restated page, it refuses the restatement, so "frame 1 said A, frame 5 said B" cannot be
+    /// expressed at all rather than merely being unpersuasive. The page HERE is byte-identical to the
+    /// first frame's, so agreement cannot be what saves it.
+    #[tokio::test]
+    async fn a_later_frame_restating_an_identical_chunk_lens_page_is_rejected() {
+        let (first, second) = identity_pair();
+        let second = second.with_chunk_lens_page(0, vec![3, 3]);
+        let reason = reject_reason(&first, &second).await;
+        assert!(
+            reason.contains("must ADVANCE, never restate"),
+            "an identical restatement is still a restatement; got {reason}"
+        );
+    }
+
+    /// An UNSTAMPED later page. Absent `chunk_lens_offset` means "begins at 0" per the wire contract, so
+    /// this restates ground the first frame's page already covered.
+    ///
+    /// Separate from the test above because the two reach the rule by different routes: that one states an
+    /// offset, this one omits it. A guard that only compared a PRESENT offset would let this through.
+    #[tokio::test]
+    async fn a_later_frame_carrying_an_unstamped_chunk_lens_page_is_rejected() {
+        let (first, mut second) = identity_pair();
+        second.chunk_lens = Some(vec![3, 3]);
+        second.chunk_lens_offset = None;
+        let reason = reject_reason(&first, &second).await;
+        assert!(
+            reason.contains("offset 0 re-covers entries below 2"),
+            "an unstamped page begins at 0, which is already filled; got {reason}"
+        );
+    }
+
+    /// A page that OVERLAPS rather than exactly repeating — the off-by-one variant of the same class.
+    ///
+    /// A guard written as "reject a page at an offset already seen" passes both tests above and is
+    /// bypassed here: offset 1 was never itself the start of a page, yet entry 1 is already filled. The
+    /// rule compares against the frontier, so partial overlap is caught the same way a duplicate is.
+    #[tokio::test]
+    async fn a_later_frame_whose_chunk_lens_page_partially_overlaps_is_rejected() {
+        let (first, second) = identity_pair();
+        let second = second.with_chunk_lens_page(1, vec![9]);
+        let reason = reject_reason(&first, &second).await;
+        assert!(
+            reason.contains("offset 1 re-covers entries below 2"),
+            "a partially overlapping page is a restatement too; got {reason}"
+        );
+    }
+
+    /// A CONFORMING next page — an advancing, non-overlapping `chunk_lens_offset` — must NOT be called a
+    /// protocol violation. This reader cannot reassemble it yet, and the error must say exactly that.
+    ///
+    /// This is the positive half of the paging rule and the reason the rule is written over
+    /// `chunk_lens_offset`. dig-nat's wire contract prescribes paging for a layout too large to state on
+    /// one frame ("successive frames each carry up to that many entries, stamped with the offset they
+    /// start at"), so "MUST NOT be repeated" forbids RESTATEMENT, not continuation. Reading it as
+    /// first-frame-only handed a conforming holder a `Transport` violation verdict, and the paged-prologue
+    /// work would then have had to DELETE the guard. Now that work replaces only what the caller does with
+    /// a recognised page.
+    #[tokio::test]
+    async fn a_conforming_next_chunk_lens_page_is_recognised_as_paging_not_a_violation() {
+        // A 4-chunk resource whose layout arrives in two pages: entries 0..2 on the first frame, 2..4 on
+        // the second. `chunk_count` (4) exceeds either page, which is what tells a reader to keep paging.
+        let first = RangeFrame::data(0, b"ABC".to_vec())
+            .with_identity(test_root(), 12, 4)
+            .with_chunk_lens_page(0, vec![3, 3])
+            .with_chunk_index(0)
+            .with_inclusion_proof("proof");
+        let second = RangeFrame::data(3, b"DEF".to_vec())
+            .with_complete(true)
+            .with_identity(test_root(), 12, 4)
+            .with_chunk_lens_page(2, vec![3, 3])
+            .with_chunk_index(1);
+        let mut wire = encode(&first);
+        wire.extend_from_slice(&encode(&second));
+        let mut cur = std::io::Cursor::new(wire);
+
+        match assemble_range_stream(&mut cur, 6).await {
+            Err(DownloadError::PagedPrologueUnsupported {
+                chunk_count,
+                delivered,
+                ..
+            }) => {
+                assert_eq!(chunk_count, 4, "the whole array's declared entry count");
+                assert_eq!(delivered, 4, "both pages were placed before the reader gave up");
+            }
+            other => panic!(
+                "a conforming next page must be reported as a READER limitation, never as a restatement \
+                 or a transport violation; got {other:?}"
+            ),
+        }
+    }
+
+    /// The typed error reaches a caller and is RECOVERABLE — so the holder is skipped, not the download.
+    ///
+    /// Pinned because the reassembly error used to be re-WRAPPED into a fresh `Transport` by
+    /// `fetch_range`, which flattened every typed variant: the `is_recoverable` arm for this one was
+    /// unreachable and the stable error catalogue promised a variant with no observable path.
+    #[tokio::test]
+    async fn the_paged_prologue_error_survives_provider_attribution_and_is_recoverable() {
+        let first = RangeFrame::data(0, b"ABC".to_vec())
+            .with_identity(test_root(), 12, 4)
+            .with_chunk_lens_page(0, vec![3, 3])
+            .with_chunk_index(0);
+        let second = RangeFrame::data(3, b"DEF".to_vec())
+            .with_complete(true)
+            .with_identity(test_root(), 12, 4)
+            .with_chunk_lens_page(2, vec![3, 3]);
+        let mut wire = encode(&first);
+        wire.extend_from_slice(&encode(&second));
+        let mut cur = std::io::Cursor::new(wire);
+
+        let raw = assemble_range_stream(&mut cur, 6)
+            .await
+            .expect_err("this reader cannot assemble a paged prologue");
+        let peer = "ab".repeat(32);
+        let attributed = raw.attributed_to(&peer);
+        let DownloadError::PagedPrologueUnsupported { provider, .. } = &attributed else {
+            panic!("attribution must not change the variant; got {attributed:?}");
+        };
+        assert_eq!(provider, &peer, "the peer it was read from is stamped in");
+        assert!(
+            attributed.is_recoverable(),
+            "one holder's unassemblable stream must not be terminal for the download"
+        );
+    }
+
+    // ---- termination against a holder that streams without progressing --------------------------
+
+    /// A holder streaming EMPTY non-final frames must be refused, not read forever.
+    ///
+    /// Every loop exit depends on the window filling or the holder setting `complete`, so a frame that
+    /// contributes no bytes and sets neither satisfies every other check — including the identity
+    /// re-check, because omitting identity is conforming by design — and advances nothing. Sustained on a
+    /// few dozen bytes per frame it pins the job while it still holds the staging claim, which makes the
+    /// staging path permanently GC-exempt and permanently un-downloadable.
+    ///
+    /// The test is bounded so a REGRESSION fails instead of hanging the suite: an unbounded reader would
+    /// otherwise consume the fixture and block, and a test that hangs reports nothing.
+    #[tokio::test]
+    async fn a_holder_streaming_empty_non_final_frames_is_refused() {
+        let first = RangeFrame::data(0, b"AB".to_vec())
+            .with_identity(test_root(), 64, 2)
+            .with_chunk_lens_page(0, vec![32, 32])
+            .with_chunk_index(0);
+        // A frame carrying nothing, declaring nothing, and not completing — every field a hostile holder
+        // is free to omit.
+        let empty = RangeFrame::data(0, Vec::new());
+        let mut wire = encode(&first);
+        for _ in 0..64 {
+            wire.extend_from_slice(&encode(&empty));
+        }
+        let mut cur = std::io::Cursor::new(wire);
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            assemble_range_stream(&mut cur, 64),
+        )
+        .await
+        .expect("the reader must REFUSE a non-progressing stream, not consume it");
+        let Err(DownloadError::Transport { reason, .. }) = outcome else {
+            panic!("a stream that cannot progress must be an error; got {outcome:?}");
+        };
+        assert!(
+            reason.contains("cannot progress"),
+            "and must say why; got {reason}"
+        );
+    }
+
+    /// The same guard, reached by a holder RE-SENDING bytes it already sent.
+    ///
+    /// This is the variant that slips past a rule aimed at the empty payload: the frame carries real bytes,
+    /// so a check on `bytes.is_empty()` accepts it, yet re-writing an already-written prefix advances the
+    /// assembled length by nothing and loops just as forever. The rule is therefore stated over the
+    /// frontier — the CLASS of frame that does not extend the prefix — not over the empty instance of it.
+    #[tokio::test]
+    async fn a_holder_resending_an_already_written_prefix_is_refused() {
+        let first = RangeFrame::data(0, b"AB".to_vec())
+            .with_identity(test_root(), 64, 2)
+            .with_chunk_lens_page(0, vec![32, 32])
+            .with_chunk_index(0);
+        let resend = RangeFrame::data(0, b"AB".to_vec());
+        let mut wire = encode(&first);
+        for _ in 0..64 {
+            wire.extend_from_slice(&encode(&resend));
+        }
+        let mut cur = std::io::Cursor::new(wire);
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            assemble_range_stream(&mut cur, 64),
+        )
+        .await
+        .expect("a re-sent prefix advances nothing and must be refused, not read forever");
+        assert!(
+            matches!(outcome, Err(DownloadError::Transport { .. })),
+            "got {outcome:?}"
+        );
+    }
+
+    /// The at-bound side: a frame that advances by ONE byte is progress and must be accepted.
+    ///
+    /// Without this the guard could be "reject any frame that does not fill the window" and both tests
+    /// above would still pass, while every real chunk-granular multi-frame holder broke. Progress is
+    /// progress however small.
+    #[tokio::test]
+    async fn a_frame_advancing_the_window_by_one_byte_is_accepted() {
+        let first = RangeFrame::data(0, b"A".to_vec())
+            .with_identity(test_root(), 3, 1)
+            .with_chunk_lens_page(0, vec![3])
+            .with_chunk_index(0);
+        let second = RangeFrame::data(1, b"B".to_vec());
+        let third = RangeFrame::data(2, b"C".to_vec()).with_complete(true);
+        let mut wire = encode(&first);
+        wire.extend_from_slice(&encode(&second));
+        wire.extend_from_slice(&encode(&third));
+        let mut cur = std::io::Cursor::new(wire);
+
+        let (bytes, _) = assemble_range_stream(&mut cur, 3)
+            .await
+            .expect("one byte at a time is slow, not hostile");
+        assert_eq!(bytes, b"ABC");
+    }
+
+    /// ATTRIBUTING and WRAPPING are not interchangeable: only one preserves the variant.
+    ///
+    /// `fetch_range` chooses between these two on a single line, and that call site is NOT covered by a
+    /// test — it needs real sockets and certificates, so it is one of the few genuinely untestable spots
+    /// in this crate. What is pinned here instead is the DIFFERENCE the choice makes, so a future edit that
+    /// swaps back to wrapping has a test stating exactly what it destroys.
+    #[tokio::test]
+    async fn wrapping_a_typed_error_loses_the_variant_that_attributing_keeps() {
+        let peer = "ab".repeat(32);
+        // Built twice rather than cloned: `DownloadError` is not `Clone` (the derive existed only for the
+        // removed re-adoption retry), and the two calls need separate owned values.
+        let typed = || DownloadError::PagedPrologueUnsupported {
+            provider: String::new(),
+            chunk_count: 4,
+            delivered: 4,
+        };
+
+        // Both halves matter and a weaker assertion misses one: dropping the variant's arm from
+        // `attributed_to` leaves it falling through to the catch-all, which PRESERVES the variant while
+        // silently failing to stamp the peer. Asserting only the variant would stay green on that.
+        match typed().attributed_to(&peer) {
+            DownloadError::PagedPrologueUnsupported { provider, .. } => assert_eq!(
+                provider, peer,
+                "attribution must fill the provider in, not merely keep the variant"
+            ),
+            other => panic!("attribution must leave the variant alone; got {other:?}"),
+        }
+        assert!(
+            matches!(
+                DownloadError::transport(&peer, typed()),
+                DownloadError::Transport { .. }
+            ),
+            "wrapping flattens it to Transport, so `is_recoverable` can no longer tell it apart and the \
+             stable error catalogue promises a variant no caller can ever match"
+        );
+    }
+
+    // ---- omit-tolerance: a TERSE holder is conforming --------------------------------------------
+    //
+    // `SPEC.md` 2.2 states normatively that a later frame OMITTING an identity field asserts nothing and
+    // must be accepted. Nothing tested it: `assemble_reassembles_ordered_frames` and both `identity_pair()`
+    // frames all call `.with_identity(...)`, so no fixture anywhere fed a later frame that leaves one out.
+    // Inverting the tolerant arm to an `Err` therefore left the whole suite green — vacuous, and exactly
+    // the one-sided pinning the rewind rule already avoids.
+
+    /// Assemble a two-frame stream whose continuation omits ONE identity field, and require success.
+    ///
+    /// Takes the field out of an otherwise-conforming frame, so the only difference from the accepted
+    /// control is the omission under test.
+    async fn assemble_with_terse_continuation(
+        strip: impl FnOnce(&mut RangeFrame),
+    ) -> Result<(Vec<u8>, RangeMeta), DownloadError> {
+        let (first, mut second) = identity_pair();
+        strip(&mut second);
+        let mut wire = encode(&first);
+        wire.extend_from_slice(&encode(&second));
+        let mut cur = std::io::Cursor::new(wire);
+        assemble_range_stream(&mut cur, 6).await
+    }
+
+    #[tokio::test]
+    async fn a_later_frame_omitting_the_root_is_accepted() {
+        let (bytes, meta) = assemble_with_terse_continuation(|f| f.root = None)
+            .await
+            .expect("a terse continuation asserts nothing and must be accepted");
+        assert_eq!(bytes, b"ABCDEF", "and its bytes still land in the window");
+        assert_eq!(
+            meta.root,
+            Some(test_root()),
+            "the stream's identity stays the FIRST frame's declaration"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_later_frame_omitting_the_total_length_is_accepted() {
+        let (bytes, meta) = assemble_with_terse_continuation(|f| f.total_length = None)
+            .await
+            .expect("a terse continuation asserts nothing and must be accepted");
+        assert_eq!(bytes, b"ABCDEF");
+        assert_eq!(meta.total_length, Some(6));
+    }
+
+    #[tokio::test]
+    async fn a_later_frame_omitting_the_chunk_count_is_accepted() {
+        let (bytes, meta) = assemble_with_terse_continuation(|f| f.chunk_count = None)
+            .await
+            .expect("a terse continuation asserts nothing and must be accepted");
+        assert_eq!(bytes, b"ABCDEF");
+        assert_eq!(meta.chunk_count, Some(2));
+    }
+
+    /// A continuation frame carrying NO metadata at all — the maximally terse conforming holder.
+    ///
+    /// The three tests above each omit one field; this omits every one at once, which is what a holder
+    /// that treats the identity set as first-frame-only actually sends. A guard that tolerated single
+    /// omissions but tripped on the combination would pass all three and fail here.
+    #[tokio::test]
+    async fn a_later_frame_omitting_every_identity_field_is_accepted() {
+        let (bytes, _) = assemble_with_terse_continuation(|f| {
+            f.root = None;
+            f.total_length = None;
+            f.chunk_count = None;
+            f.chunk_index = None;
+        })
+        .await
+        .expect("a bare continuation frame is conforming");
+        assert_eq!(bytes, b"ABCDEF");
+    }
+
+    #[tokio::test]
+    async fn a_later_frame_restating_the_inclusion_proof_is_rejected() {
+        let (first, second) = identity_pair();
+        let second = second.with_inclusion_proof("proof");
+        let reason = reject_reason(&first, &second).await;
+        assert!(reason.contains("restates inclusion_proof"), "got {reason}");
+    }
+
+    /// `chunk_index` is per-FRAME, not per-resource, so it may advance but never rewind — frames arrive
+    /// in ascending byte offset. Treating it as invariant would reject every conforming multi-frame
+    /// stream, which is why the control test above matters.
+    #[tokio::test]
+    async fn a_later_frame_rewinding_the_chunk_index_is_rejected() {
+        let (mut first, mut second) = identity_pair();
+        first.chunk_index = Some(1);
+        second.chunk_index = Some(0);
+        let reason = reject_reason(&first, &second).await;
+        assert!(reason.contains("rewinds below"), "got {reason}");
+    }
+
+    /// The other side of the rewind rule: an index that does NOT go backwards is accepted.
+    ///
+    /// A guard written as "reject any later chunk_index" passes the rewind test above and is caught only
+    /// here, so the bound is pinned from both sides. A repeated index is legal — a frame that does not
+    /// begin a new chunk restates the chunk it is inside.
+    #[tokio::test]
+    async fn a_later_frame_repeating_its_chunk_index_is_accepted() {
+        let (first, mut second) = identity_pair();
+        second.chunk_index = Some(0);
+        let mut wire = encode(&first);
+        wire.extend_from_slice(&encode(&second));
+        let mut cur = std::io::Cursor::new(wire);
+        let (bytes, _) = assemble_range_stream(&mut cur, 6)
+            .await
+            .expect("an equal chunk_index is not a rewind");
+        assert_eq!(bytes, b"ABCDEF");
     }
 }

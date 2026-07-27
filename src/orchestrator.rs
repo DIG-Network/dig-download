@@ -62,10 +62,17 @@ pub const DEFAULT_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
 /// Tuning for a download's scheduler + integrity + backoff.
 ///
 /// `Clone` is derived; `Debug` is hand-written to skip the non-`Debug` [`selector`](Self::selector)
-/// trait object. This struct is built via `..Default::default()`, so adding fields is a
-/// non-breaking (minor) change for the only in-tree consumer (dig-node) — an exhaustive struct
-/// literal elsewhere would break, but there is none.
+/// trait object.
+///
+/// `#[non_exhaustive]`: this struct was already documented as "built via `..Default::default()`, so
+/// adding fields is non-breaking" — a claim that held only for as long as nobody wrote an exhaustive
+/// literal. The attribute makes the documented intent MECHANICAL, so every future field really is a minor
+/// change instead of relying on a convention. Applied in the same breaking window as the attribute on
+/// [`RangeMeta`](crate::RangeMeta) and
+/// [`ResourceCommitment`](crate::verify::ResourceCommitment), rather than costing a second one.
+/// Construct with `DownloadConfig { window: …, ..Default::default() }`.
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct DownloadConfig {
     /// Target range size in bytes (a range packs whole chunks up to this; the node fetch window). A
     /// range is always ≥ one whole chunk. Default 3 MiB (the L7 node window).
@@ -443,6 +450,48 @@ impl Job {
         self.run_inner().await
     }
 
+    /// Drive the download: discover, establish the layout, plan, fetch, verify, promote.
+    ///
+    /// # A whole-resource refutation is TERMINAL and blames nobody
+    ///
+    /// When the chain-anchored check rejects the assembly, this download ends. It does not exclude the holder
+    /// that supplied the layout and does not re-adopt from another, because deciding whether the SHAPE or the
+    /// BYTES were wrong is not possible here: per-range verification is length and alignment only, with no
+    /// per-chunk hash, so nothing identifies which holder served bad bytes.
+    ///
+    /// A retry bounded by an attributability heuristic was built and REMOVED. Every version of that heuristic
+    /// had to vote over peer DECLARATIONS (`total_length` / `chunk_count` from `dig.getAvailability`), and
+    /// those are optional wire fields: an attacker forges one for the price of a keypair and an announce,
+    /// while honest holders legitimately omit them — production dig-node sends neither at capsule
+    /// granularity. Each version therefore produced a NEW denial cheaper than the one it fixed, and the last
+    /// bounded at three whole transfers out of honest peers — measured as 5 range fetches becoming 15 on one
+    /// fixture and 19 on another, the excess over 3x being ranges the lying record served and had refused —
+    /// plus a terminal error naming honest peers as
+    /// culprits, from a single anonymous record. Not shipping it is strictly not-worse-than-baseline; #1670 is
+    /// re-scoped onto per-chunk attribution, the only evidence that can name a holder.
+    ///
+    /// # The three rejected designs, recorded so #1670 does not rediscover them
+    ///
+    /// All three tried to decide, from what peers SAY, whether a refutation was the layout's fault. Each was
+    /// defeated by a cheaper attack than the one it fixed, and the progression is the useful part:
+    ///
+    /// - REJECTED-DESIGN: order candidates by the MODAL declared shape, so a sybil must carry the majority
+    ///   shape to keep an early position. Fabricating provider records costs no content, no keys and no race
+    ///   for position, so the majority shape is simply the attacker's and the retry budget is spent inside
+    ///   the colluding group. Measured: lying in the cheap answer PROMOTED the sybil.
+    /// - REJECTED-DESIGN: group by declared shape + demote refuted shapes + rank by size + interleave groups.
+    ///   Two bypasses: N sybils declaring N DISTINCT shapes make every group a singleton, so the key
+    ///   tiebreak decides the order and the attacker picks its key; and
+    ///   holders that declare NOTHING sit at the minimum key while being the one group a refuted-shape
+    ///   demotion can never act on. Silence beat lying.
+    /// - REJECTED-DESIGN: retry only when the refuted shape is a strict MINORITY of declared shapes. Honest
+    ///   holders are SILENT at capsule granularity, so the honest population declares nothing, one anonymous
+    ///   record becomes the only "rival" shape, and the refutation is attributed against honest peers.
+    ///
+    /// The invariant behind all three failures: **an ordering or attribution over free-to-forge OPTIONAL
+    /// declarations cannot stand in for evidence.** An ordering may DEMOTE on evidence and must never PROMOTE
+    /// on a declaration — and there is no evidence here, so there is no ordering: candidates are probed in
+    /// the order discovery produced.
     async fn run_inner(&mut self) -> Result<u64, DownloadError> {
         // Guard: a bare store id is not a downloadable byte stream.
         self.availability_item()?;
@@ -996,21 +1045,29 @@ impl Job {
     // ---- discovery + commitment --------------------------------------------------------------
 
     /// Locate holders and keep only those that confirm they hold the content (`dig.getAvailability`).
+    ///
+    /// The answer's `total_length` / `chunk_count` are deliberately NOT retained. They were, to feed a vote
+    /// on whether a refutation should be blamed on a holder; both fields are OPTIONAL on the wire and
+    /// production dig-node omits them entirely at capsule granularity, so honest holders are routinely
+    /// silent and any vote over them is decided by whoever bothers to declare. Reading only `.available`
+    /// keeps this leg free of a signal that cannot support a decision.
     async fn locate_and_confirm(&self) -> Result<Vec<ProviderRecord>, DownloadError> {
         let found = self.locator.find_providers(&self.content).await?;
         let item = self.availability_item()?;
         let mut confirmed = Vec::new();
         for p in found.iter().cloned() {
-            match self
+            let answered = self
                 .transport
                 .query_availability(&p, vec![item.clone()])
-                .await
-            {
-                Ok(resp) if resp.items.first().map(|a| a.available).unwrap_or(false) => {
-                    confirmed.push(p)
-                }
-                _ => {}
+                .await;
+            let Ok(resp) = answered else { continue };
+            let Some(answer) = resp.items.first() else {
+                continue;
+            };
+            if !answer.available {
+                continue;
             }
+            confirmed.push(p);
         }
         // The provider-index key the locate actually queried, beside what came back. A read that ends
         // with an empty candidate set is otherwise indistinguishable from one whose holders were all
@@ -1064,66 +1121,178 @@ impl Job {
         Ok(added)
     }
 
-    /// Establish the [`ResourceCommitment`] via a meta-probe: fetch a tiny range from a holder and
-    /// read the whole-resource `chunk_lens` / `total_length` / `root` from its first frame.
+    /// Establish the [`ResourceCommitment`] via a meta-probe: fetch a tiny range from a holder and read
+    /// the whole-resource `chunk_lens` / `total_length` / `root` from its first frame.
+    ///
+    /// Holders are probed in the order DISCOVERY produced, and the FIRST holder whose declaration survives
+    /// every available gate wins. Nothing about which holder supplied the layout is retained, because none of those
+    /// gates can distinguish a truthful holder from a consistent liar and nothing later can either — a
+    /// whole-resource refutation is terminal and attributes to nobody (see
+    /// [`run_inner`](Self::run_inner) for why, and
+    /// [`ResourceCommitment`](crate::verify::ResourceCommitment) for what adoption does and does not prove).
     async fn establish_commitment(&mut self) -> Result<(), DownloadError> {
-        let providers = self.providers.clone();
-        let want_root = self.content_root_hex();
-        for provider in &providers {
+        let candidates = self.providers.clone();
+        // One line per holder, so the terminal error can say what each one actually did. Previously these
+        // went to `tracing::debug!` and were dropped, so the only fact that identified the fault survived
+        // only when debug logging happened to be enabled.
+        let mut reasons: Vec<String> = Vec::with_capacity(candidates.len());
+        let mut note = |provider: &ProviderRecord, reason: String| {
+            let peer = crate::error::hex64_or_sentinel(&provider.provider_peer_id, "peer-id");
+            tracing::debug!(
+                peer = %peer,
+                reason = %reason,
+                "establish_commitment: this holder could not seed the resource layout"
+            );
+            reasons.push(format!("{peer}: {reason}"));
+        };
+
+        for provider in &candidates {
             let req = self.range_request(0, 1)?;
-            let probe = self.transport.fetch_range(provider, &req).await;
-            if let Err(e) = &probe {
-                // The meta-probe is where a reachable, confirmed holder still fails to seed the
-                // download (a wire/format mismatch, a truncated frame, a refused dial). Name the
-                // provider + the reason: without it the download's terminal error looks like a
-                // discovery miss and the real fault stays invisible (#1586).
-                tracing::debug!(
-                    peer = %crate::error::hex64_or_sentinel(&provider.provider_peer_id, "peer-id"),
-                    error = %e,
-                    "establish_commitment: metadata probe failed on this holder"
-                );
-            }
-            if let Ok(f) = probe {
-                // Bind the ground truth to the CALLER's request, not to whichever peer answers
-                // first: reject a peer whose reported generation root differs from the content-id's
-                // root before adopting anything it says (HIGH #179). Without this, a single peer
-                // winning the meta-probe race could shape the whole plan to an attacker-chosen
-                // generation, and check_consistent would then discard the honest providers.
-                if let (Some(want), Some(got)) = (&want_root, &f.meta.root) {
-                    if got != want {
-                        continue;
-                    }
+            let fetched = match self.probe_metadata(provider, &req).await {
+                Ok(fetched) => fetched,
+                Err(e) => {
+                    // The meta-probe is where a reachable, CONFIRMED holder still fails to seed the
+                    // download (a wire/format mismatch, a truncated frame, a refused dial). Naming the
+                    // provider + reason is what keeps that from surfacing as a discovery miss (#1586).
+                    note(provider, format!("metadata probe failed: {e}"));
+                    continue;
                 }
-                if let (Some(tl), Some(cl)) = (f.meta.total_length, f.meta.chunk_lens.clone()) {
-                    match ResourceCommitment::from_first_frame_bounded(
-                        tl,
-                        cl,
-                        f.meta.root.clone(),
-                        f.meta.inclusion_proof.clone(),
-                        self.config.max_resource_size,
-                    ) {
-                        Ok(c) => {
-                            self.commitment = Some(c);
-                            return Ok(());
-                        }
-                        Err(_) => continue,
-                    }
+            };
+            match self.adopt_layout(provider, fetched) {
+                Ok(commitment) => {
+                    self.commitment = Some(commitment);
+                    return Ok(());
+                }
+                Err(reason) => note(provider, reason),
+            }
+        }
+
+        // Say WHICH step failed. Holders WERE located and confirmed; not one could seed the layout. A
+        // bare content id here reads as "discovery found nobody" and cost four separate #1586
+        // investigations, which is why this is its own named error rather than a `NotFound`.
+        let error = DownloadError::MetadataProbeFailed {
+            content: format!("{:?}", self.content),
+            holders: candidates.len(),
+            reasons,
+        };
+        self.emit(DownloadEvent::Failed {
+            reason: error.to_string(),
+        })
+        .await;
+        Err(error)
+    }
+
+    /// Fetch one holder's metadata probe under [`DownloadConfig::range_timeout`].
+    ///
+    /// # The timeout is the only thing that bounds this call
+    ///
+    /// Every ordinary range fetch is already wrapped in this timeout; the metadata probe was not, and it is
+    /// the one fetch that runs BEFORE the scheduler exists — so nothing else could interrupt it. It also
+    /// never polls the control channel, so `cancel()` cannot reach it either. A holder that accepts the
+    /// stream and then trickles frames forever therefore pinned the job indefinitely while it still held
+    /// the [`ActiveDownloads`] claim, which makes the staging path both permanently GC-exempt and
+    /// permanently un-downloadable — the exact denial the claim exists to prevent.
+    ///
+    /// The reassembler's own termination guard closes the no-progress variant of that. This closes the
+    /// variant where every frame DOES progress, just arbitrarily slowly, which no amount of per-frame
+    /// checking can distinguish from a genuinely slow link.
+    async fn probe_metadata(
+        &self,
+        provider: &ProviderRecord,
+        req: &RangeRequest,
+    ) -> Result<FetchedRange, DownloadError> {
+        let fetch = self.transport.fetch_range(provider, req);
+        match self.config.range_timeout {
+            None => fetch.await,
+            Some(limit) => tokio::time::timeout(limit, fetch)
+                .await
+                .unwrap_or_else(|_| {
+                    Err(DownloadError::Timeout {
+                        provider: provider.provider_peer_id.clone(),
+                    })
+                }),
+        }
+    }
+
+    /// Decide whether `fetched`'s declared metadata may become this download's resource layout, returning
+    /// the commitment or the reason to try the next holder.
+    ///
+    /// Every gate here compares fields the SAME holder supplied, except the root match, which binds to the
+    /// CALLER's content id — so this establishes internal consistency and correct generation, never
+    /// truthfulness — see [`ResourceCommitment`](crate::verify::ResourceCommitment) for why that gap cannot
+    /// be closed from here.
+    fn adopt_layout(
+        &self,
+        provider: &ProviderRecord,
+        fetched: FetchedRange,
+    ) -> Result<ResourceCommitment, String> {
+        let meta = fetched.meta;
+
+        // Bind the ground truth to the CALLER's request, not to whichever peer answers first: a peer
+        // whose reported generation root differs from the content-id's root is rejected before anything
+        // it says is adopted (HIGH #179). Without this, one peer winning the meta-probe race could shape
+        // the whole plan to an attacker-chosen generation, and `check_consistent` would then discard the
+        // honest providers.
+        if let Some(want) = self.content_root_hex() {
+            // `Some(want)` and a MISSING `root` used to fall through this guard, because it only fired when
+            // BOTH were present. A layout with no stated generation was therefore adopted and only rejected
+            // after the whole resource had been fetched — the same denial as #1670, reached by omitting a
+            // field rather than by lying in it. A holder that will not say which generation it serves
+            // cannot be checked against the request at all, so it is skipped here.
+            match &meta.root {
+                Some(got) if got == &want => {}
+                Some(got) => {
+                    // SANITIZED, not interpolated. `got` is a peer-supplied `Option<String>` with no hex
+                    // check on this path, and the caller writes this reason into a `tracing` field as a raw
+                    // `String` rather than through `DownloadError`'s sanitizing `Display` — so a holder could
+                    // otherwise inject newlines, ANSI or bidi overrides into debug output, up to the frame
+                    // ceiling (#1603). `hex64_or_sentinel` renders a well-formed 64-hex root verbatim and
+                    // everything else as a fixed sentinel.
+                    return Err(format!(
+                        "serves generation root {}, not the requested {want}",
+                        crate::error::hex64_or_sentinel(got, "root")
+                    ));
+                }
+                None => {
+                    return Err(format!(
+                        "states no generation root, so it cannot be checked against the requested {want}"
+                    ))
                 }
             }
         }
-        // Say WHICH step failed. Holders WERE located and confirmed; not one could answer the
-        // metadata probe. The bare content id here reads as "discovery found nobody" and cost four
-        // separate #1586 investigations — the message now names the step that actually failed.
-        let reason = format!(
-            "could not read resource metadata for {:?} — the metadata probe failed on all {}              confirmed holder(s)",
-            self.content,
-            providers.len()
-        );
-        self.emit(DownloadEvent::Failed {
-            reason: reason.clone(),
-        })
-        .await;
-        Err(DownloadError::NotFound { content: reason })
+
+        let (Some(total_length), Some(chunk_lens)) = (meta.total_length, meta.chunk_lens) else {
+            return Err("first frame declared no total_length/chunk_lens".into());
+        };
+
+        // A layout too large to state on one frame is served as a paged prologue, so a first frame can
+        // legitimately carry only the FIRST page while declaring the whole array's `chunk_count`. This
+        // reader does not reassemble pages yet, so such a holder is one it cannot use.
+        //
+        // The metadata probe asks for a 1-byte range and therefore stops after the first frame, which is
+        // exactly why this is NOT reported as the holder failing to page: from here, a conforming pager
+        // and a holder that would never have paged look identical, and guessing would blame a peer that
+        // did nothing wrong.
+        if let Some(declared) = meta.chunk_count {
+            let delivered = chunk_lens.len() as u64;
+            if declared != delivered {
+                return Err(DownloadError::PagedPrologueUnsupported {
+                    provider: provider.provider_peer_id.clone(),
+                    chunk_count: declared,
+                    delivered,
+                }
+                .to_string());
+            }
+        }
+
+        ResourceCommitment::from_first_frame_bounded(
+            total_length,
+            chunk_lens,
+            meta.root,
+            meta.inclusion_proof,
+            self.config.max_resource_size,
+        )
+        .map_err(|e| e.to_string())
     }
 
     /// Persist the established commitment into the resume checkpoint (so a crash-resume skips the
