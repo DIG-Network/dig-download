@@ -976,11 +976,7 @@ mod tests {
         let resp = t
             .query_availability(
                 &p,
-                vec![AvailabilityItem {
-                    store_id: "s".into(),
-                    root: None,
-                    retrieval_key: None,
-                }],
+                vec![AvailabilityItem::store("s")],
             )
             .await
             .unwrap();

@@ -520,6 +520,24 @@ mod tests {
     use dig_dht::{CandidateAddr, ProviderRecord};
     use dig_nat::PeerId;
 
+    /// The generation root every conforming fixture frame is stamped with (64-hex, as the wire
+    /// requires). Identity travels on EVERY frame in dig-nat 0.13, so it is named once here rather
+    /// than re-spelled per fixture.
+    fn test_root() -> String {
+        "aa".repeat(32)
+    }
+
+    /// Encode a fixture frame, surfacing the dig-nat 0.13 ceiling refusal as a test failure.
+    ///
+    /// `RangeFrame::encode` became FALLIBLE in 0.13 (#1640): the encode side now refuses a frame a
+    /// conforming decoder would have to reject. A fixture that trips it is a fixture bug, so the
+    /// panic names the ceiling instead of silently disappearing into a `Result` nobody inspects.
+    fn encode(frame: &RangeFrame) -> Vec<u8> {
+        frame
+            .encode()
+            .expect("fixture frame must be within the dig-nat framing ceilings")
+    }
+
     fn provider(peer: u8, host: &str, port: u16) -> ProviderRecord {
         ProviderRecord::new(
             &dig_dht::Key::from_bytes([0xAB; 32]),
@@ -707,30 +725,19 @@ mod tests {
     #[tokio::test]
     async fn assemble_reassembles_ordered_frames() {
         // Two frames tiling a 6-byte range; first frame carries the metadata.
-        let f0 = RangeFrame {
-            offset: 0,
-            length: 3,
-            bytes: b"ABC".to_vec(),
-            complete: false,
-            total_length: Some(6),
-            chunk_lens: Some(vec![3, 3]),
-            chunk_index: Some(0),
-            inclusion_proof: Some("proof".into()),
-            root: Some("aa".repeat(32)),
-        };
-        let f1 = RangeFrame {
-            offset: 3,
-            length: 3,
-            bytes: b"DEF".to_vec(),
-            complete: true,
-            total_length: None,
-            chunk_lens: None,
-            chunk_index: None,
-            inclusion_proof: None,
-            root: None,
-        };
-        let mut wire = f0.encode();
-        wire.extend_from_slice(&f1.encode());
+        let f0 = RangeFrame::data(0, b"ABC".to_vec())
+            .with_identity(test_root(), 6, 2)
+            .with_chunk_lens_page(0, vec![3, 3])
+            .with_chunk_index(0)
+            .with_inclusion_proof("proof");
+        // The continuation frame starts on a chunk boundary, so it RESTATES the fixed-size identity
+        // set + its own `chunk_index` and omits the once-per-stream prologue.
+        let f1 = RangeFrame::data(3, b"DEF".to_vec())
+            .with_complete(true)
+            .with_identity(test_root(), 6, 2)
+            .with_chunk_index(1);
+        let mut wire = encode(&f0);
+        wire.extend_from_slice(&encode(&f1));
         let mut cur = std::io::Cursor::new(wire);
         let (bytes, meta) = assemble_range_stream(&mut cur, 6).await.unwrap();
         assert_eq!(bytes, b"ABCDEF");
@@ -745,18 +752,10 @@ mod tests {
     /// never belong to the range) and stays an error.
     #[tokio::test]
     async fn assemble_rejects_frame_starting_beyond_window() {
-        let f = RangeFrame {
-            offset: 8,
-            length: 4,
-            bytes: vec![0u8; 4],
-            complete: true,
-            total_length: None,
-            chunk_lens: None,
-            chunk_index: None,
-            inclusion_proof: None,
-            root: None,
-        };
-        let mut cur = std::io::Cursor::new(f.encode());
+        // Deliberately IDENTITY-FREE: the frame is refused on its offset alone, before any metadata
+        // is consulted, so attaching identity here would only obscure which field the rejection reads.
+        let f = RangeFrame::data(8, vec![0u8; 4]).with_complete(true);
+        let mut cur = std::io::Cursor::new(encode(&f));
         let err = assemble_range_stream(&mut cur, 5).await;
         assert!(matches!(err, Err(DownloadError::Transport { .. })));
     }
@@ -768,18 +767,13 @@ mod tests {
     #[tokio::test]
     async fn assemble_clips_chunk_granular_frame_to_one_byte_probe() {
         let chunk = vec![0x5Au8; 4096];
-        let f = RangeFrame {
-            offset: 0,
-            length: chunk.len() as u64,
-            bytes: chunk,
-            complete: true,
-            total_length: Some(1_048_576),
-            chunk_lens: Some(vec![4096; 256]),
-            chunk_index: Some(0),
-            inclusion_proof: Some("proof".into()),
-            root: Some("aa".repeat(32)),
-        };
-        let mut cur = std::io::Cursor::new(f.encode());
+        let f = RangeFrame::data(0, chunk)
+            .with_complete(true)
+            .with_identity(test_root(), 1_048_576, 256)
+            .with_chunk_lens_page(0, vec![4096; 256])
+            .with_chunk_index(0)
+            .with_inclusion_proof("proof");
+        let mut cur = std::io::Cursor::new(encode(&f));
         let (bytes, meta) = assemble_range_stream(&mut cur, 1).await.unwrap();
         assert_eq!(
             bytes,
@@ -796,30 +790,17 @@ mod tests {
     /// Only the OVERSHOOTING tail is clipped: every earlier frame's bytes survive, in order.
     #[tokio::test]
     async fn assemble_clips_only_the_overshooting_last_frame() {
-        let f0 = RangeFrame {
-            offset: 0,
-            length: 3,
-            bytes: b"ABC".to_vec(),
-            complete: false,
-            total_length: Some(9),
-            chunk_lens: Some(vec![3, 6]),
-            chunk_index: Some(0),
-            inclusion_proof: None,
-            root: None,
-        };
-        let f1 = RangeFrame {
-            offset: 3,
-            length: 6,
-            bytes: b"DEFGHI".to_vec(),
-            complete: true,
-            total_length: None,
-            chunk_lens: None,
-            chunk_index: None,
-            inclusion_proof: None,
-            root: None,
-        };
-        let mut wire = f0.encode();
-        wire.extend_from_slice(&f1.encode());
+        let f0 = RangeFrame::data(0, b"ABC".to_vec())
+            .with_identity(test_root(), 9, 2)
+            .with_chunk_lens_page(0, vec![3, 6])
+            .with_chunk_index(0);
+        // Chunk-aligned continuation: identity restated, prologue not repeated.
+        let f1 = RangeFrame::data(3, b"DEFGHI".to_vec())
+            .with_complete(true)
+            .with_identity(test_root(), 9, 2)
+            .with_chunk_index(1);
+        let mut wire = encode(&f0);
+        wire.extend_from_slice(&encode(&f1));
         let mut cur = std::io::Cursor::new(wire);
         let (bytes, meta) = assemble_range_stream(&mut cur, 5).await.unwrap();
         assert_eq!(bytes, b"ABCDE");
@@ -830,30 +811,17 @@ mod tests {
     /// frame — it never buffers past `max_len`.
     #[tokio::test]
     async fn assemble_stops_once_the_window_is_full() {
-        let f0 = RangeFrame {
-            offset: 0,
-            length: 4,
-            bytes: b"WXYZ".to_vec(),
-            complete: false,
-            total_length: Some(8),
-            chunk_lens: Some(vec![4, 4]),
-            chunk_index: Some(0),
-            inclusion_proof: None,
-            root: None,
-        };
-        let f1 = RangeFrame {
-            offset: 4,
-            length: 4,
-            bytes: b"nope".to_vec(),
-            complete: true,
-            total_length: None,
-            chunk_lens: None,
-            chunk_index: None,
-            inclusion_proof: None,
-            root: None,
-        };
-        let mut wire = f0.encode();
-        wire.extend_from_slice(&f1.encode());
+        let f0 = RangeFrame::data(0, b"WXYZ".to_vec())
+            .with_identity(test_root(), 8, 2)
+            .with_chunk_lens_page(0, vec![4, 4])
+            .with_chunk_index(0);
+        // Chunk-aligned continuation: identity restated, prologue not repeated.
+        let f1 = RangeFrame::data(4, b"nope".to_vec())
+            .with_complete(true)
+            .with_identity(test_root(), 8, 2)
+            .with_chunk_index(1);
+        let mut wire = encode(&f0);
+        wire.extend_from_slice(&encode(&f1));
         let mut cur = std::io::Cursor::new(wire);
         let (bytes, _) = assemble_range_stream(&mut cur, 4).await.unwrap();
         assert_eq!(bytes, b"WXYZ");
@@ -884,18 +852,11 @@ mod tests {
     #[tokio::test]
     async fn assemble_stops_on_clean_eof() {
         // A single non-complete frame followed by EOF still yields the bytes.
-        let f = RangeFrame {
-            offset: 0,
-            length: 2,
-            bytes: b"hi".to_vec(),
-            complete: false,
-            total_length: Some(2),
-            chunk_lens: Some(vec![2]),
-            chunk_index: Some(0),
-            inclusion_proof: None,
-            root: None,
-        };
-        let mut cur = std::io::Cursor::new(f.encode());
+        let f = RangeFrame::data(0, b"hi".to_vec())
+            .with_identity(test_root(), 2, 1)
+            .with_chunk_lens_page(0, vec![2])
+            .with_chunk_index(0);
+        let mut cur = std::io::Cursor::new(encode(&f));
         let (bytes, meta) = assemble_range_stream(&mut cur, 2).await.unwrap();
         assert_eq!(bytes, b"hi");
         assert_eq!(meta.total_length, Some(2));
@@ -951,18 +912,11 @@ mod tests {
     /// rather than dependent on the CI host's memory or overcommit policy.
     #[tokio::test]
     async fn an_unsatisfiable_assembly_buffer_is_a_recoverable_error_not_an_abort() {
-        let f = RangeFrame {
-            offset: u64::MAX - 4,
-            length: 2,
-            bytes: vec![0xAB; 2],
-            complete: false,
-            total_length: Some(u64::MAX),
-            chunk_lens: Some(vec![u64::MAX]),
-            chunk_index: Some(0),
-            inclusion_proof: None,
-            root: None,
-        };
-        let mut cur = std::io::Cursor::new(f.encode());
+        // Deliberately IDENTITY-FREE: the reservation is sized from `offset + bytes.len()` against
+        // `max_len`, so no metadata field participates. Stating identity here would suggest the
+        // refusal depends on a declared length it does not read.
+        let f = RangeFrame::data(u64::MAX - 4, vec![0xAB; 2]);
+        let mut cur = std::io::Cursor::new(encode(&f));
         let err = assemble_range_stream(&mut cur, u64::MAX)
             .await
             .expect_err("an unsatisfiable window allocation is refused, not fatal");
