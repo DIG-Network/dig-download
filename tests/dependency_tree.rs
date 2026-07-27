@@ -33,7 +33,7 @@ fn locked_versions(crate_name: &str) -> Vec<&str> {
         .collect()
 }
 
-/// **Proves:** the resolved tree carries EXACTLY ONE `dig-rpc-protocol`, and it is the 0.5 line that
+/// **Proves:** the resolved tree carries EXACTLY ONE `dig-rpc-protocol`, and it is the 0.6 line that
 /// defines the whole-module wire (`ModuleInfo`, `GetModuleInfoParams`, `FetchModuleRangeParams`).
 /// **Catches:** a consumer (today dig-peer) reintroducing an older dig-rpc-protocol major, which would
 /// silently place two `ModuleInfo` shapes either side of the module pull's trust boundary — a defect the
@@ -48,21 +48,21 @@ fn the_tree_carries_exactly_one_dig_rpc_protocol_and_it_is_the_module_wire_major
          means two `ModuleInfo` shapes across a trust boundary"
     );
     assert!(
-        versions[0].starts_with("0.5."),
-        "the module wire ships in dig-rpc-protocol 0.5; the tree resolved {}",
+        versions[0].starts_with("0.6."),
+        "the module wire ships in dig-rpc-protocol 0.6; the tree resolved {}",
         versions[0]
     );
 }
 
-/// **Proves:** the peer client itself is on the same 0.5 line — the transitive entry, not just the
+/// **Proves:** the peer client itself is on the same 0.6 line — the transitive entry, not just the
 /// direct caret dep, since a consumer's own lock is what actually decides which patch is compiled.
 #[test]
 fn the_peer_client_is_on_the_module_wire_major() {
     let versions = locked_versions("dig-peer");
     assert_eq!(versions.len(), 1, "one dig-peer only, found {versions:?}");
     assert!(
-        versions[0].starts_with("0.5."),
-        "dig-peer must be on the 0.5 line (dig-rpc-protocol 0.5 + the module client methods); \
+        versions[0].starts_with("0.6."),
+        "dig-peer must be on the 0.6 line (dig-rpc-protocol 0.6 + the module client methods); \
          the tree resolved {}",
         versions[0]
     );
@@ -81,4 +81,49 @@ fn the_transport_stack_is_not_duplicated() {
             "expected exactly one {crate_name}, found {versions:?}"
         );
     }
+}
+
+/// **Proves:** the resolved `dig-nat` is on the 0.13 line.
+///
+/// **Catches:** a lock that silently resolves dig-nat 0.11.x. On that line `RangeFrame::encode`
+/// returned a bare `Vec<u8>` with NO ceiling on the payload while the DECODE side already capped the
+/// body at 64 KiB, so a holder emitted frames every conforming reader was required to reject and every
+/// DIG read or reshare above ~48 KiB failed to decode (#1640).
+///
+/// Two things worth stating exactly, because a version this test names wrongly is a wrong rule the
+/// suite would then vouch for. First, the encode ceiling landed in **0.12.0**, not 0.13.0 — 0.13.0 is
+/// required here for a different reason: it is where the wire types became `#[non_exhaustive]` with
+/// public constructors, and where `chunk_index` gained a setter separate from `with_inclusion_proof`, so
+/// a chunk-aligned continuation frame can state its alignment without repeating a once-per-stream proof.
+/// Second, `the_transport_stack_is_not_duplicated` proves there is only ONE dig-nat; only this test
+/// proves that one is a fixed one — and a caret bump in `Cargo.toml` does not settle it, because an
+/// intermediate consumer pinning `^0.11` reintroduces the broken line in the lock while the manifest
+/// still reads `"0.13"`.
+#[test]
+fn the_transport_is_on_the_capped_encode_line() {
+    let versions = locked_versions("dig-nat");
+    assert_eq!(versions.len(), 1, "one dig-nat only, found {versions:?}");
+    assert!(
+        versions[0].starts_with("0.13."),
+        "dig-nat must be on the 0.13 line (capped framed ENCODE since 0.12 for #1640, plus the \
+         per-frame chunk_index setter and the public constructors 0.13 adds); the tree resolved {}",
+        versions[0]
+    );
+}
+
+/// **Proves:** exactly one `dig-dht`, on the 0.7 line that itself carries dig-nat 0.13.
+///
+/// **Catches:** the published-but-unresolvable class this cascade exists to fix — `dig-dht = "0.5.1"`
+/// means `>=0.5.1, <0.6`, which can NEVER reach 0.7.0, so the locate leg would keep resolving a dig-dht
+/// that drags the uncapped dig-nat line in transitively while the direct dep looked correct. Two dig-dht
+/// entries would also make `dig_dht::ProviderRecord` two distinct types across the locate boundary.
+#[test]
+fn the_locator_is_on_the_cascaded_dht_line() {
+    let versions = locked_versions("dig-dht");
+    assert_eq!(versions.len(), 1, "one dig-dht only, found {versions:?}");
+    assert!(
+        versions[0].starts_with("0.7."),
+        "dig-dht must be on the 0.7 line (the release carrying dig-nat 0.13); the tree resolved {}",
+        versions[0]
+    );
 }

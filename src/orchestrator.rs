@@ -1238,20 +1238,16 @@ impl Job {
     fn availability_item(&self) -> Result<AvailabilityItem, DownloadError> {
         match &self.content {
             ContentId::Store { .. } => Err(DownloadError::NotDownloadable),
-            ContentId::Root { store_id, root } => Ok(AvailabilityItem {
-                store_id: hex32(store_id),
-                root: Some(hex32(root)),
-                retrieval_key: None,
-            }),
+            ContentId::Root { store_id, root } => {
+                Ok(AvailabilityItem::store(hex32(store_id)).with_root(hex32(root)))
+            }
             ContentId::Resource {
                 store_id,
                 root,
                 retrieval_key,
-            } => Ok(AvailabilityItem {
-                store_id: hex32(store_id),
-                root: Some(hex32(root)),
-                retrieval_key: Some(hex32(retrieval_key)),
-            }),
+            } => Ok(AvailabilityItem::store(hex32(store_id))
+                .with_root(hex32(root))
+                .with_retrieval_key(hex32(retrieval_key))),
         }
     }
 
@@ -1265,29 +1261,27 @@ impl Job {
     }
 
     /// The `dig.fetchRange` request for `[offset, offset+length)` of this content id.
+    ///
+    /// `skip_layout` is deliberately left UNSET, which asks every holder for the layout metadata on
+    /// every stream — the pre-0.13.0 behaviour. Suppressing it is only correct once the orchestrator
+    /// tracks "I already hold a complete `chunk_lens` for this root", and `chunk_lens` is a DECRYPT
+    /// input: per-chunk AES-GCM-SIV needs the WHOLE array, so a fan-out that suppressed it before the
+    /// first stream had paged in a complete set would produce undecryptable bytes. Asking for
+    /// redundant metadata costs bandwidth; asking for none too early costs correctness.
     fn range_request(&self, offset: u64, length: u64) -> Result<RangeRequest, DownloadError> {
         match &self.content {
             ContentId::Store { .. } => Err(DownloadError::NotDownloadable),
-            ContentId::Root { store_id, root } => Ok(RangeRequest {
-                store_id: hex32(store_id),
-                retrieval_key: None,
-                root: Some(hex32(root)),
-                capsule: true,
-                offset,
-                length,
-            }),
+            ContentId::Root { store_id, root } => {
+                Ok(RangeRequest::capsule(hex32(store_id), offset, length).with_root(hex32(root)))
+            }
             ContentId::Resource {
                 store_id,
                 root,
                 retrieval_key,
-            } => Ok(RangeRequest {
-                store_id: hex32(store_id),
-                retrieval_key: Some(hex32(retrieval_key)),
-                root: Some(hex32(root)),
-                capsule: false,
-                offset,
-                length,
-            }),
+            } => Ok(
+                RangeRequest::resource(hex32(store_id), hex32(retrieval_key), offset, length)
+                    .with_root(hex32(root)),
+            ),
         }
     }
 }

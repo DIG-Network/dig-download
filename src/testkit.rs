@@ -216,15 +216,20 @@ impl RangeTransport for MockRangeTransport {
         let held = !matches!(behavior, Behavior::Unavailable | Behavior::AlwaysFail);
         let answers = items
             .iter()
-            .map(|_| AvailabilityAnswer {
-                available: held,
-                roots: Some(vec![self.content.root.clone()]),
-                total_length: Some(self.content.bytes.len() as u64),
-                chunk_count: Some(self.content.chunk_lens.len() as u64),
-                complete: Some(true),
+            .map(|_| {
+                let answer = if held {
+                    AvailabilityAnswer::available()
+                } else {
+                    AvailabilityAnswer::unavailable()
+                };
+                answer
+                    .with_roots(vec![self.content.root.clone()])
+                    .with_total_length(self.content.bytes.len() as u64)
+                    .with_chunk_count(self.content.chunk_lens.len() as u64)
+                    .with_complete(true)
             })
             .collect();
-        Ok(AvailabilityResponse { items: answers })
+        Ok(AvailabilityResponse::new(answers))
     }
 
     async fn fetch_range(
@@ -969,14 +974,7 @@ mod tests {
         let t = MockRangeTransport::new(content);
         t.set_behavior(&hex, Behavior::Unavailable).await;
         let resp = t
-            .query_availability(
-                &p,
-                vec![AvailabilityItem {
-                    store_id: "s".into(),
-                    root: None,
-                    retrieval_key: None,
-                }],
-            )
+            .query_availability(&p, vec![AvailabilityItem::store("s")])
             .await
             .unwrap();
         assert!(!resp.items[0].available);

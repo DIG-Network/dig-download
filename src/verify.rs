@@ -582,18 +582,15 @@ mod tests {
         let v = MerkleVerifier::insecure_structural_only();
 
         // A chunk-granular holder answers a 10-byte window with a whole 30-byte span.
-        let over_long = dig_nat::RangeFrame {
-            offset: 0,
-            length: 30,
-            bytes: vec![0u8; 30],
-            complete: true,
-            total_length: Some(35),
-            chunk_lens: Some(vec![10, 20, 5]),
-            chunk_index: Some(0),
-            root: None,
-            inclusion_proof: None,
-        };
-        let mut stream = std::io::Cursor::new(over_long.encode());
+        let over_long = dig_nat::RangeFrame::data(0, vec![0u8; 30])
+            .with_complete(true)
+            .with_identity("aa".repeat(32), 35, 3)
+            .with_chunk_lens_page(0, vec![10, 20, 5])
+            .with_chunk_index(0);
+        let wire = over_long
+            .encode()
+            .expect("a 30-byte fixture frame is far inside the framing ceilings");
+        let mut stream = std::io::Cursor::new(wire);
         let (clipped, _meta) = crate::source::assemble_range_stream(&mut stream, 10)
             .await
             .expect("an over-long frame is clipped, never rejected");
