@@ -974,10 +974,7 @@ mod tests {
         let t = MockRangeTransport::new(content);
         t.set_behavior(&hex, Behavior::Unavailable).await;
         let resp = t
-            .query_availability(
-                &p,
-                vec![AvailabilityItem::store("s")],
-            )
+            .query_availability(&p, vec![AvailabilityItem::store("s")])
             .await
             .unwrap();
         assert!(!resp.items[0].available);

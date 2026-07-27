@@ -1271,12 +1271,9 @@ impl Job {
     fn range_request(&self, offset: u64, length: u64) -> Result<RangeRequest, DownloadError> {
         match &self.content {
             ContentId::Store { .. } => Err(DownloadError::NotDownloadable),
-            ContentId::Root { store_id, root } => Ok(RangeRequest::capsule(
-                hex32(store_id),
-                offset,
-                length,
-            )
-            .with_root(hex32(root))),
+            ContentId::Root { store_id, root } => {
+                Ok(RangeRequest::capsule(hex32(store_id), offset, length).with_root(hex32(root)))
+            }
             ContentId::Resource {
                 store_id,
                 root,

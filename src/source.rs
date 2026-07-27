@@ -871,6 +871,11 @@ mod tests {
     /// mock and 20 KB / 27 KB e2e content — and a fixture that cannot exceed a bound can never detect an
     /// unbounded encoder. Testing only the at-bound case would be the same mistake in miniature: it
     /// confirms the ceiling is reachable without showing that anything stops one byte past it.
+    ///
+    /// Scope of the proof, stated honestly: the over-bound half is load-bearing against dig-nat 0.11,
+    /// where `encode` returned a bare `Vec<u8>` and no ceiling existed at all. It does NOT distinguish
+    /// 0.12 from 0.13 — the payload ceiling landed in 0.12.0 — so `dependency_tree.rs` carries the
+    /// assertion that the resolved line is not a pre-0.12 one.
     #[tokio::test]
     async fn a_payload_at_the_ceiling_round_trips_and_one_byte_over_is_refused() {
         let ceiling = dig_nat::MAX_RANGE_FRAME_PAYLOAD;
@@ -925,9 +930,9 @@ mod tests {
             .with_identity(test_root(), total_length, chunk_count as u64)
             .with_chunk_lens_page(0, page0.clone())
             .with_chunk_index(0);
-        let wire = f
-            .encode()
-            .expect("a first page of MAX_CHUNK_LENS_PER_FRAME entries is within the framing ceiling");
+        let wire = f.encode().expect(
+            "a first page of MAX_CHUNK_LENS_PER_FRAME entries is within the framing ceiling",
+        );
 
         let mut cur = std::io::Cursor::new(wire);
         let (_bytes, meta) = assemble_range_stream(&mut cur, 2).await.unwrap();

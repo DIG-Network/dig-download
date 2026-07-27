@@ -70,10 +70,32 @@ caller:
 - MUST capture the first frame's verification metadata (below) before any window check, so a
   metadata-only probe (`length = 1`) succeeds against any granularity.
 
-The **first frame** of a range additionally carries the whole-resource verification metadata:
-`total_length`, `chunk_lens` (per-chunk ciphertext lengths, in order), `chunk_index` (index of the
-first chunk in this range), `inclusion_proof` (base64, absent for a capsule), and `root` (64-hex, the
-generation the inclusion proof is against).
+A range's frames additionally carry whole-resource verification metadata, and it splits into **two
+sets with different rules** — conforming to the wrong one produces a verification miss on a
+multi-frame read rather than a clean failure:
+
+- **Identity — fixed-size, on EVERY frame:** `root` (64-hex, the generation the inclusion proof is
+  against), `total_length`, `chunk_count`, and `chunk_index` (the index into `chunk_lens` of this
+  frame's first chunk) wherever the window is chunk-aligned. These are what let a reader reject a
+  wrong-generation or wrong-layout holder the moment a frame arrives — a property the once-per-stream
+  set can never have, because it arrives once. They are bounded in size, so carrying them on every
+  frame is cheap.
+- **Prologue — resource-scaling, ONCE per range stream:** `chunk_lens` (per-chunk ciphertext lengths,
+  in order, located by `chunk_lens_offset` when paged) and `inclusion_proof` (base64, absent for a
+  capsule). Their size is a function of the RESOURCE rather than of the frame, so they ride the first
+  frame or a paged prologue and MUST NOT be repeated on later frames. A request that set
+  `skip_layout` suppresses them entirely.
+
+Before dig-nat 0.13.0 every one of these was "first frame only", because the whole layout had to fit
+one frame or the range was unservable. An implementation MUST NOT treat `chunk_index` as
+first-frame-only: it is identity, and a chunk-aligned continuation frame states it.
+
+A reader MUST NOT adopt an INCOMPLETE `chunk_lens` as a layout. `chunk_lens` is a decrypt input —
+per-chunk AES-GCM-SIV needs the whole array — so a partial array is not a degraded layout but one
+that decrypts every chunk to garbage. The sum check in section 4 ("`chunk_lens` MUST sum to
+`total_length`") is what enforces this: a single page of a paged prologue sums short and is rejected.
+Reassembling a paged prologue across frames is NOT yet implemented by this crate; such a resource is
+refused rather than mis-read.
 
 ---
 

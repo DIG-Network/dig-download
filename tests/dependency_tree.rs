@@ -83,24 +83,30 @@ fn the_transport_stack_is_not_duplicated() {
     }
 }
 
-/// **Proves:** the resolved `dig-nat` is on the 0.13 line — the release where `RangeFrame::encode`
-/// became FALLIBLE and started refusing a body over `MAX_FRAMED_BODY`.
+/// **Proves:** the resolved `dig-nat` is on the 0.13 line.
 ///
-/// **Catches:** a lock that silently resolves dig-nat 0.11.x/0.12.x, which is not a version nit: on
-/// those lines the framed ENCODE side was UNCAPPED while the DECODE side already capped at 64 KiB, so a
-/// holder happily emitted frames every conforming reader was required to reject, and every DIG read or
-/// reshare above ~48 KiB failed to decode (#1640). `the_transport_stack_is_not_duplicated` proves there
-/// is only ONE dig-nat; only this test proves that one is the FIXED one. A caret bump in `Cargo.toml`
-/// does not settle it — an intermediate consumer pinning `^0.11` re-introduces the broken line in the
-/// lock while the manifest still reads `"0.13"`.
+/// **Catches:** a lock that silently resolves dig-nat 0.11.x. On that line `RangeFrame::encode`
+/// returned a bare `Vec<u8>` with NO ceiling on the payload while the DECODE side already capped the
+/// body at 64 KiB, so a holder emitted frames every conforming reader was required to reject and every
+/// DIG read or reshare above ~48 KiB failed to decode (#1640).
+///
+/// Two things worth stating exactly, because a version this test names wrongly is a wrong rule the
+/// suite would then vouch for. First, the encode ceiling landed in **0.12.0**, not 0.13.0 — 0.13.0 is
+/// required here for a different reason: it is where the wire types became `#[non_exhaustive]` with
+/// public constructors, and where `chunk_index` gained a setter separate from `with_inclusion_proof`, so
+/// a chunk-aligned continuation frame can state its alignment without repeating a once-per-stream proof.
+/// Second, `the_transport_stack_is_not_duplicated` proves there is only ONE dig-nat; only this test
+/// proves that one is a fixed one — and a caret bump in `Cargo.toml` does not settle it, because an
+/// intermediate consumer pinning `^0.11` reintroduces the broken line in the lock while the manifest
+/// still reads `"0.13"`.
 #[test]
 fn the_transport_is_on_the_capped_encode_line() {
     let versions = locked_versions("dig-nat");
     assert_eq!(versions.len(), 1, "one dig-nat only, found {versions:?}");
     assert!(
         versions[0].starts_with("0.13."),
-        "dig-nat must be on the 0.13 line (framed ENCODE capped at MAX_FRAMED_BODY, #1640); the tree \
-         resolved {} — reads above ~48 KiB cannot decode on that line",
+        "dig-nat must be on the 0.13 line (capped framed ENCODE since 0.12 for #1640, plus the \
+         per-frame chunk_index setter and the public constructors 0.13 adds); the tree resolved {}",
         versions[0]
     );
 }
