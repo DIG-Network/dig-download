@@ -46,7 +46,7 @@ dig-constants = "0.8"
 # dig-nat dep now agree on dig-nat 0.11 — the tree still carries exactly ONE dig-nat instance. dig-dht
 # defines its OWN `PeerId`/`ProviderRecord` types (NOT re-exported from dig-nat).
 # NC-7: prefer the crates.io release over bare-git.
-dig-dht = "0.5.1"
+dig-dht = "0.7"
 
 # WIRE — the whole-`.dig`-module pull descriptor + method names (#1576). `ModuleInfo`
 # (`total_size` / `module_hash` / `chunk_hashes` / `chunk_lens`) is the canonical byte-contract a
@@ -54,7 +54,7 @@ dig-dht = "0.5.1"
 # re-declaring the shape (single source of truth, no drift vs the dig-node serve leg). Foundation-level
 # (L00), zero DIG deps — a legal downward edge from L30. NC-7: prefer the crates.io release over
 # bare-git.
-dig-rpc-protocol = "0.5"
+dig-rpc-protocol = "0.6"
 
 # REACH + FETCH — the mTLS peer transport the range fetch rides: `dig.getAvailability` +
 # `dig.fetchRange` over dig-nat mux streams, plus the wire shapes (`RangeRequest`, `RangeFrame`,
@@ -66,7 +66,7 @@ dig-rpc-protocol = "0.5"
 # (above, 0.5.1) is now ALSO on dig-nat 0.11, so the final tree carries exactly ONE dig-nat instance — this bump is
 # additive-but-breaking-for-consumers of dig-download's own public API (single dig-nat + dig-dht
 # version in the tree). NC-7: prefer the crates.io release over bare-git.
-dig-nat = "0.11"
+dig-nat = "0.13"
 
 # REACH + FETCH via the shared client — dig-download talks to peers through `DigPeer`, the one DIG
 # Network peer client (#1283), rather than driving dig-nat directly: `DigPeer::connect_with_runtime`
@@ -82,7 +82,7 @@ dig-nat = "0.11"
 # class of defect, which cost six blind diagnosis rounds. dig-peer 0.5 is on dig-rpc-protocol 0.5, so
 # the tree now carries exactly ONE. dig-peer 0.5 also adds the `get_module_info` / `fetch_module_range`
 # client methods dig-node's `ModuleTransport` adapter is built on.
-dig-peer = "0.5.0"
+dig-peer = "0.6"
 
 # Async runtime for the orchestrator task + the concurrent range fan-out + backoff timers.
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync", "io-util"] }
