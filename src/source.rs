@@ -862,6 +862,94 @@ mod tests {
         assert_eq!(meta.total_length, Some(2));
     }
 
+    /// #1640, from BOTH sides of the bound. A payload at exactly [`MAX_RANGE_FRAME_PAYLOAD`] is legal
+    /// and must survive the real encode → decode → assemble path; one byte over must be REFUSED at the
+    /// encode site rather than emitted for a decoder that is required to reject it.
+    ///
+    /// The fixture size is taken FROM the protocol constant, deliberately. #1640 hid for as long as it
+    /// did because every fixture that touched this path was far below the ceiling — an 8-byte in-process
+    /// mock and 20 KB / 27 KB e2e content — and a fixture that cannot exceed a bound can never detect an
+    /// unbounded encoder. Testing only the at-bound case would be the same mistake in miniature: it
+    /// confirms the ceiling is reachable without showing that anything stops one byte past it.
+    #[tokio::test]
+    async fn a_payload_at_the_ceiling_round_trips_and_one_byte_over_is_refused() {
+        let ceiling = dig_nat::MAX_RANGE_FRAME_PAYLOAD;
+        let at_ceiling = vec![0x7Eu8; ceiling];
+
+        let f = RangeFrame::data(0, at_ceiling.clone())
+            .with_complete(true)
+            .with_identity(test_root(), ceiling as u64, 1)
+            .with_chunk_lens_page(0, vec![ceiling as u64])
+            .with_chunk_index(0);
+        let wire = f
+            .encode()
+            .expect("a payload AT MAX_RANGE_FRAME_PAYLOAD is conforming and must encode");
+
+        let mut cur = std::io::Cursor::new(wire);
+        let (bytes, meta) = assemble_range_stream(&mut cur, ceiling as u64)
+            .await
+            .expect("a ceiling-sized frame decodes and assembles");
+        assert_eq!(
+            bytes, at_ceiling,
+            "every byte of a ceiling-sized window survives the round trip"
+        );
+        assert_eq!(meta.total_length, Some(ceiling as u64));
+        assert_eq!(meta.chunk_index, Some(0));
+
+        let over = RangeFrame::data(0, vec![0x7Eu8; ceiling + 1]).with_complete(true);
+        let err = over
+            .encode()
+            .expect_err("one byte past the ceiling has no conforming frame and must be refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    /// A resource whose layout does not fit ONE frame arrives as a dig-nat 0.13 **paged prologue**, and
+    /// dig-download does not yet reassemble the pages (tracked separately — obtaining a paged layout is a
+    /// wire-shape decision, not a dependency bump). What must hold regardless is that the partial page is
+    /// REFUSED rather than adopted: `chunk_lens` is a DECRYPT input, so a truncated array is not a
+    /// degraded layout, it is one that decrypts every chunk to garbage.
+    ///
+    /// The fixture's `chunk_count` is set from [`MAX_CHUNK_LENS_PER_FRAME`], the sender's own paging
+    /// threshold, so this is the genuinely-paged shape rather than a large-looking array that still fits
+    /// one frame. Each entry differs from its neighbours, so a truncated *or* misplaced page produces a
+    /// different array — a uniform `vec![64; n]` would have been satisfied by either.
+    #[tokio::test]
+    async fn a_paged_prologue_is_refused_rather_than_adopted_as_a_complete_layout() {
+        let chunk_count = dig_nat::MAX_CHUNK_LENS_PER_FRAME + 952;
+        let chunk_lens: Vec<u64> = (0..chunk_count).map(|i| 64 + (i as u64 % 7)).collect();
+        let total_length: u64 = chunk_lens.iter().sum();
+        let page0 = chunk_lens[..dig_nat::MAX_CHUNK_LENS_PER_FRAME].to_vec();
+
+        let f = RangeFrame::data(0, b"AB".to_vec())
+            .with_complete(true)
+            .with_identity(test_root(), total_length, chunk_count as u64)
+            .with_chunk_lens_page(0, page0.clone())
+            .with_chunk_index(0);
+        let wire = f
+            .encode()
+            .expect("a first page of MAX_CHUNK_LENS_PER_FRAME entries is within the framing ceiling");
+
+        let mut cur = std::io::Cursor::new(wire);
+        let (_bytes, meta) = assemble_range_stream(&mut cur, 2).await.unwrap();
+        assert_eq!(
+            meta.chunk_lens.as_deref(),
+            Some(&page0[..]),
+            "the assembler surfaces the page it was given, unpadded and unguessed"
+        );
+
+        let err = crate::verify::ResourceCommitment::from_first_frame(
+            total_length,
+            meta.chunk_lens.expect("the page is present"),
+            meta.root,
+            meta.inclusion_proof,
+        )
+        .expect_err("an incomplete chunk_lens must never become a commitment");
+        assert!(
+            format!("{err}").contains("chunk_lens sum"),
+            "and it is refused for the reason that makes it unusable — the array does not describe              the declared resource: {err}"
+        );
+    }
+
     #[test]
     fn source_tracker_backoff_and_recovery() {
         let mut t = SourceTracker::new(Duration::from_millis(100), Duration::from_secs(10));
