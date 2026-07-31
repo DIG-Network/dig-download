@@ -20,7 +20,7 @@
 # by dig-node (see the implementers' note in the crate docs).
 [package]
 name = "dig-download"
-version = "0.12.0"
+version = "0.13.0"
 edition = "2021"
 rust-version = "1.75.0"
 license = "Apache-2.0 OR MIT"
@@ -42,17 +42,17 @@ dig-constants = "0.8"
 #
 # Sourcing: crates.io. dig-dht 0.8 keeps the SAME `find_providers` public API this crate consumes
 # (`DhtService::find_providers` — the true distributed iterative lookup); its own bump is to move onto
-# dig-nat 0.14 (below), so dig-dht + dig-peer + dig-download's direct dig-nat dep all agree on dig-nat
-# 0.14 and the tree carries exactly ONE dig-nat instance (asserted by `tests/dependency_tree.rs`, not
+# dig-nat 0.15 (below), so dig-dht + dig-peer + dig-download's direct dig-nat dep all agree on dig-nat
+# 0.15 and the tree carries exactly ONE dig-nat instance (asserted by `tests/dependency_tree.rs`, not
 # assumed).
 #
 # That agreement is why all THREE deps move in one commit. A 0.x MINOR is semver-INCOMPATIBLE, so
-# `dig-nat = "0.14"` here is unresolvable while any intermediate consumer still requires `^0.13`:
+# `dig-nat = "0.15"` here is unresolvable while any intermediate consumer still requires `^0.14`:
 # bumping dig-nat alone produced a lock with two dig-nat entries and four E0308s on the
 # `DigPeer::fetch_range` seam. Never bump one leg of this trio by itself.
 #
-# `^0.8` rather than an older caret because a 0.x MINOR is semver-INCOMPATIBLE: `"0.5.1"` means
-# `>=0.5.1, <0.6`, which can never resolve 0.8.0 no matter how long it has been published. An outdated
+# `^0.9` rather than an older caret because a 0.x MINOR is semver-INCOMPATIBLE: `"0.8"` means
+# `>=0.8.0, <0.9`, which can never resolve 0.9.0 no matter how long it has been published. An outdated
 # requirement therefore pins the locate leg to a dig-dht that drags an older dig-nat in
 # transitively, while the manifest looked current.
 #
@@ -60,7 +60,7 @@ dig-constants = "0.8"
 # crate RE-EXPORTS `ContentId`/`ProviderRecord`, so their identity is part of dig-download's public
 # API — which is why this bump is breaking for consumers.
 # NC-7: prefer the crates.io release over bare-git.
-dig-dht = "0.8"
+dig-dht = "0.9"
 
 # WIRE — the whole-`.dig`-module pull descriptor + method names (#1576). `ModuleInfo`
 # (`total_size` / `module_hash` / `chunk_hashes` / `chunk_lens`) is the canonical byte-contract a
@@ -91,12 +91,12 @@ dig-rpc-protocol = "0.6"
 # The wire shapes (`RangeRequest`, `RangeFrame`, `AvailabilityItem`/`Answer`/`Response`) appear in this
 # crate's public `RangeTransport` trait, so their identity is part of dig-download's public API and this
 # bump is breaking for consumers. NC-7: prefer the crates.io release over bare-git.
-dig-nat = "0.14"
+dig-nat = "0.15"
 
 # REACH + FETCH via the shared client — dig-download talks to peers through `DigPeer`, the one DIG
 # Network peer client (#1283), rather than driving dig-nat directly: `DigPeer::connect_with_runtime`
-# (peer_id-PINNED mTLS over the full NAT ladder) + `get_availability` / `fetch_range`. dig-peer 0.7
-# re-exports the SAME dig-nat 0.14 / dig-tls 0.3 shapes this crate already uses (`PeerTarget`,
+# (peer_id-PINNED mTLS over the full NAT ladder) + `get_availability` / `fetch_range`. dig-peer 0.8
+# re-exports the SAME dig-nat 0.15 / dig-tls 0.3 shapes this crate already uses (`PeerTarget`,
 # `RangeRequest`, `AvailabilityItem`/`AvailabilityResponse`, `NodeCert`, `PeerId`), so the tree still
 # carries exactly ONE dig-nat + dig-tls instance. NC-7: prefer the crates.io release over bare-git.
 #
@@ -107,7 +107,7 @@ dig-nat = "0.14"
 # class of defect, which cost six blind diagnosis rounds. dig-peer 0.5 is on dig-rpc-protocol 0.5, so
 # the tree now carries exactly ONE. dig-peer 0.5 also adds the `get_module_info` / `fetch_module_range`
 # client methods dig-node's `ModuleTransport` adapter is built on.
-dig-peer = "0.7"
+dig-peer = "0.8"
 
 # Async runtime for the orchestrator task + the concurrent range fan-out + backoff timers.
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync", "io-util"] }
@@ -160,7 +160,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"
 # certificate with no public constructor besides `generate_signed`/`load_or_generate`/`from_pem`,
 # which need a BLS identity `SecretKey`. dig-tls owns that type; not needed as a PRODUCTION
 # dependency (dig-download's own code only ever holds/passes an `Arc<dig_nat::NodeCert>` it is
-# handed, never mints one). Pinned to 0.3 to match the dig-tls that dig-nat 0.14 re-exports — two
+# handed, never mints one). Pinned to 0.3 to match the dig-tls that dig-nat 0.15 re-exports — two
 # dig-tls majors in the test build would otherwise produce an E0308 type mismatch on `NodeCert`.
 dig-tls = "0.3"
 
