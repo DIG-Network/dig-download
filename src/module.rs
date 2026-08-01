@@ -28,13 +28,21 @@
 //!    back from staging and RE-ATTRIBUTED against `chunk_hashes` rather than trusted, so it is skipped
 //!    when still intact and re-fetched when the staging file has been corrupted since (#1605). A
 //!    resumed pull always ends in the same two final gates below — resume can never bypass them.
-//! 6. **Assemble** verified chunks in order into the [`Sink`]'s staging area, then run the two
-//!    fail-closed final gates BEFORE finalize — (a) the reassembled blob hashes to `module_hash`
-//!    (whole-blob integrity), and (b) the reassembled blob verifies against its chain-anchored `root`
-//!    via the injected [`ModuleAnchorVerifier`] (NC-9 — verified-content-is-not-safe-until-chain-bound;
-//!    a right-shaped-but-forged module a lying holder-set could otherwise agree on is caught here).
-//!    Only if BOTH pass is the sink finalized + the resume checkpoint cleared. A failure leaves the
-//!    staging file unfinalized (never written through) and is terminal for the pull.
+//! 6. **Assemble** verified chunks in order into the [`Sink`]'s staging area, hashing each into a
+//!    running whole-module SHA-256 as it lands, then run the two fail-closed final gates BEFORE
+//!    finalize — (a) that running hash equals `module_hash` (whole-blob integrity), and (b) the staged
+//!    module verifies against its chain-anchored `root` via the injected [`ModuleAnchorVerifier`],
+//!    which reads it through the bounded [`ModuleReader`] seam (NC-9 —
+//!    verified-content-is-not-safe-until-chain-bound; a right-shaped-but-forged module a lying
+//!    holder-set could otherwise agree on is caught here). Only if BOTH pass is the sink finalized +
+//!    the resume checkpoint cleared. A failure leaves the staging file unfinalized (never written
+//!    through) and is terminal for the pull.
+//!
+//!    **Peak memory is ONE CHUNK, not one module** (#1610). Nothing sized by the declared `total_size`
+//!    is ever allocated, so a small host can reshare a capsule far larger than its RAM. Streaming the
+//!    hash opens no window on partially-verified bytes: a chunk is absorbed only after it matches
+//!    `chunk_hashes[i]`, the bytes live in the STAGING area — never the artifact — and promotion is a
+//!    single atomic step strictly after both gates pass.
 //!
 //! ## Trust model
 //!
@@ -53,7 +61,8 @@
 //!   dig-nat/dig-peer adapter is wired by dig-node's serve/client legs (the module client methods do
 //!   not yet exist on the shared peer client); this crate ships the seam + the in-memory
 //!   [`testkit::MockModuleTransport`](crate::testkit) used by the tests.
-//! - [`ModuleAnchorVerifier`] — binds the assembled blob to the chain root. dig-node injects the
+//! - [`ModuleAnchorVerifier`] + [`ModuleReader`] — bind the STAGED module to the chain root, read
+//!   through a bounded window rather than handed over as one slice. dig-node injects the
 //!   digstore verifier (which parses the `.dig`, extracts its committed root, and checks it equals the
 //!   `getAnchoredRoot` value). There is no fail-open production default: the no-op
 //!   `AcceptAnyModuleAnchor` exists ONLY under `cfg(test)` / the `testkit` feature, so a default
@@ -107,20 +116,67 @@ pub trait ModuleTransport: Send + Sync {
     ) -> Result<Vec<u8>, DownloadError>;
 }
 
-/// Binds a fully-assembled `.dig` module blob to its chain-anchored `(store_id, root)` — the sole
-/// root of trust of the module pull (NC-9). dig-node injects the digstore verifier; this crate ships
-/// only the explicitly-opt-in, fail-OPEN [`AcceptAnyModuleAnchor`] for tests.
+/// Random-access read over the module bytes a pull has staged — the seam the anchor gate sees
+/// INSTEAD of a `&[u8]` of the whole module (#1610).
+///
+/// A `&[u8]` parameter forced the puller to hold the entire module in RAM before it could ask the one
+/// question that decides the pull, so peak RSS was the module size and a small host simply could not
+/// reshare a large capsule. Behind this trait the same gate reads the staging area on demand, so peak
+/// RSS is one chunk.
+///
+/// ## What an implementation MUST guarantee
+///
+/// Every byte this reader returns is already **chunk-hash-verified against the descriptor**, and the
+/// readable window is exactly the `total_size` the whole-module-hash gate has already accepted — the
+/// gate never sees an unverified or out-of-window byte ([`StagedModuleReader`] is this crate's
+/// implementation and enforces both).
+#[async_trait]
+pub trait ModuleReader: Send + Sync {
+    /// The module's verified length in bytes. Reads are clamped to `[0, len())`.
+    fn len(&self) -> u64;
+
+    /// Whether the module is empty — present because clippy requires it beside [`len`](Self::len);
+    /// a real `.dig` module is never empty.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Read the `[offset, offset + len)` window of the module.
+    ///
+    /// # Errors
+    /// [`DownloadError::Sink`] when the window falls outside the module or the staged bytes cannot be
+    /// read back / no longer match the descriptor's chunk hashes. A read error is never "zeroes": the
+    /// caller MUST treat it as a failure to verify, never as absent content.
+    async fn read_at(&self, offset: u64, len: u64) -> Result<Vec<u8>, DownloadError>;
+}
+
+/// Binds a fully-staged `.dig` module to its chain-anchored `(store_id, root)` — the sole root of
+/// trust of the module pull (NC-9). dig-node injects the digstore verifier; this crate ships only the
+/// explicitly-opt-in, fail-OPEN [`AcceptAnyModuleAnchor`] for tests.
+#[async_trait]
 pub trait ModuleAnchorVerifier: Send + Sync {
-    /// Whether `module` is the genuine `.dig` container committed on-chain under `(store_id, root)`
-    /// (i.e. its embedded generation root equals the `getAnchoredRoot` value).
+    /// Whether the module behind `module` is the genuine `.dig` container committed on-chain under
+    /// `(store_id, root)` (i.e. its embedded generation root equals the `getAnchoredRoot` value).
+    ///
+    /// `module` is a **borrowed, read-only** view of the staged bytes and is valid only for the
+    /// duration of this call: it cannot be retained, and it cannot promote or mutate anything. The
+    /// bytes it yields are chunk-hash-verified and bounded to the already-hash-gated module length,
+    /// so reading them incrementally is not a weaker check than being handed the whole slice was —
+    /// it is the same bytes, materialized one window at a time.
     ///
     /// An implementation that consults the chain MUST report [`ModuleAnchor::Unavailable`] when it
     /// could not reach an answer, NEVER [`ModuleAnchor::NotAnchored`]. The two are acted on very
     /// differently: `NotAnchored` is EVIDENCE against the holder that supplied the descriptor and earns
     /// it a durable demotion, while `Unavailable` is this node's own failure and is terminal for the
     /// pull. Collapsing them lets a chain-source blip brand every honest holder tried (see
-    /// [`ModuleAnchor`]).
-    fn verify_module_anchor(&self, module: &[u8], store_id: &str, root: &str) -> ModuleAnchor;
+    /// [`ModuleAnchor`]). A read error from `module` is likewise the LOCAL node failing to read its own
+    /// staging area ⇒ `Unavailable`, not `NotAnchored`.
+    async fn verify_module_anchor(
+        &self,
+        module: &dyn ModuleReader,
+        store_id: &str,
+        root: &str,
+    ) -> ModuleAnchor;
 }
 
 /// The three answers a [`ModuleAnchorVerifier`] can give — the reason this is not a `bool`.
@@ -156,20 +212,30 @@ pub enum ModuleAnchor {
 pub struct AcceptAnyModuleAnchor;
 
 #[cfg(any(test, feature = "testkit"))]
+#[async_trait]
 impl ModuleAnchorVerifier for AcceptAnyModuleAnchor {
-    fn verify_module_anchor(&self, _module: &[u8], _store_id: &str, _root: &str) -> ModuleAnchor {
+    async fn verify_module_anchor(
+        &self,
+        _module: &dyn ModuleReader,
+        _store_id: &str,
+        _root: &str,
+    ) -> ModuleAnchor {
         ModuleAnchor::Anchored
     }
 }
 
 /// The default [`ModuleDownloadConfig::max_module_size`] — 512 MiB.
 ///
-/// The puller assembles the module in memory, so this bound is what ONE lying `getModuleInfo` can
-/// make a node try to allocate. It is deliberately sized to what a small node can actually hold, not
-/// to the largest conceivable capsule: a ceiling above real host memory is not a bound at all (a
-/// declared multi-gigabyte module would be an out-of-memory primitive costing the attacker one
-/// message). A deployment that genuinely reshares larger capsules raises it explicitly, having sized
-/// the host for it.
+/// **This is a DISK policy knob, no longer a memory bound (#1610).** The puller used to assemble the
+/// whole module in RAM, so the declared size was what one lying `getModuleInfo` could make a node
+/// allocate — a ceiling above host memory was then an out-of-memory primitive costing the attacker one
+/// message. Chunks are now hashed as they land and the anchor gate reads the staging area, so peak RSS
+/// is ONE CHUNK regardless of the declared size and no RAM ceiling is being defended.
+///
+/// What the bound still limits is the STAGING BYTES an unproven descriptor can make this node write to
+/// disk before either gate can reject it, so it is kept rather than removed. A deployment that
+/// reshares larger capsules now raises it on the disk budget alone; it no longer has to size host
+/// memory to the largest capsule it wants to serve.
 pub const DEFAULT_MAX_MODULE_SIZE: u64 = 512 * 1024 * 1024;
 
 /// The hard upper bound on the number of chunks a [`ModuleInfo`] may declare.
@@ -195,9 +261,10 @@ pub struct ModuleDownloadConfig {
     pub range_timeout: std::time::Duration,
 
     /// Upper bound on the `total_size` a [`ModuleInfo`] may declare. The descriptor comes from an
-    /// UNTRUSTED holder and sizes the puller's assembly buffer, so without this bound a single lying
-    /// `getModuleInfo` would make the node allocate arbitrarily much memory. A descriptor above the
-    /// bound is refused before any allocation. Defaults to [`DEFAULT_MAX_MODULE_SIZE`].
+    /// UNTRUSTED holder and sizes the bytes this node will STAGE on disk before either final gate can
+    /// reject it, so it is refused above this bound before a single range is fetched. It is a disk
+    /// policy knob, not a memory bound — see [`DEFAULT_MAX_MODULE_SIZE`]. Defaults to
+    /// [`DEFAULT_MAX_MODULE_SIZE`].
     pub max_module_size: u64,
 }
 
@@ -373,49 +440,64 @@ impl ModuleDownloader {
             sink.truncate(0).await?;
         }
 
-        // Assemble into an in-memory blob (the final whole-blob-hash + chain-anchor gate needs the
-        // complete bytes). The size is attacker-DECLARED, so the allocation is FALLIBLE: exhaustion
-        // must be a `DownloadError`, never the uncatchable abort an infallible `vec![0; n]` produces.
-        let mut blob = try_zeroed_blob(layout.total_size)?;
-        let mut done: Vec<bool> = vec![false; layout.chunk_count()];
-        self.rehydrate_done_chunks(sink, info, &layout, &mut state, &mut blob, &mut done)
-            .await;
-
-        // FETCH + ATTRIBUTE every still-missing chunk, fanned round-robin across the holders. A
-        // rehydrated chunk verified against THIS descriptor's hashes, so it already makes the
-        // descriptor credible for the exhaustion classification below.
-        let mut any_chunk_verified = done.iter().any(|d| *d);
-        for (index, already_done) in done.iter().enumerate() {
-            if *already_done {
-                continue;
-            }
+        // STAGE + HASH the module CHUNK BY CHUNK, in ascending chunk order (#1610). There is no
+        // whole-module buffer: peak RSS is ONE CHUNK, and the attacker-declared `total_size` sizes no
+        // allocation at all — it now only bounds the staged bytes on disk.
+        //
+        // The fail-closed property is unchanged, and rests on the SAME two facts as before:
+        //   1. a chunk is absorbed into the running whole-module hash only AFTER it has matched the
+        //      descriptor's `chunk_hashes[i]`, so no unattributed byte ever reaches the hash gate; and
+        //   2. bytes land in the STAGING area, which is never the artifact — promotion is the atomic
+        //      `promote_verified` below, strictly after BOTH gates pass. Nothing partially verified is
+        //      observable at the final path, exactly as when a RAM blob held the same bytes.
+        let checkpointed = std::mem::take(&mut state.done_ranges);
+        let mut hasher = Sha256::new();
+        let mut any_chunk_verified = false;
+        for index in 0..layout.chunk_count() {
             let (offset, len) = layout.chunk_span(index);
-            let bytes = match self
-                .fetch_verified_chunk(providers, info, &layout, index, store_id, root)
-                .await
-            {
-                Ok(bytes) => bytes,
-                // Exhaustion is attributed to the DESCRIPTOR whether or not a chunk has verified: a
-                // liar can buy credibility for one byte, so only the attempt budget may bound the
-                // retry (#1613). A non-recoverable failure (a sink/state fault) stays terminal — it
-                // is the local node failing, not a holder lying.
-                Err(e) if e.is_recoverable() || matches!(e, DownloadError::NotFound { .. }) => {
-                    return Err(PullFailure::UnsatisfiableDescriptor(
-                        describe_chunk_exhaustion(e, any_chunk_verified),
-                    ))
+            let staged = if checkpointed.contains(&index) {
+                self.read_back_verified_chunk(sink, info, index, offset, len)
+                    .await
+            } else {
+                None
+            };
+            let bytes = match staged {
+                Some(bytes) => bytes,
+                None => {
+                    // FETCH + ATTRIBUTE the chunk, fanned round-robin across the holders.
+                    let bytes = match self
+                        .fetch_verified_chunk(providers, info, &layout, index, store_id, root)
+                        .await
+                    {
+                        Ok(bytes) => bytes,
+                        // Exhaustion is attributed to the DESCRIPTOR whether or not a chunk has
+                        // verified: a liar can buy credibility for one byte, so only the attempt
+                        // budget may bound the retry (#1613). A non-recoverable failure (a sink/state
+                        // fault) stays terminal — it is the local node failing, not a holder lying.
+                        Err(e)
+                            if e.is_recoverable()
+                                || matches!(e, DownloadError::NotFound { .. }) =>
+                        {
+                            return Err(PullFailure::UnsatisfiableDescriptor(
+                                describe_chunk_exhaustion(e, any_chunk_verified),
+                            ))
+                        }
+                        Err(e) => return Err(PullFailure::Terminal(e)),
+                    };
+                    sink.write_at(offset, &bytes).await?;
+                    state.mark_done(index);
+                    self.state_store.save(&state).await?;
+                    bytes
                 }
-                Err(e) => return Err(PullFailure::Terminal(e)),
             };
             any_chunk_verified = true;
-            sink.write_at(offset, &bytes).await?;
-            blob[offset as usize..(offset + len) as usize].copy_from_slice(&bytes);
+            hasher.update(&bytes);
             state.mark_done(index);
-            self.state_store.save(&state).await?;
         }
 
         // The two FAIL-CLOSED final gates, BEFORE finalize. Neither pass ⇒ the staging file is never
         // promoted (the module is rejected, not written through — NC-9).
-        let assembled_hash = sha256_hex(&blob);
+        let assembled_hash = hex_of(hasher.finalize());
         if assembled_hash != info.module_hash {
             return Err(PullFailure::BadDescriptor(DownloadError::Verify(
                 VerifyError::Metadata(format!(
@@ -424,7 +506,29 @@ impl ModuleDownloader {
                 )),
             )));
         }
-        match self.anchor.verify_module_anchor(&blob, store_id, root) {
+        // The anchor gate reads the staging area through a bounded, read-only, chunk-re-verifying
+        // window instead of being handed the whole module. It runs AFTER the whole-module hash gate,
+        // so every byte it can see belongs to a blob this node has already hashed end to end, and it
+        // runs BEFORE `promote_verified`, so its verdict still gates the whole artifact.
+        //
+        // The gate reads through the SINK, so a sink that cannot expose its staged bytes is refused
+        // here — explicitly, and named for what it is. Such a sink could never be promoted either
+        // (`promote_verified` refuses an unprovable staged length), so this is the same refusal one
+        // step earlier; naming it "the chain anchor could not be verified" would blame the chain for a
+        // local capability the sink simply does not have.
+        if !sink.supports_read_back() {
+            return Err(PullFailure::Terminal(DownloadError::sink(
+                "this sink cannot read back its staged bytes, so the chain-anchor gate has nothing \
+                 to read and the module could never be promoted; implement Sink::read_at + \
+                 Sink::supports_read_back",
+            )));
+        }
+        let reader = StagedModuleReader::new(sink, &layout, &info.chunk_hashes);
+        match self
+            .anchor
+            .verify_module_anchor(&reader, store_id, root)
+            .await
+        {
             ModuleAnchor::Anchored => {}
             ModuleAnchor::NotAnchored => {
                 return Err(PullFailure::BadDescriptor(DownloadError::Verify(
@@ -631,43 +735,137 @@ impl ModuleDownloader {
         }
     }
 
-    /// Read each already-checkpointed chunk back from the sink's staging area into `blob`, marking it
-    /// `done` so it is not re-fetched.
+    /// Read one already-checkpointed chunk back from the sink's staging area, returning it only if it
+    /// still passes the SAME attribution a freshly-fetched chunk gets.
     ///
-    /// A staged chunk is RE-ATTRIBUTED against `chunk_hashes` exactly like a freshly-fetched one: the
-    /// staging file is not a trusted input (it survives a crash, another process, and bit-rot), so a
-    /// resumed pull must not inherit corruption it can no longer localize. A chunk that cannot be read
-    /// back, reads short, or fails its hash is left NOT done and simply re-fetched, and the checkpoint
-    /// is corrected to match — resume is an optimization, never a correctness dependency (#1605).
-    async fn rehydrate_done_chunks(
+    /// The staging file is not a trusted input (it survives a crash, another process, and bit-rot), so
+    /// a resumed pull must not inherit corruption it can no longer localize. A chunk that cannot be
+    /// read back, reads short, or fails its hash yields `None` and is simply re-fetched — resume is an
+    /// optimization, never a correctness dependency (#1605).
+    async fn read_back_verified_chunk(
         &self,
         sink: &dyn Sink,
         info: &ModuleInfo,
-        layout: &ChunkPlan,
-        state: &mut DownloadState,
-        blob: &mut [u8],
-        done: &mut [bool],
-    ) {
-        for index in std::mem::take(&mut state.done_ranges) {
-            if index >= layout.chunk_count() {
-                continue;
-            }
-            let (offset, len) = layout.chunk_span(index);
-            let Ok(bytes) = sink.read_at(offset, len).await else {
-                continue;
-            };
-            if bytes.len() as u64 != len || sha256_hex(&bytes) != info.chunk_hashes[index] {
-                tracing::warn!(
-                    chunk = index,
-                    offset,
-                    "staged chunk failed re-attribution on resume; re-fetching"
-                );
-                continue;
-            }
-            blob[offset as usize..(offset + len) as usize].copy_from_slice(&bytes);
-            done[index] = true;
-            state.mark_done(index);
+        index: usize,
+        offset: u64,
+        len: u64,
+    ) -> Option<Vec<u8>> {
+        let bytes = sink.read_at(offset, len).await.ok()?;
+        if bytes.len() as u64 != len || sha256_hex(&bytes) != info.chunk_hashes[index] {
+            tracing::warn!(
+                chunk = index,
+                offset,
+                "staged chunk failed re-attribution on resume; re-fetching"
+            );
+            return None;
         }
+        Some(bytes)
+    }
+}
+
+/// The [`ModuleReader`] the puller hands the anchor gate: a bounded, read-only, chunk-re-verifying
+/// window onto the sink's staging area (#1610).
+///
+/// It exists so the gate never needs the whole module in RAM. Two properties make that safe to
+/// substitute for the `&[u8]` it replaced:
+///
+/// - **Bounded.** Reads outside `[0, total_size)` are refused, so the gate cannot see a byte outside
+///   the blob the whole-module hash gate accepted — including any longer tail a demoted descriptor
+///   may have left staged (a staging area is never shortened by writing).
+/// - **Re-verified.** Every chunk is re-read from the artifact and re-hashed against the descriptor's
+///   `chunk_hashes` on each read, so a staging area mutated between the hash gate and the anchor gate
+///   fails closed instead of feeding the gate bytes nothing has attributed. Being handed a RAM blob
+///   gave weaker cover than this: it verified a COPY while promotion promoted the file.
+///
+/// Peak memory for one read is the caller's requested span plus one chunk. The anchor verifier is an
+/// injected, trusted component of the node (never a peer), so the span is not attacker-controlled.
+struct StagedModuleReader<'a> {
+    sink: &'a dyn Sink,
+    layout: &'a ChunkPlan,
+    chunk_hashes: &'a [String],
+}
+
+impl<'a> StagedModuleReader<'a> {
+    fn new(sink: &'a dyn Sink, layout: &'a ChunkPlan, chunk_hashes: &'a [String]) -> Self {
+        StagedModuleReader {
+            sink,
+            layout,
+            chunk_hashes,
+        }
+    }
+
+    /// Read chunk `index` back from staging and re-attribute it against the descriptor.
+    async fn verified_chunk(&self, index: usize) -> Result<Vec<u8>, DownloadError> {
+        let (offset, len) = self.layout.chunk_span(index);
+        let bytes = self.sink.read_at(offset, len).await?;
+        if bytes.len() as u64 != len {
+            return Err(DownloadError::sink(format!(
+                "staged chunk {index} reads {} bytes, expected {len}",
+                bytes.len()
+            )));
+        }
+        if sha256_hex(&bytes) != self.chunk_hashes[index] {
+            return Err(DownloadError::sink(format!(
+                "staged chunk {index} no longer matches its verified hash"
+            )));
+        }
+        Ok(bytes)
+    }
+}
+
+#[async_trait]
+impl ModuleReader for StagedModuleReader<'_> {
+    fn len(&self) -> u64 {
+        self.layout.total_size
+    }
+
+    async fn read_at(&self, offset: u64, len: u64) -> Result<Vec<u8>, DownloadError> {
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+        let end = offset.checked_add(len).filter(|e| *e <= self.len());
+        let Some(end) = end else {
+            return Err(DownloadError::sink(format!(
+                "read [{offset}, {offset}+{len}) falls outside the {}-byte module",
+                self.len()
+            )));
+        };
+        let mut out = Vec::with_capacity(usize::try_from(len).map_err(|_| {
+            DownloadError::sink(format!(
+                "read of {len} bytes exceeds this platform's address space"
+            ))
+        })?);
+        // Start at the last chunk beginning at or before `offset`; zero-length chunks in between are
+        // stepped over by the loop rather than special-cased.
+        let mut index = self
+            .layout
+            .offsets
+            .partition_point(|&start| start <= offset)
+            .saturating_sub(1);
+        while (out.len() as u64) < len {
+            if index >= self.layout.chunk_count() {
+                // Unreachable while `end <= total_size` holds, but fail CLOSED rather than return a
+                // short read that a caller could mistake for the whole window.
+                return Err(DownloadError::sink(format!(
+                    "the staged chunk plan does not cover [{offset}, {end})"
+                )));
+            }
+            let (chunk_offset, chunk_len) = self.layout.chunk_span(index);
+            if chunk_len == 0 {
+                index += 1;
+                continue;
+            }
+            let chunk = self.verified_chunk(index).await?;
+            let want_from = offset + out.len() as u64;
+            let start = usize::try_from(want_from - chunk_offset).unwrap_or(usize::MAX);
+            let take = chunk
+                .len()
+                .saturating_sub(start)
+                .min(usize::try_from(len - out.len() as u64).unwrap_or(usize::MAX));
+            out.extend_from_slice(&chunk[start..start + take]);
+            index += 1;
+        }
+        Ok(out)
     }
 }
 
@@ -812,40 +1010,6 @@ impl From<DownloadError> for PullFailure {
     }
 }
 
-/// Allocate the `total_size`-byte assembly buffer FALLIBLY, attributing the two ways it can fail
-/// DIFFERENTLY.
-///
-/// `total_size` is attacker-declared (bounded only by [`ModuleDownloadConfig::max_module_size`]), and
-/// `vec![0u8; n]` aborts the process via `handle_alloc_error` when the allocation fails — an uncatchable
-/// death a hostile descriptor must never be able to cause. So the reservation is fallible. What it fails
-/// AS then decides two INDEPENDENT things — who is blamed, and what happens next — and both have to be
-/// chosen deliberately:
-///
-/// - a size that does not fit this platform's address space is a claim that cannot describe any real
-///   resource ⇒ the DESCRIPTOR is proven false: blame its source, durably.
-/// - a reservation this host cannot satisfy says nothing about the holder ⇒ blame NOBODY, but still try
-///   the next holder's descriptor. It is [`PullFailure::UnsatisfiableDescriptor`], not `Terminal`:
-///   `Terminal` would kill the pull outright, and a ~100-byte self-consistent descriptor with an inflated
-///   `total_size` is then all it takes to make a capsule permanently undownloadable on this node — the
-///   one-message reshare denial the whole descriptor-retry budget exists to bound. The declared size is
-///   also remotely inducible pressure (every concurrent pull reserves up to `max_module_size`), which is
-///   an argument for routing AROUND it, not for surrendering to it.
-fn try_zeroed_blob(total_size: u64) -> Result<Vec<u8>, PullFailure> {
-    let len = usize::try_from(total_size).map_err(|_| {
-        PullFailure::BadDescriptor(DownloadError::Verify(VerifyError::Metadata(format!(
-            "declared module total_size {total_size} does not fit this platform's address space"
-        ))))
-    })?;
-    let mut blob: Vec<u8> = Vec::new();
-    blob.try_reserve_exact(len).map_err(|e| {
-        PullFailure::UnsatisfiableDescriptor(DownloadError::sink(format!(
-            "this host cannot allocate the {len}-byte module assembly buffer this descriptor declares:              {e}"
-        )))
-    })?;
-    blob.resize(len, 0); // within the reservation above — no further allocation
-    Ok(blob)
-}
-
 /// Why each holder could not serve a step, accumulated so the terminal error explains the failure
 /// instead of swallowing it (#836). Holder ids are sentinelled — a `provider_peer_id` is free-form
 /// text off the wire, and a log an attacker can write is not evidence (#1603).
@@ -894,8 +1058,8 @@ impl ChunkPlan {
     /// typed rejection, not a panic (see the inline note below).
     ///
     /// The size bound is checked FIRST and before any allocation: the descriptor comes from an
-    /// untrusted holder and `total_size` sizes the puller's assembly buffer, so an unbounded declared
-    /// size is a one-message memory-exhaustion attack.
+    /// untrusted holder and `total_size` bounds the bytes staged on disk before either final gate can
+    /// reject them.
     fn from_info(info: &ModuleInfo, max_module_size: u64) -> Result<Self, PullFailure> {
         // Every rejection below is a statement about the DESCRIPTOR, so it is attributable to the holder
         // that supplied it. The one exception is the allocation further down, which is a local outcome —
@@ -952,8 +1116,8 @@ impl ChunkPlan {
         let mut offsets = Vec::new();
         // Not descriptor evidence — the count is already bounded above, so a refusal here is this host
         // running out of memory and must brand nobody. But it is still UNSATISFIABLE rather than
-        // terminal: another holder's descriptor deserves a try (see `try_zeroed_blob` for why the two
-        // axes — blame and next-step — are chosen separately).
+        // terminal: another holder's descriptor deserves a try (blame and next-step are two
+        // INDEPENDENT axes, chosen separately).
         offsets.try_reserve_exact(chunk_lens.len()).map_err(|e| {
             PullFailure::UnsatisfiableDescriptor(DownloadError::sink(format!(
                 "this host cannot allocate the {}-entry chunk plan this descriptor declares: {e}",
@@ -999,11 +1163,17 @@ fn merge_new_providers(
     }
 }
 
-/// The 64-hex SHA-256 of `bytes` — the module + per-chunk content-id derivation.
+/// The 64-hex SHA-256 of `bytes` — the per-chunk content-id derivation.
 fn sha256_hex(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
+    hex_of(Sha256::digest(bytes))
+}
+
+/// Lower-hex a digest. Split out from [`sha256_hex`] because the whole-module hash is now accumulated
+/// INCREMENTALLY over the chunks (#1610) and so finalizes a digest that never had a contiguous
+/// `&[u8]` behind it.
+fn hex_of(digest: impl AsRef<[u8]>) -> String {
     let mut out = String::with_capacity(64);
-    for b in digest {
+    for b in digest.as_ref() {
         out.push(char::from_digit((b >> 4) as u32, 16).unwrap());
         out.push(char::from_digit((b & 0x0f) as u32, 16).unwrap());
     }
@@ -1407,11 +1577,11 @@ mod tests {
         );
     }
 
-    /// A hostile `getModuleInfo` descriptor declares a `total_size` the puller would allocate an
-    /// assembly buffer for. Without a bound, one lying holder can OOM the node — so the declared size
-    /// is refused against a configured cap BEFORE any allocation.
+    /// A hostile `getModuleInfo` descriptor declares a `total_size` the puller would STAGE on disk
+    /// before either final gate could reject it. The declared size is refused against the configured
+    /// cap before a single range is fetched.
     #[tokio::test]
-    async fn an_oversized_declared_module_is_refused_before_allocation() {
+    async fn an_oversized_declared_module_is_refused_before_staging() {
         let store_id = hex_id(0xF1);
         let root = hex_id(0xF2);
         let transport = Arc::new(
@@ -2432,28 +2602,26 @@ mod tests {
         assert!(!sink.0.is_finalized().await, "and it never finalized");
     }
 
-    /// GATE — a failed allocation blames NOBODY and still routes to the next descriptor.
+    /// A declared size far past any real module costs no allocation at all (#1610).
     ///
-    /// Two independent axes, and this failure needs a deliberate answer on each. WHO failed: this host,
-    /// so nothing durable may be recorded against the holder (the pressure is remotely inducible — every
-    /// concurrent pull reserves up to `max_module_size` for an attacker-declared size). WHAT NEXT: try
-    /// another holder's descriptor, because `Terminal` would let a ~100-byte self-consistent descriptor
-    /// with an inflated `total_size` make a capsule permanently undownloadable. `UnsatisfiableDescriptor`
-    /// is the arm that says both; asserting only "not proven false" or only "terminal" pins half of it.
-    ///
-    /// An ~18 EiB reservation fails on every host without touching a page, so this is deterministic.
+    /// Before #1610 this descriptor made the puller try to reserve ~18 EiB — the failure the deleted
+    /// `try_zeroed_blob` had to classify. The plan now derives from the descriptor without allocating
+    /// anything proportional to `total_size`, so the same hostile claim is simply *planned* and then
+    /// dies as unfetchable chunks (see the two end-to-end tests below). Pinning it here keeps the
+    /// no-allocation property from silently regressing back into a reservation.
     #[test]
-    fn a_failed_allocation_brands_nobody_and_still_allows_another_descriptor() {
-        let err = try_zeroed_blob(u64::MAX).expect_err("this host cannot reserve 18 EiB");
-        assert!(
-            !err.is_proven_false(),
-            "a local allocation outcome must never be attributable to a holder"
-        );
-        assert!(
-            matches!(err, PullFailure::UnsatisfiableDescriptor(_)),
-            "and it must NOT be terminal — another holder's descriptor is still worth trying: {}",
-            err.error()
-        );
+    fn an_18_exbibyte_declaration_costs_no_allocation() {
+        let hostile = ModuleInfo {
+            total_size: u64::MAX,
+            module_hash: hex_id(0x01),
+            chunk_hashes: vec![hex_id(0x02)],
+            chunk_lens: vec![u64::MAX],
+        };
+        let Ok(plan) = ChunkPlan::from_info(&hostile, u64::MAX) else {
+            panic!("the plan is derived, not allocated — an 18 EiB claim is now cheap to hold")
+        };
+        assert_eq!(plan.total_size, u64::MAX);
+        assert_eq!(plan.chunk_count(), 1);
     }
 
     /// GATE, end to end — a ~100-byte inflated descriptor must not deny the capsule.
@@ -2466,7 +2634,7 @@ mod tests {
     /// Only the LIAR inflates. With every holder inflating — as this test first did — a puller that dies
     /// instead of retrying is indistinguishable from one that recovers, so the regression was invisible.
     #[tokio::test]
-    async fn an_honest_holder_completes_the_pull_after_an_unallocatable_descriptor() {
+    async fn an_honest_holder_completes_the_pull_after_an_impossible_descriptor() {
         let store_id = hex_id(0x8A);
         let root = hex_id(0x8B);
         let key = module_download_key(&store_id, &root);
@@ -2509,15 +2677,16 @@ mod tests {
                 .await
                 .unwrap()
                 .is_empty(),
-            "and NOBODY is branded for this host's memory limits — not even the liar, since the \
-             allocation is not evidence about a peer"
+            "and NOBODY is branded: an unsatisfiable descriptor is not PROOF the holder lied — the \
+             bytes it declares may simply be unavailable"
         );
+        let _ = &liar;
     }
 
-    /// The same failure when NO holder offers an allocatable module: the pull fails (bounded by the
-    /// attempt budget) and still records nothing against anyone.
+    /// The same failure when EVERY holder declares an impossible module: the pull fails closed
+    /// (bounded by the attempt budget) and promotes nothing.
     #[tokio::test]
-    async fn no_holder_is_branded_when_none_offers_an_allocatable_module() {
+    async fn every_holder_declaring_an_impossible_module_fails_closed() {
         let store_id = hex_id(0x8E);
         let root = hex_id(0x8F);
         let key = module_download_key(&store_id, &root);
@@ -2541,16 +2710,16 @@ mod tests {
         downloader
             .download(&store_id, &root, &sink)
             .await
-            .expect_err("no holder can offer a module this host can hold");
+            .expect_err("no holder offers a module that could exist");
         assert!(
             state_store
                 .bad_descriptor_peers(&key)
                 .await
                 .unwrap()
                 .is_empty(),
-            "no holder is branded for THIS host's memory limits"
+            "no holder is branded for a descriptor merely unsatisfiable"
         );
-        assert!(!sink.is_finalized().await);
+        assert!(!sink.is_finalized().await, "and nothing is promoted");
     }
 
     /// GATE — an anchor gate that cannot REACH an answer must not brand the holder.
@@ -2601,5 +2770,194 @@ mod tests {
             !sink.is_finalized().await,
             "fail-closed: nothing is promoted while the anchor is unproven"
         );
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // #1610 — the streaming whole-module hash + the reader-based anchor gate.
+    // ---------------------------------------------------------------------------------------------
+
+    /// The whole-module hash is taken in CHUNK order, not in the order chunks became available.
+    ///
+    /// The nearest wrong implementation absorbs each chunk as it lands — which is what the previous
+    /// structure did in effect, rehydrating the checkpointed chunks first and only then fetching the
+    /// rest. Every existing resume test survives that bug, because their checkpoints hold a PREFIX
+    /// (chunks 0,1): prefix-first arrival order and ascending chunk order are the same sequence, so
+    /// the fixture cannot tell them apart.
+    ///
+    /// The distinguishing fixture is a checkpoint holding exactly the MIDDLE chunk of five, over
+    /// content where every chunk differs. Arrival-order hashing then computes `c2‖c0‖c1‖c3‖c4`, which
+    /// fails the whole-module gate; chunk-order hashing completes the pull.
+    #[tokio::test]
+    async fn the_whole_module_hash_is_taken_in_chunk_order_not_arrival_order() {
+        let store_id = hex_id(0x90);
+        let root = hex_id(0x91);
+        let key = module_download_key(&store_id, &root);
+        // 40 bytes / 8 = 5 chunks, each with distinct content.
+        let module = (0u8..40).collect::<Vec<u8>>();
+
+        // Stage ONLY the middle chunk (index 2, bytes [16, 24)) and checkpoint exactly it.
+        let sink = InMemorySink::new();
+        sink.write_at(16, &module[16..24]).await.unwrap();
+        let state_store = Arc::new(InMemoryStateStore::new());
+        let mut state = DownloadState::new(&key);
+        state.total_length = module.len() as u64;
+        state.chunk_lens = vec![8; 5];
+        state.mark_done(2);
+        state_store.save(&state).await.unwrap();
+
+        let downloader = ModuleDownloader::new(
+            locator_with(1, &store_id, &root),
+            Arc::new(MockModuleTransport::serving(
+                &store_id,
+                &root,
+                module.clone(),
+                8,
+            )),
+            // Anchored on the exact bytes — so this test also proves the READER reassembles the module
+            // the gate sees in chunk order, not merely that the hash does.
+            Arc::new(crate::testkit::OnlyThisModuleAnchor::new(module.clone())),
+            state_store,
+            ModuleDownloadConfig::default(),
+        );
+
+        let len = downloader
+            .download(&store_id, &root, &sink)
+            .await
+            .expect("a mid-module checkpoint resumes and still passes both gates");
+        assert_eq!(len, module.len() as u64);
+        assert_eq!(sink.contents().await, module);
+        assert!(sink.is_finalized().await);
+    }
+
+    /// The anchor gate cannot read outside the module the whole-module hash gate accepted.
+    ///
+    /// A staging area is never SHORTENED by writing, so bytes past `total_size` can genuinely be
+    /// there — a longer earlier attempt's tail. An unbounded reader would hand them to the gate as if
+    /// they were part of the verified artifact.
+    #[tokio::test]
+    async fn the_anchor_gate_cannot_read_past_the_verified_module() {
+        /// An anchor gate that tries to read one byte beyond the module's end.
+        struct ReadsPastTheEnd;
+
+        #[async_trait]
+        impl ModuleAnchorVerifier for ReadsPastTheEnd {
+            async fn verify_module_anchor(
+                &self,
+                module: &dyn ModuleReader,
+                _store_id: &str,
+                _root: &str,
+            ) -> ModuleAnchor {
+                match module.read_at(module.len().saturating_sub(1), 2).await {
+                    Ok(_) => ModuleAnchor::Anchored,
+                    Err(e) => ModuleAnchor::Unavailable(e.to_string()),
+                }
+            }
+        }
+
+        let store_id = hex_id(0x92);
+        let root = hex_id(0x93);
+        let module = (0u8..40).collect::<Vec<u8>>();
+
+        let downloader = ModuleDownloader::new(
+            locator_with(1, &store_id, &root),
+            Arc::new(MockModuleTransport::serving(
+                &store_id,
+                &root,
+                module.clone(),
+                8,
+            )),
+            Arc::new(ReadsPastTheEnd),
+            Arc::new(InMemoryStateStore::new()),
+            ModuleDownloadConfig::default(),
+        );
+        let sink = InMemorySink::new();
+
+        let err = downloader
+            .download(&store_id, &root, &sink)
+            .await
+            .expect_err("a read past the verified end is refused, so the gate reaches no answer");
+        assert!(
+            err.to_string().contains("falls outside"),
+            "the refusal names the out-of-range window: {err}"
+        );
+        assert!(!sink.is_finalized().await, "and nothing is promoted");
+    }
+
+    /// Staging bytes that change between the hash gate and the anchor read fail CLOSED, and brand
+    /// nobody.
+    ///
+    /// The two gates now read the staging area at two different moments (they used to share one RAM
+    /// copy), so the window between them has to be closed by re-attributing every chunk the reader
+    /// serves. Asserting only "the pull fails" would not distinguish a reader that re-verifies from
+    /// one that does not: without the check the anchor gate simply sees the corrupted bytes and
+    /// answers `NotAnchored`, which also fails the pull — but as a durable verdict against a holder
+    /// that did nothing wrong. So the load-bearing assertion is WHO gets blamed.
+    #[tokio::test]
+    async fn staging_corrupted_between_the_two_gates_fails_closed_and_brands_nobody() {
+        /// A sink that stages honestly but returns a flipped byte on read-back — a staging area
+        /// mutated (by bit-rot, another process, or a local attacker) after the hash gate passed.
+        struct CorruptingReadBack(InMemorySink);
+
+        #[async_trait]
+        impl Sink for CorruptingReadBack {
+            async fn write_at(&self, offset: u64, bytes: &[u8]) -> Result<(), DownloadError> {
+                self.0.write_at(offset, bytes).await
+            }
+            async fn truncate(&self, len: u64) -> Result<(), DownloadError> {
+                self.0.truncate(len).await
+            }
+            fn supports_read_back(&self) -> bool {
+                true
+            }
+            async fn read_at(&self, offset: u64, len: u64) -> Result<Vec<u8>, DownloadError> {
+                let mut bytes = self.0.read_at(offset, len).await?;
+                if let Some(first) = bytes.first_mut() {
+                    *first ^= 0xFF;
+                }
+                Ok(bytes)
+            }
+            async fn finalize(&self) -> Result<(), DownloadError> {
+                self.0.finalize().await
+            }
+        }
+
+        let store_id = hex_id(0x94);
+        let root = hex_id(0x95);
+        let key = module_download_key(&store_id, &root);
+        let module = (0u8..40).collect::<Vec<u8>>();
+        let state_store = Arc::new(InMemoryStateStore::new());
+
+        let downloader = ModuleDownloader::new(
+            locator_with(2, &store_id, &root),
+            Arc::new(MockModuleTransport::serving(
+                &store_id,
+                &root,
+                module.clone(),
+                8,
+            )),
+            Arc::new(crate::testkit::OnlyThisModuleAnchor::new(module.clone())),
+            state_store.clone(),
+            ModuleDownloadConfig::default(),
+        );
+        let sink = CorruptingReadBack(InMemorySink::new());
+
+        let err = downloader
+            .download(&store_id, &root, &sink)
+            .await
+            .expect_err("the gate must not run on bytes nothing has attributed");
+        assert!(
+            err.to_string()
+                .contains("no longer matches its verified hash"),
+            "the failure names the staging area, not the chain or a holder: {err}"
+        );
+        assert!(
+            state_store
+                .bad_descriptor_peers(&key)
+                .await
+                .unwrap()
+                .is_empty(),
+            "local corruption is never evidence against a holder that served correct bytes"
+        );
+        assert!(!sink.0.is_finalized().await, "and nothing is promoted");
     }
 }
