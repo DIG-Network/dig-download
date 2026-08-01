@@ -624,8 +624,19 @@ attributable machinery as §§5–10, addressed at the module blob rather than a
   - `get_module_info(provider_peer_id, store_id, root) -> ModuleInfo` (`dig.getModuleInfo`).
   - `fetch_module_range(provider_peer_id, store_id, root, offset, length) -> Vec<u8>`
     (`dig.fetchModuleRange`).
-- **`ModuleAnchorVerifier`** — `verify_module_anchor(module, store_id, root) -> bool`, binding an
-  assembled blob to its on-chain generation root. There is **NO fail-open production default**, and none is
+- **`ModuleReader`** — `len()` + `read_at(offset, len)`, a bounded random-access view of the module a
+  pull has staged. This is the seam the anchor gate reads through; the engine MUST NOT materialize the
+  whole module to run that gate. An implementation MUST guarantee both properties the engine's
+  `StagedModuleReader` provides: reads outside `[0, total_size)` are REFUSED (a staging area is never
+  shortened by writing, so bytes past the verified end can genuinely be present), and every chunk is
+  re-read from the promotable artifact and re-attributed against `chunk_hashes` on each read (the
+  whole-module-hash gate and the anchor gate read staging at two different moments; a staging area
+  mutated in between MUST fail closed rather than reach the gate unattributed). A read failure is a
+  LOCAL failure — `Unavailable`, never `NotAnchored` (section 17.6).
+- **`ModuleAnchorVerifier`** — `verify_module_anchor(module: &dyn ModuleReader, store_id, root) ->
+  ModuleAnchor`, binding a staged module to its on-chain generation root. The `module` view is borrowed
+  and read-only: it is valid only for the call, cannot be retained, and cannot promote or mutate
+  anything. There is **NO fail-open production default**, and none is
   reachable: the no-op `AcceptAnyModuleAnchor` is compiled ONLY under `cfg(test)` or the explicit `testkit`
   feature, so a default consumer build cannot name it. A production caller MUST inject a real
   chain-anchored verifier (it is a required positional argument of `ModuleDownloader::new`).
@@ -655,11 +666,12 @@ terminate in either a chunk plan or a `Verify(Metadata)` rejection. It MUST NOT 
 
 A `ModuleInfo` is rejected with `Verify(Metadata)` unless ALL hold, checked in this order:
 
-- `total_size <= max_module_size` (`DEFAULT_MAX_MODULE_SIZE` = **512 MiB**). The descriptor is UNTRUSTED and
-  `total_size` sizes the assembly buffer, so this bound MUST be checked **before any allocation** — an
-  unbounded declared size is a one-message memory-exhaustion attack. The default is deliberately sized to
-  what a modest host can hold: a ceiling above real host memory bounds nothing. A deployment that reshares
-  larger capsules raises `max_module_size` explicitly.
+- `total_size <= max_module_size` (`DEFAULT_MAX_MODULE_SIZE` = **512 MiB**). The descriptor is UNTRUSTED
+  and `total_size` sizes the bytes this node will STAGE before either final gate can reject them, so the
+  bound MUST be checked before any range is fetched. It is a **disk policy knob, not a memory bound**:
+  the engine holds one chunk regardless of the declared size (section 17.3a), so a deployment that
+  reshares larger capsules raises `max_module_size` against its disk budget alone and does NOT have to
+  size host memory to the largest capsule it serves.
 - `chunk_lens` is non-empty (without it no byte→chunk mapping, hence no per-chunk check, exists).
 - `chunk_lens.len() <= MAX_MODULE_CHUNK_COUNT` (1 Mi). The declared COUNT sizes the plan's own vectors, so an
   absurd count is the same one-message allocation attack as an absurd `total_size`; it MUST be bounded
@@ -671,11 +683,33 @@ A `ModuleInfo` is rejected with `Verify(Metadata)` unless ALL hold, checked in t
   summation (where overflow checks are on) or yields spans that index past the assembled blob.
 - Cumulative chunk offsets are likewise accumulated with **CHECKED** arithmetic.
 
-**Allocation is FALLIBLE (MUST).** Every allocation sized by the descriptor — the assembly buffer, the chunk
-plan, a staging read-back buffer — MUST use a fallible reservation and surface exhaustion as a
-`Verify(Metadata)` / `Sink` error. An infallible `vec![0; n]` aborts the process (`handle_alloc_error`),
-which an untrusted descriptor MUST never be able to cause. A declared size or span that does not fit the
-platform's `usize` is likewise a rejection, never a truncating conversion.
+**Allocation is FALLIBLE (MUST).** Every allocation sized by the descriptor — the chunk plan, a staging
+read-back buffer — MUST use a fallible reservation and surface exhaustion as a `Verify(Metadata)` /
+`Sink` error. An infallible `vec![0; n]` aborts the process (`handle_alloc_error`), which an untrusted
+descriptor MUST never be able to cause. A declared size or span that does not fit the platform's `usize`
+is likewise a rejection, never a truncating conversion.
+
+### 17.3a Bounded working set (MUST)
+
+**A pull's peak resident memory MUST be proportional to ONE CHUNK, never to the module.** No allocation
+sized by `total_size` may exist: the whole-module SHA-256 is accumulated INCREMENTALLY over the chunks,
+and the anchor gate reads through `ModuleReader` (section 17.1). A conforming engine pulls a module far
+larger than host memory.
+
+- **Chunk ORDER, not arrival order (MUST).** Chunks are absorbed into the running whole-module hash in
+  ascending chunk index, whatever order they became available in — a resumed pull that reads chunk *k*
+  back from staging MUST still absorb it at position *k*. Hashing in arrival order silently produces a
+  different digest for exactly the resumes that recover a non-prefix checkpoint.
+- **Attribute BEFORE absorbing (MUST).** A chunk enters the running hash only after it has matched
+  `chunk_hashes[index]` (freshly fetched or read back), so no unattributed byte can reach the
+  whole-module gate.
+- The staging area — not a memory buffer — holds the bytes in the meantime, and it is never the
+  artifact: promotion happens only after BOTH final gates pass (sections 17.5b, 17.6). Streaming the
+  hash therefore opens no window in which partially-verified bytes are observable at the final path.
+- A sink that cannot read its staged bytes back (`Sink::supports_read_back() == false`) MUST be refused
+  BEFORE the anchor gate, with an error naming the sink. Such a sink could never be promoted either; a
+  refusal phrased as "the chain anchor could not be verified" would blame the chain for a local
+  capability the sink does not have.
 
 ### 17.4 Per-chunk attribution (MUST — fail-closed)
 
@@ -741,19 +775,18 @@ reshare: the bytes verify per chunk, the pull assembles, and only the final gate
     holder lying.
 - **A LOCAL failure is never evidence against a holder (MUST) — and blame is a SEPARATE question from
   what happens next.** A failed allocation (the assembly buffer, the chunk plan), a sink or state-store
-  fault, and an anchor check that could not COMPLETE are outcomes of this node, not claims about a peer,
-  so none of them may record anything durable. What each does NEXT is decided independently:
+  fault, an unreadable staging area, and an anchor check that could not COMPLETE are outcomes of this
+  node, not claims about a peer, so none of them may record anything durable. What each does NEXT is
+  decided independently:
   - a sink/state fault or an incomplete anchor check is TERMINAL — the local facility the pull depends on
     is broken, and another descriptor would meet the same wall;
-  - a failed ALLOCATION is `UnsatisfiableDescriptor`: it demotes the descriptor's source for the current
-    call and tries the next holder's descriptor, bounded by `MAX_DESCRIPTOR_ATTEMPTS`. The declared size
-    is the attacker's choice, so making it terminal hands out a one-message reshare denial — a ~100-byte
-    self-consistent descriptor with an inflated `total_size` (and matching final `chunk_len`) passes the
-    ceiling, fails the reservation, and would kill every pull of that capsule on this node. Remotely
-    inducible pressure is an argument for routing AROUND a descriptor, never for surrendering the pull.
-  Allocation also must not brand: an honest descriptor for a large capsule under memory pressure would
-  otherwise convict an honest holder, and that pressure is itself remotely inducible, since every
-  concurrent pull reserves up to `max_module_size` for an attacker-declared size.
+  - a failed ALLOCATION (now only the chunk plan) is `UnsatisfiableDescriptor`: it demotes the
+    descriptor's source for the current call and tries the next holder's descriptor, bounded by
+    `MAX_DESCRIPTOR_ATTEMPTS`. Making it terminal would hand out a one-message reshare denial.
+  A descriptor declaring a size this node cannot SATISFY is likewise never proof the holder lied — the
+  bytes may simply be unavailable — so it demotes for the current call and brands nobody. (Before
+  section 17.3a this arose as a failed reservation of the assembly buffer; with no such buffer it arises
+  as chunks that never arrive, and the classification is unchanged.)
 - **Only a PROVEN-FALSE descriptor earns a DURABLE verdict (MUST).** A final-gate rejection proves the
   descriptor was false and is attributable to its source. Chunk exhaustion does not: the bytes may be
   genuinely unavailable, and the holders refusing them need not be the holder that supplied the
@@ -803,8 +836,14 @@ shortened by writing**. So:
 
 Before `Sink::finalize`, on EVERY pull including a resumed one:
 
-1. The reassembled blob's SHA-256 equals the descriptor's `module_hash`.
-2. `ModuleAnchorVerifier::verify_module_anchor(blob, store_id, root)` reports `Anchored`.
+1. The SHA-256 accumulated over the chunks in chunk order (section 17.3a) equals the descriptor's
+   `module_hash`.
+2. `ModuleAnchorVerifier::verify_module_anchor(reader, store_id, root)` reports `Anchored`, where
+   `reader` is a `ModuleReader` bounded to the length gate 1 just accepted.
+
+The gates run in that order, and both before promotion: every byte the anchor gate can read therefore
+belongs to a module this node has already hashed end to end, and the anchor verdict still gates the
+whole artifact.
 
 The anchor answer is THREE-valued (`Anchored` / `NotAnchored` / `Unavailable`), and an implementation that
 consults the chain MUST report `Unavailable` when it could not reach an answer:

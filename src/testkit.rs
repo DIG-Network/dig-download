@@ -1003,10 +1003,11 @@ fn hex_sha256(bytes: &[u8]) -> String {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RejectAllModuleAnchor;
 
+#[async_trait]
 impl crate::module::ModuleAnchorVerifier for RejectAllModuleAnchor {
-    fn verify_module_anchor(
+    async fn verify_module_anchor(
         &self,
-        _module: &[u8],
+        _module: &dyn crate::module::ModuleReader,
         _store_id: &str,
         _root: &str,
     ) -> crate::module::ModuleAnchor {
@@ -1024,10 +1025,11 @@ impl crate::module::ModuleAnchorVerifier for RejectAllModuleAnchor {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct UnreachableChainAnchor;
 
+#[async_trait]
 impl crate::module::ModuleAnchorVerifier for UnreachableChainAnchor {
-    fn verify_module_anchor(
+    async fn verify_module_anchor(
         &self,
-        _module: &[u8],
+        _module: &dyn crate::module::ModuleReader,
         _store_id: &str,
         _root: &str,
     ) -> crate::module::ModuleAnchor {
@@ -1051,14 +1053,36 @@ impl OnlyThisModuleAnchor {
     }
 }
 
+/// The window size [`OnlyThisModuleAnchor`] streams the module in.
+///
+/// Deliberately a small PRIME so windows straddle chunk boundaries at every alignment rather than
+/// landing on them: a double that read the whole module in one `read_at(0, len)` would exercise the
+/// reader's single easiest path and report a boundary bug in it as "anchored".
+const ANCHOR_READ_WINDOW: u64 = 7;
+
+#[async_trait]
 impl crate::module::ModuleAnchorVerifier for OnlyThisModuleAnchor {
-    fn verify_module_anchor(
+    /// Streams the module through the [`ModuleReader`](crate::module::ModuleReader) seam in small
+    /// windows — the way the real digstore verifier reads a `.dig` — and compares the result with the
+    /// one module this gate accepts.
+    ///
+    /// A read failure is [`Unavailable`](crate::module::ModuleAnchor::Unavailable), never
+    /// `NotAnchored`: this node failing to read its own staging area is not evidence against a holder.
+    async fn verify_module_anchor(
         &self,
-        module: &[u8],
+        module: &dyn crate::module::ModuleReader,
         _store_id: &str,
         _root: &str,
     ) -> crate::module::ModuleAnchor {
-        if module == self.0.as_slice() {
+        let mut seen: Vec<u8> = Vec::new();
+        while (seen.len() as u64) < module.len() {
+            let want = ANCHOR_READ_WINDOW.min(module.len() - seen.len() as u64);
+            match module.read_at(seen.len() as u64, want).await {
+                Ok(bytes) => seen.extend_from_slice(&bytes),
+                Err(e) => return crate::module::ModuleAnchor::Unavailable(e.to_string()),
+            }
+        }
+        if seen == self.0 {
             crate::module::ModuleAnchor::Anchored
         } else {
             crate::module::ModuleAnchor::NotAnchored
