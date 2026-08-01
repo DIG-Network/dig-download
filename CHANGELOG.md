@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.14.0] - 2026-08-01
+
+### Features
+- **module:** Verify the module anchor from a reader, not a whole-module buffer (#22)
+
 ## [0.13.0] - 2026-07-31
 
 ### Chores
