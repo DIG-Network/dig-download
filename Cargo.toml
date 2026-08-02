@@ -20,7 +20,7 @@
 # by dig-node (see the implementers' note in the crate docs).
 [package]
 name = "dig-download"
-version = "0.14.0"
+version = "0.15.0"
 edition = "2021"
 rust-version = "1.75.0"
 license = "Apache-2.0 OR MIT"
@@ -60,7 +60,7 @@ dig-constants = "0.8"
 # crate RE-EXPORTS `ContentId`/`ProviderRecord`, so their identity is part of dig-download's public
 # API — which is why this bump is breaking for consumers.
 # NC-7: prefer the crates.io release over bare-git.
-dig-dht = "0.9"
+dig-dht = "0.11"
 
 # WIRE — the whole-`.dig`-module pull descriptor + method names (#1576). `ModuleInfo`
 # (`total_size` / `module_hash` / `chunk_hashes` / `chunk_lens`) is the canonical byte-contract a
@@ -91,7 +91,7 @@ dig-rpc-protocol = "0.6"
 # The wire shapes (`RangeRequest`, `RangeFrame`, `AvailabilityItem`/`Answer`/`Response`) appear in this
 # crate's public `RangeTransport` trait, so their identity is part of dig-download's public API and this
 # bump is breaking for consumers. NC-7: prefer the crates.io release over bare-git.
-dig-nat = "0.15"
+dig-nat = "0.18"
 
 # REACH + FETCH via the shared client — dig-download talks to peers through `DigPeer`, the one DIG
 # Network peer client (#1283), rather than driving dig-nat directly: `DigPeer::connect_with_runtime`
@@ -107,7 +107,7 @@ dig-nat = "0.15"
 # class of defect, which cost six blind diagnosis rounds. dig-peer 0.5 is on dig-rpc-protocol 0.5, so
 # the tree now carries exactly ONE. dig-peer 0.5 also adds the `get_module_info` / `fetch_module_range`
 # client methods dig-node's `ModuleTransport` adapter is built on.
-dig-peer = "0.8"
+dig-peer = "0.9"
 
 # Async runtime for the orchestrator task + the concurrent range fan-out + backoff timers.
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync", "io-util"] }
