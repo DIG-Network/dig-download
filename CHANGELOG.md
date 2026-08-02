@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.15.0] - 2026-08-02
+
+### Chores
+- **deps:** Dig-nat 0.18 + dig-dht 0.11 + dig-peer 0.9 (#23)
+
 ## [0.14.0] - 2026-08-01
 
 ### Features
