@@ -62,8 +62,8 @@ fn the_peer_client_is_on_the_module_wire_major() {
     let versions = locked_versions("dig-peer");
     assert_eq!(versions.len(), 1, "one dig-peer only, found {versions:?}");
     assert!(
-        versions[0].starts_with("0.8."),
-        "dig-peer must be on the 0.8 line (dig-rpc-protocol 0.6 + the module client methods, re-exporting          dig-nat 0.15, whose `SafeText` crosses dig-peer's own error surface); the tree resolved {}",
+        versions[0].starts_with("0.9."),
+        "dig-peer must be on the 0.9 line (dig-rpc-protocol 0.6 + the module client methods, re-exporting          dig-nat 0.18, whose `SafeText` crosses dig-peer's own error surface); the tree resolved {}",
         versions[0]
     );
 }
@@ -115,13 +115,13 @@ fn the_transport_is_on_the_capped_encode_line() {
     let versions = locked_versions("dig-nat");
     assert_eq!(versions.len(), 1, "one dig-nat only, found {versions:?}");
     assert!(
-        versions[0].starts_with("0.15."),
-        "dig-nat must be on the 0.15 line (capped framed ENCODE since 0.12 for #1640, the per-frame          chunk_index setter and public constructors from 0.13, the paged-prologue reassembly primitives          from 0.14, and `SafeText` in 0.15); the tree resolved {}",
+        versions[0].starts_with("0.18."),
+        "dig-nat must be on the 0.18 line (capped framed ENCODE since 0.12 for #1640, the per-frame          chunk_index setter and public constructors from 0.13, the paged-prologue reassembly primitives          from 0.14, `SafeText` in 0.15, the RLY-009 DHT-record messages in 0.17, and the          non_exhaustive RelayMessage in 0.18 that stops a wire addition forcing this cascade again);          the tree resolved {}",
         versions[0]
     );
 }
 
-/// **Proves:** exactly one `dig-dht`, on the 0.9 line that itself carries dig-nat 0.15.
+/// **Proves:** exactly one `dig-dht`, on the 0.11 line that itself carries dig-nat 0.18.
 ///
 /// **Catches:** the published-but-unresolvable class this cascade exists to fix — a caret like
 /// `dig-dht = "0.8"` means `>=0.8.0, <0.9`, which can NEVER reach 0.9.0, so the locate leg would keep
@@ -133,8 +133,8 @@ fn the_locator_is_on_the_cascaded_dht_line() {
     let versions = locked_versions("dig-dht");
     assert_eq!(versions.len(), 1, "one dig-dht only, found {versions:?}");
     assert!(
-        versions[0].starts_with("0.9."),
-        "dig-dht must be on the 0.9 line (the release carrying dig-nat 0.15); the tree resolved {}",
+        versions[0].starts_with("0.11."),
+        "dig-dht must be on the 0.11 line (the release carrying dig-nat 0.18 + the bounded          ProviderStore::snapshot the relay's /dht view is built from); the tree resolved {}",
         versions[0]
     );
 }
