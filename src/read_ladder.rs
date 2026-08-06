@@ -489,3 +489,5 @@ mod tests {
         assert_eq!(TransportMode::default(), TransportMode::Https);
     }
 }
+
+// FIX #2164: local read-ladder rungs build URLs no dig-node listener serves; see read_ladder.rs.
