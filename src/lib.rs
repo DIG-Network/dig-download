@@ -130,9 +130,9 @@ pub use queue::{DownloadQueue, QueuedHandle, DEFAULT_MAX_ACTIVE_DOWNLOADS};
 #[cfg(feature = "http-probe")]
 pub use read_ladder::HttpHealthProbe;
 pub use read_ladder::{
-    local_urls, override_source, resolve_node, CachedResolver, HealthProbe, OverrideInputs,
-    OverrideSource, ResolvedNode, ResolvedTier, TransportMode, DEFAULT_LOCAL_NODE_PORT,
-    DEFAULT_PROBE_TIMEOUT, DIG_LOCAL_HOST, RPC_DIG_NET,
+    local_urls, override_source, resolve_node, CachedResolver, HealthProbe, LocalRung,
+    OverrideInputs, OverrideSource, ResolvedNode, ResolvedTier, TransportMode,
+    DEFAULT_LOCAL_NODE_PORT, DEFAULT_PROBE_TIMEOUT, DIG_LOCAL_HOST, RPC_DIG_NET,
 };
 pub use select::{
     CandidateRef, NullSelector, RangeOutcome, RangeResult, SelectPlan, SelectRequest,
