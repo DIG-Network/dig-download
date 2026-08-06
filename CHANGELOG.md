@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.16.0] - 2026-08-06
+
+### Bug Fixes
+- **read-ladder:** Local rungs must target dig-node's real listeners, not https://host:port (#2164)
+
 ## [0.15.0] - 2026-08-02
 
 ### Chores
