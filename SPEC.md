@@ -119,14 +119,31 @@ Before dig-nat 0.13.0 every one of these was "first frame only", because the who
 one frame or the range was unservable. An implementation MUST NOT treat `chunk_index` as
 first-frame-only: it is identity, and a chunk-aligned continuation frame states it.
 
+A `chunk_lens` layout arrives in one of two shapes, and a reader MUST handle both:
+
+- **Single-frame layout** — the whole `chunk_lens` array rides the first frame (`chunk_count` absent,
+  or equal to the array's length). This is the pre-0.13.0 shape and stays readable.
+- **Paged prologue** — a layout too large for one frame (`chunk_count` greater than the first frame's
+  `chunk_lens` length). The first frame carries the array's FIRST page while declaring the whole
+  `chunk_count`, and successive frames each carry another page stamped with the entry `chunk_lens_offset`
+  it begins at. A reader MUST reassemble the pages into one array, placing each page at its offset, and
+  has the whole layout once it holds `chunk_count` entries.
+
 A reader MUST NOT adopt an INCOMPLETE `chunk_lens` as a layout. `chunk_lens` is a decrypt input —
 per-chunk AES-GCM-SIV needs the whole array — so a partial array is not a degraded layout but one
-that decrypts every chunk to garbage. The sum check in section 4 ("`chunk_lens` MUST sum to
-`total_length`") is what enforces this: a single page of a paged prologue sums short and is rejected.
-Reassembling a paged prologue across frames is NOT yet implemented by this crate; such a resource is
-refused rather than mis-read, and the refusal is NAMED: a holder that declares a `chunk_count` larger
-than the number of `chunk_lens` entries it delivers MUST be rejected as `PagedPrologueUnsupported` — reporting it
-as a generic all-holders-failed result cannot be told apart from "nobody holds this content".
+that decrypts every chunk to garbage. Reassembly is therefore **fail-closed**: the array is adopted
+ONLY when every page has landed. A prologue that ends short of `chunk_count`, or a page that is
+misaligned (offset not a multiple of the 2048-entry page size), duplicated, or overshoots the declared
+count, yields NO layout at all — the holder is skipped with a RECOVERABLE error, never believed with a
+partial array. The refusal for an incomplete prologue is NAMED `PagedPrologueUnsupported` (carrying the
+declared `chunk_count` and the entries delivered), so "this holder served a short layout" is never
+reported as a generic all-holders-failed result that cannot be told apart from "nobody holds this
+content". The reassembled array is additionally re-checked by the section-4 sum rule ("`chunk_lens`
+MUST sum to `total_length`") as a second, independent gate.
+
+The establish probe requests the layout (no `skip_layout`) so exactly one stream pages in the whole
+array; every subsequent scheduled data range sets `skip_layout` because the reader already holds the
+complete `chunk_lens` for that root, so a large prologue is not re-paged on every parallel stream.
 
 ---
 
@@ -508,10 +525,13 @@ none could seed a layout, and MUST carry the per-holder reason. A refutation by 
 as `Verify(VerifyError::Root)` (or `Length`), never re-described as a discovery or compatibility failure. An
 implementation MUST NOT collapse these into one error.
 
-`PagedPrologueUnsupported` names a READER limitation and MUST NOT be phrased as a holder fault. A holder
-paging its prologue is conforming, and the 1-byte metadata probe legitimately receives only the first page,
-so a conforming pager and a holder that would never have paged are indistinguishable from the adoption
-path — attributing it would blame a peer that did nothing wrong.
+`PagedPrologueUnsupported` names an INCOMPLETE layout: the reader reassembles a paged prologue (above),
+so a conforming multi-page holder now reads end-to-end, and this error is raised only when the layout
+cannot be completed — a prologue that ends short of `chunk_count`, or a first frame declaring no
+multi-page layout that a later frame nonetheless pages. It carries the declared `chunk_count` and the
+entries delivered, and is RECOVERABLE: the offending holder is skipped, never adopted with a partial
+array. (A hostile page that violates a placement rule — misaligned, duplicated, overshooting — surfaces
+instead as a recoverable `Transport` rejection naming the broken rule.)
 
 `VerifyError`: `Length { expected, actual }`, `Metadata(reason)`, `Alignment(reason)`, `Root`,
 `MissingMetadata(reason)`. Every `VerifyError` is recoverable at the range level (the source is

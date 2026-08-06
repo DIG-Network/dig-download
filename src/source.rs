@@ -14,7 +14,10 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use dig_dht::ProviderRecord;
-use dig_nat::{AvailabilityItem, AvailabilityResponse, RangeFrame, RangeRequest};
+use dig_nat::{
+    AvailabilityItem, AvailabilityResponse, ChunkLensAssembler, ChunkLensError, RangeFrame,
+    RangeRequest,
+};
 use dig_peer::DigPeer;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
@@ -374,6 +377,18 @@ fn check_unrevised<T: PartialEq + std::fmt::Debug>(
 /// mid-stream, or restates the once-per-stream prologue, fails the whole fetch instead of being
 /// believed on frame 1. Nothing beneath this reader performs that check.
 ///
+/// # Paged prologue
+///
+/// A resource whose `chunk_lens` array is too large to state on one frame is served as a **paged
+/// prologue**: the first frame declares the whole array's `chunk_count` but carries only its first
+/// page, and successive frames each carry another page stamped with the entry `chunk_lens_offset` it
+/// begins at (dig-nat `SPEC.md` §5.1.1). This reader reassembles those pages into one array via
+/// [`ChunkLensAssembler`], and sets [`RangeMeta::chunk_lens`] to the FULL array only once every page
+/// has landed. The reassembly is **fail-closed**: `chunk_lens` is a decrypt input (per-chunk
+/// AES-GCM-SIV needs the whole array, whose entries must sum to `total_length`), so a stream whose
+/// prologue ends short — or whose page is misaligned, duplicated, or overshoots — yields NO layout at
+/// all rather than a partial one, and the holder is skipped (a RECOVERABLE error) rather than believed.
+///
 /// This is the pure, network-free core of [`NatRangeTransport::fetch_range`] and is
 /// unit-tested by feeding encoded frames through an in-memory reader.
 pub async fn assemble_range_stream<R: AsyncRead + Unpin>(
@@ -383,6 +398,9 @@ pub async fn assemble_range_stream<R: AsyncRead + Unpin>(
     let mut buf: Vec<u8> = Vec::new();
     let mut meta = RangeMeta::default();
     let mut identity: Option<StreamIdentity> = None;
+    // Reassembles the `chunk_lens` array of a paged prologue across frames. Built lazily on the first
+    // frame that declares more entries than it carries, and `None` for the ordinary single-frame layout.
+    let mut assembler: Option<ChunkLensAssembler> = None;
     // One past the furthest byte any frame has contributed — the progress the termination guard at the
     // bottom of the loop requires each non-final frame to advance.
     let mut byte_frontier: u64 = 0;
@@ -396,10 +414,31 @@ pub async fn assemble_range_stream<R: AsyncRead + Unpin>(
         let Some(frame) = frame else {
             break; // clean end-of-stream
         };
+        // Whether THIS frame advanced the paged prologue. A prologue page may carry zero data bytes, so
+        // the termination guard must count an accepted page as progress or a legitimately data-less page
+        // would look like a stalled stream.
+        let mut accepted_page = false;
         match identity.as_mut() {
             None => {
                 meta = RangeMeta::from_frame(&frame);
                 identity = Some(StreamIdentity::from_first_frame(&frame));
+                // A layout too large for one frame is paged: the first frame declares the whole array's
+                // `chunk_count` while carrying only its first page. Begin reassembly so the pages that
+                // arrive on later frames land in one array. `ChunkLensAssembler::new` refuses a
+                // `chunk_count` above `MAX_RESOURCE_CHUNK_COUNT` before it allocates.
+                if let Some(chunk_count) = frame.chunk_count {
+                    let delivered = frame.chunk_lens.as_ref().map_or(0, Vec::len) as u64;
+                    if chunk_count > delivered {
+                        let mut asm = ChunkLensAssembler::new(chunk_count as usize)
+                            .map_err(chunk_lens_error)?;
+                        if let Some(page) = &frame.chunk_lens {
+                            asm.accept_page(frame.chunk_lens_offset.unwrap_or(0), page)
+                                .map_err(chunk_lens_error)?;
+                            accepted_page = true;
+                        }
+                        assembler = Some(asm);
+                    }
+                }
             }
             Some(identity) => {
                 let verdict = identity.check_later_frame(&frame).map_err(|reason| {
@@ -408,23 +447,53 @@ pub async fn assemble_range_stream<R: AsyncRead + Unpin>(
                         reason,
                     }
                 })?;
-                if let LaterFrame::NewProloguePage { .. } = verdict {
-                    // The holder is CONFORMING and this reader is the limitation, so the error says so
-                    // rather than blaming it. This is the single line the paged-prologue work replaces
-                    // with `ChunkLensAssembler::accept_page`, which is why the classification above is
-                    // written to survive that change instead of being deleted by it.
-                    return Err(DownloadError::PagedPrologueUnsupported {
-                        provider: String::new(),
-                        chunk_count: identity.chunk_count.unwrap_or_default(),
-                        delivered: identity.entries_delivered(),
-                    });
+                if let LaterFrame::NewProloguePage { offset, .. } = verdict {
+                    // The identity guard confirmed this page ADVANCES the prologue; the assembler applies
+                    // the finer placement rules (alignment, exact page length, no duplicate slot) that
+                    // dig-nat owns. A hostile page is a RECOVERABLE rejection that skips THIS holder.
+                    let page = frame.chunk_lens.as_ref().expect(
+                        "a NewProloguePage verdict is only produced for a frame with chunk_lens",
+                    );
+                    match assembler.as_mut() {
+                        Some(asm) => {
+                            asm.accept_page(offset, page).map_err(chunk_lens_error)?;
+                            accepted_page = true;
+                        }
+                        // The first frame declared no multi-page layout, yet a later frame pages one: the
+                        // frames disagree about the resource's shape. Refuse fail-closed rather than adopt
+                        // a page for an array this reader never sized.
+                        None => {
+                            return Err(DownloadError::PagedPrologueUnsupported {
+                                provider: String::new(),
+                                chunk_count: identity.chunk_count.unwrap_or_default(),
+                                delivered: identity.entries_delivered(),
+                            });
+                        }
+                    }
                 }
             }
         }
-        // A zero-length request asks for metadata ONLY (there is no window to place bytes in), so the
-        // first frame's meta is all it wanted.
+        // The paged prologue is stream metadata that must fully drain even when the window is already
+        // full or the request wanted metadata only — so every early loop exit waits on it.
+        let prologue_drained = assembler
+            .as_ref()
+            .map_or(true, ChunkLensAssembler::is_complete);
+        // A zero-length request asks for metadata ONLY (there is no window to place bytes in). The paged
+        // prologue IS that metadata, so drain it before stopping; a page that carries no data bytes is
+        // handled here rather than falling through to byte placement.
         if max_len == 0 {
-            break;
+            if prologue_drained {
+                break;
+            }
+            // A non-final frame that advanced nothing (no accepted page) cannot progress the prologue —
+            // stop it looping forever. Mirrors the byte-window termination guard below.
+            if !accepted_page {
+                return Err(DownloadError::Transport {
+                    provider: String::new(),
+                    reason: "a metadata stream ended its prologue short without progressing".into(),
+                });
+            }
+            continue;
         }
         // A frame that starts at or past the end of the requested window carries bytes that can never
         // belong to this range — a real protocol violation, not a granularity mismatch.
@@ -458,7 +527,10 @@ pub async fn assemble_range_stream<R: AsyncRead + Unpin>(
             buf.resize(end, 0); // within the reservation above — no further allocation
         }
         buf[start..end].copy_from_slice(&frame.bytes[..take]);
-        if frame.complete || buf.len() as u64 >= max_len {
+        // The window filling is NOT sufficient to stop while a paged prologue is still draining: the
+        // layout is stream metadata the reader must hold in full, and the probe that requested one byte
+        // is exactly the read that must keep going until the last page lands.
+        if frame.complete || (prologue_drained && buf.len() as u64 >= max_len) {
             break;
         }
 
@@ -473,7 +545,9 @@ pub async fn assemble_range_stream<R: AsyncRead + Unpin>(
         // The guard is over the CLASS — a frame that does not extend the assembled prefix — rather than
         // over the empty-payload instance of it, so the re-send variant is caught by the same rule.
         // Bytes arrive in ascending offset, so a conforming continuation always extends past the frontier.
-        if end as u64 <= byte_frontier {
+        // A frame that placed no new bytes but ADVANCED the paged prologue is progress too: prologue-only
+        // pages legitimately carry zero data, so they are exempt from the byte-frontier rule.
+        if end as u64 <= byte_frontier && !accepted_page {
             return Err(DownloadError::Transport {
                 provider: String::new(),
                 reason: format!(
@@ -483,9 +557,37 @@ pub async fn assemble_range_stream<R: AsyncRead + Unpin>(
                 ),
             });
         }
-        byte_frontier = end as u64;
+        byte_frontier = byte_frontier.max(end as u64);
+    }
+
+    // The layout is adopted ONLY as a COMPLETE array. An assembler that never saw its last page yields
+    // nothing (fail-closed): a partial `chunk_lens` sums short of `total_length` and would decrypt every
+    // chunk to garbage, so the holder is skipped (a recoverable refusal) rather than believed.
+    if let Some(asm) = assembler {
+        match asm.into_chunk_lens() {
+            Ok(full) => meta.chunk_lens = Some(full),
+            Err(_) => {
+                return Err(DownloadError::PagedPrologueUnsupported {
+                    provider: String::new(),
+                    chunk_count: meta.chunk_count.unwrap_or_default(),
+                    delivered: identity
+                        .as_ref()
+                        .map_or(0, StreamIdentity::entries_delivered),
+                });
+            }
+        }
     }
     Ok((buf, meta))
+}
+
+/// Map a [`ChunkLensError`] from the paged-prologue assembler to a RECOVERABLE [`DownloadError`], so a
+/// hostile or short prologue skips the offending holder rather than failing the whole download. The
+/// `provider` is left empty for the transport layer to stamp (see [`DownloadError::attributed_to`]).
+fn chunk_lens_error(e: ChunkLensError) -> DownloadError {
+    DownloadError::Transport {
+        provider: String::new(),
+        reason: format!("chunk_lens prologue rejected: {e}"),
+    }
 }
 
 /// The maximum number of trailer bytes drained from a range stream after the complete/last frame,
@@ -1172,19 +1274,16 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 
-    /// A resource whose layout does not fit ONE frame arrives as a **paged prologue** (dig-nat 0.13 and
-    /// later), and
-    /// dig-download does not yet reassemble the pages (tracked separately — obtaining a paged layout is a
-    /// wire-shape decision, not a dependency bump). What must hold regardless is that the partial page is
-    /// REFUSED rather than adopted: `chunk_lens` is a DECRYPT input, so a truncated array is not a
-    /// degraded layout, it is one that decrypts every chunk to garbage.
+    /// A holder that declares a paged `chunk_count` but sends only its FIRST page then marks the stream
+    /// complete has delivered an INCOMPLETE layout. The reader refuses it fail-closed at the assembler —
+    /// it never surfaces the lone page as if it were the whole array — because `chunk_lens` is a DECRYPT
+    /// input: a truncated array is not a degraded layout, it is one that decrypts every chunk to garbage.
     ///
-    /// The fixture's `chunk_count` is set from [`MAX_CHUNK_LENS_PER_FRAME`], the sender's own paging
+    /// The fixture's `chunk_count` sits above [`MAX_CHUNK_LENS_PER_FRAME`], the sender's own paging
     /// threshold, so this is the genuinely-paged shape rather than a large-looking array that still fits
-    /// one frame. Each entry differs from its neighbours, so a truncated *or* misplaced page produces a
-    /// different array — a uniform `vec![64; n]` would have been satisfied by either.
+    /// one frame.
     #[tokio::test]
-    async fn a_paged_prologue_is_refused_rather_than_adopted_as_a_complete_layout() {
+    async fn a_single_page_of_a_paged_prologue_is_refused_not_surfaced_as_the_whole_array() {
         let chunk_count = dig_nat::MAX_CHUNK_LENS_PER_FRAME + 952;
         let chunk_lens: Vec<u64> = (0..chunk_count).map(|i| 64 + (i as u64 % 7)).collect();
         let total_length: u64 = chunk_lens.iter().sum();
@@ -1193,30 +1292,23 @@ mod tests {
         let f = RangeFrame::data(0, b"AB".to_vec())
             .with_complete(true)
             .with_identity(test_root(), total_length, chunk_count as u64)
-            .with_chunk_lens_page(0, page0.clone())
+            .with_chunk_lens_page(0, page0)
             .with_chunk_index(0);
         let wire = f.encode().expect(
             "a first page of MAX_CHUNK_LENS_PER_FRAME entries is within the framing ceiling",
         );
 
         let mut cur = std::io::Cursor::new(wire);
-        let (_bytes, meta) = assemble_range_stream(&mut cur, 2).await.unwrap();
-        assert_eq!(
-            meta.chunk_lens.as_deref(),
-            Some(&page0[..]),
-            "the assembler surfaces the page it was given, unpadded and unguessed"
-        );
-
-        let err = crate::verify::ResourceCommitment::from_first_frame(
-            total_length,
-            meta.chunk_lens.expect("the page is present"),
-            meta.root,
-            meta.inclusion_proof,
-        )
-        .expect_err("an incomplete chunk_lens must never become a commitment");
+        let err = assemble_range_stream(&mut cur, 2)
+            .await
+            .expect_err("a lone page of a paged prologue is not a complete layout");
         assert!(
-            format!("{err}").contains("chunk_lens sum"),
-            "and it is refused for the reason that makes it unusable — the array does not describe              the declared resource: {err}"
+            matches!(err, DownloadError::PagedPrologueUnsupported { .. }),
+            "an incomplete prologue is refused fail-closed, never adopted; got {err:?}"
+        );
+        assert!(
+            err.is_recoverable(),
+            "the holder is skipped, not the download"
         );
     }
 
@@ -1437,82 +1529,148 @@ mod tests {
         );
     }
 
-    /// A CONFORMING next page — an advancing, non-overlapping `chunk_lens_offset` — must NOT be called a
-    /// protocol violation. This reader cannot reassemble it yet, and the error must say exactly that.
-    ///
-    /// This is the positive half of the paging rule and the reason the rule is written over
-    /// `chunk_lens_offset`. dig-nat's wire contract prescribes paging for a layout too large to state on
-    /// one frame ("successive frames each carry up to that many entries, stamped with the offset they
-    /// start at"), so "MUST NOT be repeated" forbids RESTATEMENT, not continuation. Reading it as
-    /// first-frame-only handed a conforming holder a `Transport` violation verdict, and the paged-prologue
-    /// work would then have had to DELETE the guard. Now that work replaces only what the caller does with
-    /// a recognised page.
-    #[tokio::test]
-    async fn a_conforming_next_chunk_lens_page_is_recognised_as_paging_not_a_violation() {
-        // A 4-chunk resource whose layout arrives in two pages: entries 0..2 on the first frame, 2..4 on
-        // the second. `chunk_count` (4) exceeds either page, which is what tells a reader to keep paging.
-        let first = RangeFrame::data(0, b"ABC".to_vec())
-            .with_identity(test_root(), 12, 4)
-            .with_chunk_lens_page(0, vec![3, 3])
-            .with_chunk_index(0)
-            .with_inclusion_proof("proof");
-        let second = RangeFrame::data(3, b"DEF".to_vec())
-            .with_complete(true)
-            .with_identity(test_root(), 12, 4)
-            .with_chunk_lens_page(2, vec![3, 3])
-            .with_chunk_index(1);
-        let mut wire = encode(&first);
-        wire.extend_from_slice(&encode(&second));
-        let mut cur = std::io::Cursor::new(wire);
+    // ---- paged-prologue reassembly (#1668) ------------------------------------------------------
 
-        match assemble_range_stream(&mut cur, 6).await {
-            Err(DownloadError::PagedPrologueUnsupported {
-                chunk_count,
-                delivered,
-                ..
-            }) => {
-                assert_eq!(chunk_count, 4, "the whole array's declared entry count");
-                assert_eq!(delivered, 4, "both pages were placed before the reader gave up");
-            }
-            other => panic!(
-                "a conforming next page must be reported as a READER limitation, never as a restatement \
-                 or a transport violation; got {other:?}"
-            ),
-        }
+    /// The `chunk_lens` entries of a `count`-entry resource, DISTINCT per index (`64 + i%7`).
+    ///
+    /// A uniform `vec![64; count]` would hide a page placed at the wrong offset or a page truncated by
+    /// one entry — every slot looks identical — so the ceiling test that #1640 taught us to write needs
+    /// entries that differ, and a reassembled array that equals this one proves each page landed exactly.
+    fn distinct_lens(count: usize) -> Vec<u64> {
+        (0..count).map(|i| 64 + (i % 7) as u64).collect()
     }
 
-    /// The typed error reaches a caller and is RECOVERABLE — so the holder is skipped, not the download.
+    /// The three frames of a paged prologue for a resource ABOVE the single-frame ceiling.
     ///
-    /// Pinned because the reassembly error used to be re-WRAPPED into a fresh `Transport` by
-    /// `fetch_range`, which flattened every typed variant: the `is_recoverable` arm for this one was
-    /// unreachable and the stable error catalogue promised a variant with no observable path.
-    #[tokio::test]
-    async fn the_paged_prologue_error_survives_provider_attribution_and_is_recoverable() {
+    /// `chunk_count = 2*2048 + 1 = 4097` needs exactly three pages — [0,2048), [2048,4096), [4096,4097)
+    /// — so it exercises full pages AND a short final page, and sits above `MAX_CHUNK_LENS_PER_FRAME`
+    /// where a reader that snapshots the layout from frame 1 alone could never read it. The first frame
+    /// carries the only data bytes (`b"ABC"`); the two later frames are prologue-only (zero data), which
+    /// is what makes the termination guard's "an accepted page is progress" exemption load-bearing.
+    fn paged_prologue_frames() -> (Vec<u64>, RangeFrame, RangeFrame, RangeFrame) {
+        let full = distinct_lens(4097);
+        let total: u64 = full.iter().sum();
         let first = RangeFrame::data(0, b"ABC".to_vec())
-            .with_identity(test_root(), 12, 4)
-            .with_chunk_lens_page(0, vec![3, 3])
-            .with_chunk_index(0);
-        let second = RangeFrame::data(3, b"DEF".to_vec())
+            .with_identity(test_root(), total, 4097)
+            .with_chunk_lens_page(0, full[0..2048].to_vec())
+            .with_chunk_index(0)
+            .with_inclusion_proof("proof");
+        let second = RangeFrame::data(0, Vec::new())
+            .with_identity(test_root(), total, 4097)
+            .with_chunk_lens_page(2048, full[2048..4096].to_vec());
+        let third = RangeFrame::data(0, Vec::new())
             .with_complete(true)
-            .with_identity(test_root(), 12, 4)
-            .with_chunk_lens_page(2, vec![3, 3]);
+            .with_identity(test_root(), total, 4097)
+            .with_chunk_lens_page(4096, full[4096..4097].to_vec());
+        (full, first, second, third)
+    }
+
+    /// A paged prologue spanning THREE frames is reassembled into one array, and adopted only once the
+    /// last page has landed. This is the capability #1668 adds: a resource above the single-frame layout
+    /// ceiling now reads end-to-end instead of being refused.
+    #[tokio::test]
+    async fn a_paged_prologue_is_reassembled_into_the_full_chunk_lens_array() {
+        let (full, first, second, third) = paged_prologue_frames();
+        let mut wire = encode(&first);
+        wire.extend_from_slice(&encode(&second));
+        wire.extend_from_slice(&encode(&third));
+        let mut cur = std::io::Cursor::new(wire);
+
+        // A one-byte window (the metadata probe) MUST keep reading until every prologue page lands,
+        // even though the byte window fills on the first frame.
+        let (bytes, meta) = assemble_range_stream(&mut cur, 3)
+            .await
+            .expect("a conforming paged prologue reassembles");
+        assert_eq!(bytes, b"ABC", "the data window is clipped and preserved");
+        assert_eq!(meta.chunk_count, Some(4097));
+        assert_eq!(
+            meta.chunk_lens,
+            Some(full),
+            "the reassembled array equals the full, per-entry-distinct layout"
+        );
+    }
+
+    /// FAIL-CLOSED: the SAME stream missing its last page yields NO layout. A partial `chunk_lens` sums
+    /// short of `total_length` and would decrypt every chunk to garbage, so an incomplete prologue is a
+    /// RECOVERABLE refusal (the holder is skipped) — never an adopted partial array (SPEC.md §2.2).
+    #[tokio::test]
+    async fn an_incomplete_paged_prologue_is_refused_not_adopted() {
+        let (_full, first, mut second, _third) = paged_prologue_frames();
+        // End the stream after the SECOND page (2 of 3 pages) by marking it complete.
+        second.complete = true;
         let mut wire = encode(&first);
         wire.extend_from_slice(&encode(&second));
         let mut cur = std::io::Cursor::new(wire);
 
-        let raw = assemble_range_stream(&mut cur, 6)
+        let err = assemble_range_stream(&mut cur, 3)
             .await
-            .expect_err("this reader cannot assemble a paged prologue");
-        let peer = "ab".repeat(32);
-        let attributed = raw.attributed_to(&peer);
-        let DownloadError::PagedPrologueUnsupported { provider, .. } = &attributed else {
-            panic!("attribution must not change the variant; got {attributed:?}");
-        };
-        assert_eq!(provider, &peer, "the peer it was read from is stamped in");
+            .expect_err("a prologue short of chunk_count must not be adopted");
         assert!(
-            attributed.is_recoverable(),
-            "one holder's unassemblable stream must not be terminal for the download"
+            matches!(
+                err,
+                DownloadError::PagedPrologueUnsupported {
+                    chunk_count: 4097,
+                    ..
+                }
+            ),
+            "an incomplete layout is refused fail-closed; got {err:?}"
         );
+        assert!(
+            err.is_recoverable(),
+            "one holder's short prologue skips the holder, not the download"
+        );
+    }
+
+    /// A declared `chunk_count` above `MAX_RESOURCE_CHUNK_COUNT` is refused BEFORE the assembler
+    /// allocates its array — a peer-declared count is never allowed to become an allocation this host
+    /// cannot survive. The refusal is recoverable, so the scheduler routes around the hostile holder.
+    #[tokio::test]
+    async fn a_chunk_count_above_the_resource_ceiling_is_refused_before_allocation() {
+        let oversized = dig_nat::MAX_RESOURCE_CHUNK_COUNT as u64 + 1;
+        let first = RangeFrame::data(0, b"A".to_vec())
+            .with_identity(test_root(), 64, oversized)
+            .with_chunk_lens_page(0, vec![64; 2048])
+            .with_chunk_index(0);
+        let mut cur = std::io::Cursor::new(encode(&first));
+
+        let err = assemble_range_stream(&mut cur, 1)
+            .await
+            .expect_err("an over-ceiling chunk_count is refused pre-allocation");
+        assert!(
+            err.is_recoverable(),
+            "a refused-before-allocation layout skips the holder, not the download; got {err:?}"
+        );
+    }
+
+    /// A MISALIGNED later page (offset not a multiple of `MAX_CHUNK_LENS_PER_FRAME`) is rejected by the
+    /// assembler's own placement rules — defense in depth beyond the identity frontier guard. Recoverable,
+    /// so the holder is skipped.
+    #[tokio::test]
+    async fn a_misaligned_prologue_page_is_rejected() {
+        let full = distinct_lens(4097);
+        let total: u64 = full.iter().sum();
+        let first = RangeFrame::data(0, b"ABC".to_vec())
+            .with_identity(test_root(), total, 4097)
+            .with_chunk_lens_page(0, full[0..2048].to_vec())
+            .with_chunk_index(0);
+        // Offset 2049 is not a page-aligned multiple of 2048, so the assembler refuses it even though it
+        // advances the identity frontier past 2048.
+        let second = RangeFrame::data(0, Vec::new())
+            .with_complete(true)
+            .with_identity(test_root(), total, 4097)
+            .with_chunk_lens_page(2049, full[2049..4097].to_vec());
+        let mut wire = encode(&first);
+        wire.extend_from_slice(&encode(&second));
+        let mut cur = std::io::Cursor::new(wire);
+
+        let err = assemble_range_stream(&mut cur, 3)
+            .await
+            .expect_err("a misaligned page must be rejected");
+        assert!(
+            matches!(&err, DownloadError::Transport { reason, .. } if reason.contains("chunk_lens prologue rejected")),
+            "the assembler's placement rule names the rejection; got {err:?}"
+        );
+        assert!(err.is_recoverable(), "a hostile page skips the holder");
     }
 
     // ---- termination against a holder that streams without progressing --------------------------
