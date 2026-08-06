@@ -1759,3 +1759,5 @@ mod tests {
         assert_eq!(bytes, b"ABCDEF");
     }
 }
+
+// #1668: paged-prologue reassembly — WIP salvage anchor (removed in the feature commit).
