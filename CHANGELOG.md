@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.17.0] - 2026-08-06
+
+### Features
+- **source:** Reassemble the dig-nat paged prologue so large resources are readable (#1668)
+
 ## [0.16.0] - 2026-08-06
 
 ### Bug Fixes
