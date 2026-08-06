@@ -598,6 +598,23 @@ within a short timeout:
 4. **`rpc.dig.net`** — the public gateway. FINAL fallback only; returned even if it does not itself
    answer the probe (nowhere left to fall through to). MUST NEVER be hard-coded as the primary endpoint.
 
+The local tiers (2)+(3) expand to an ORDERED list of concrete rungs, because a `dig-node` does not
+expose a single uniform listener — each rung MUST address a listener the node actually serves
+(`dig-node/SPEC.md` §4.1/§4.1a). `local_urls(port)` builds them, in probe order:
+
+| # | Rung | `dig-node` listener (`dig-node/SPEC.md`) | Tier |
+|---|------|------------------------------------------|------|
+| 1 | `https://dig.local` (PORTLESS) | §4.1a — the portless TLS listener (`:443`), gated on the dig-cert leaf | `DigLocal` |
+| 2 | `http://dig.local` (PORTLESS) | §4.1a — the portless plaintext fail-soft (`:80`) when the TLS leaf is unprovisioned | `DigLocal` |
+| 3 | `http://localhost:9778` | §4.1 — the loopback listener, which is PLAINTEXT (NOT TLS), so `http` not `https` | `Localhost` |
+
+The first rung to answer the probe wins; the tier reported is per the table (both `dig.local` rungs
+report `DigLocal`). `dig.local` rungs are portless (they hit `:443`/`:80`); only the loopback rung
+carries the port. Hostnames are used verbatim (`dig.local`/`localhost`, never literal IPs) so the OS
+resolver prefers IPv6 (`[::1]`) with IPv4 fallback (`CLAUDE.md` §5.2). A single `https://host:{port}`
+shape for all local rungs (the pre-#2164 defect) addresses listeners that do not exist and MUST NOT
+be reintroduced.
+
 - **Probe seam (MUST)** — resolution is transport-free: it takes a `HealthProbe` trait so the
   fall-through ORDER is unit-testable without a network. The optional `HttpHealthProbe` (feature
   `http-probe`) is a ready-made `GET {base}/health` probe that races the request against the

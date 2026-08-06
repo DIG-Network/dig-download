@@ -9,9 +9,11 @@
 //! 1. an EXPLICITLY-CONFIGURED node — always wins, overriding the ladder entirely. Precedence among
 //!    override sources (highest first): an explicit `--node` flag/argument > `$DIG_NODE_URL` > the
 //!    persisted `node.url` config value.
-//! 2. `dig.local` — the installed local node (the installer's hosts registration).
-//! 3. `localhost` — a node on the loopback default read port, when `dig.local` does not
-//!    resolve/respond.
+//! 2. `dig.local` — the installed local node (the installer's hosts registration), probed as its
+//!    PORTLESS `https://dig.local` (§4.1a `:443`) then the plaintext fail-soft `http://dig.local`
+//!    (§4.1a `:80`).
+//! 3. `localhost` — the loopback listener, probed as `http://localhost:9778` (`dig-node/SPEC.md`
+//!    §4.1 — the loopback port is PLAINTEXT, not TLS), when `dig.local` does not respond.
 //! 4. `rpc.dig.net` — the public gateway. FINAL fallback only.
 //!
 //! The resolved choice is cached for the invocation ([`CachedResolver`]) so a command that needs the
@@ -77,9 +79,22 @@ pub enum ResolvedTier {
 /// The resolved node endpoint + how it was chosen.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedNode {
-    /// Base URL, e.g. `https://dig.local:9778` or `https://rpc.dig.net`.
+    /// Base URL, e.g. `https://dig.local` or `https://rpc.dig.net`.
     pub base_url: String,
     /// Which tier the endpoint came from.
+    pub tier: ResolvedTier,
+}
+
+/// One local candidate the ladder probes before the public gateway: a fully-formed base URL paired
+/// with the [`ResolvedTier`] it resolves to. The scheme/host/port are NOT uniform across rungs —
+/// each rung targets a SPECIFIC `dig-node` listener (`dig-node/SPEC.md` §4.1/§4.1a), so it carries
+/// its own complete URL rather than a shared scheme + a per-tier port (the defect fixed in #2164).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalRung {
+    /// The fully-formed base URL to probe, e.g. `https://dig.local` or `http://localhost:9778`.
+    pub url: String,
+    /// The tier this rung resolves to when it answers (`DigLocal` for the `dig.local` rungs,
+    /// `Localhost` for the loopback rung).
     pub tier: ResolvedTier,
 }
 
@@ -155,15 +170,16 @@ impl OverrideInputs {
 /// timeout/no-response. `rpc.dig.net` is the final fallback and is returned even if it does not itself
 /// answer the probe (there is nowhere left to fall through to).
 ///
-/// `dig_local_url`/`localhost_url` are the fully-formed base URLs for those tiers (callers build them
-/// once, e.g. `https://dig.local:9778` via [`local_urls`]); passing them in — rather than hardcoding a
-/// scheme/port here — keeps this function transport-agnostic and lets callers vary the local node port.
+/// `local_rungs` are the fully-formed local candidates, in probe order, that come before the gateway
+/// (callers build them once via [`local_urls`]); passing them in — rather than hardcoding a
+/// scheme/host/port here — keeps this function transport-agnostic and lets callers vary the port.
+/// Each rung carries the [`ResolvedTier`] it resolves to, because the ladder now has more rungs than
+/// tiers (two `dig.local` schemes both map to `DigLocal`; see [`local_urls`]).
 ///
 /// Panics-free; never fails — the public gateway is always a valid last resort.
 pub async fn resolve_node(
     overrides: &OverrideInputs,
-    dig_local_url: &str,
-    localhost_url: &str,
+    local_rungs: &[LocalRung],
     probe: &dyn HealthProbe,
     timeout: Duration,
 ) -> ResolvedNode {
@@ -174,18 +190,13 @@ pub async fn resolve_node(
         };
     }
 
-    if probe.probe(dig_local_url, timeout).await {
-        return ResolvedNode {
-            base_url: dig_local_url.trim_end_matches('/').to_string(),
-            tier: ResolvedTier::DigLocal,
-        };
-    }
-
-    if probe.probe(localhost_url, timeout).await {
-        return ResolvedNode {
-            base_url: localhost_url.trim_end_matches('/').to_string(),
-            tier: ResolvedTier::Localhost,
-        };
+    for rung in local_rungs {
+        if probe.probe(&rung.url, timeout).await {
+            return ResolvedNode {
+                base_url: rung.url.trim_end_matches('/').to_string(),
+                tier: rung.tier,
+            };
+        }
     }
 
     ResolvedNode {
@@ -194,15 +205,37 @@ pub async fn resolve_node(
     }
 }
 
-/// Build the `(dig.local, localhost)` base URLs for the ladder's two local tiers at `port`, over
-/// HTTPS. A convenience so callers do not re-derive the scheme/host/port strings `resolve_node`
-/// expects (the local read port is `DIG_NODE_PORT`; default [`DEFAULT_LOCAL_NODE_PORT`]).
+/// Build the ladder's local rungs, in probe order, each targeting a REAL `dig-node` listener
+/// (`dig-node/SPEC.md` §4.1/§4.1a). The listeners are NOT uniform, so each rung carries its own
+/// scheme/host/port — this is the crux of #2164, where a single `https://…:{port}` shape addressed
+/// listeners that do not exist and the local tiers could never answer:
+///
+/// 1. `https://dig.local` — the installed local node's PORTLESS TLS listener (§4.1a, `:443`, gated on
+///    a dig-cert leaf). Tried first.
+/// 2. `http://dig.local` — the PORTLESS plaintext fail-soft (§4.1a, `:80`) for when the dig-cert TLS
+///    leaf is not yet provisioned.
+/// 3. `http://localhost:{port}` — the loopback listener (§4.1, default [`DEFAULT_LOCAL_NODE_PORT`]),
+///    which is PLAINTEXT (not TLS), so it MUST be `http`, never `https`.
+///
+/// The `dig.local` rungs are portless (they hit `:443`/`:80`); only the loopback rung is port-bound.
+/// Hostnames (`dig.local`/`localhost`) are used verbatim — no literal IPs — so the OS resolver picks
+/// IPv6 first (`[::1]`) with IPv4 fallback (`CLAUDE.md` §5.2).
 #[must_use]
-pub fn local_urls(port: u16) -> (String, String) {
-    (
-        format!("https://{DIG_LOCAL_HOST}:{port}"),
-        format!("https://localhost:{port}"),
-    )
+pub fn local_urls(port: u16) -> Vec<LocalRung> {
+    vec![
+        LocalRung {
+            url: format!("https://{DIG_LOCAL_HOST}"),
+            tier: ResolvedTier::DigLocal,
+        },
+        LocalRung {
+            url: format!("http://{DIG_LOCAL_HOST}"),
+            tier: ResolvedTier::DigLocal,
+        },
+        LocalRung {
+            url: format!("http://localhost:{port}"),
+            tier: ResolvedTier::Localhost,
+        },
+    ]
 }
 
 /// Which override source (if any) `overrides` would resolve to — used by diagnostics/tests that want
@@ -233,13 +266,12 @@ impl CachedResolver {
     pub async fn get_or_resolve(
         &self,
         overrides: &OverrideInputs,
-        dig_local_url: &str,
-        localhost_url: &str,
+        local_rungs: &[LocalRung],
         probe: &dyn HealthProbe,
         timeout: Duration,
     ) -> ResolvedNode {
         self.cached
-            .get_or_init(|| resolve_node(overrides, dig_local_url, localhost_url, probe, timeout))
+            .get_or_init(|| resolve_node(overrides, local_rungs, probe, timeout))
             .await
             .clone()
     }
@@ -330,39 +362,66 @@ mod tests {
         }
     }
 
-    const DIG_LOCAL: &str = "https://dig.local:9778";
-    const LOCALHOST: &str = "https://localhost:9778";
+    // The three local rungs in probe order (must match `local_urls`); see the SPEC-anchored
+    // `local_rungs_target_real_dig_node_listeners` test below for WHY each targets a real listener.
+    const DIG_LOCAL_HTTPS: &str = "https://dig.local";
+    const DIG_LOCAL_HTTP: &str = "http://dig.local";
+    const LOCALHOST_HTTP: &str = "http://localhost:9778";
     const T: Duration = Duration::from_millis(50);
+
+    /// The ladder's local rungs at the default port — what a real caller passes to `resolve_node`.
+    fn rungs() -> Vec<LocalRung> {
+        local_urls(DEFAULT_LOCAL_NODE_PORT)
+    }
 
     #[tokio::test]
     async fn prefers_dig_local_when_it_answers() {
-        let probe = ScriptedProbe::new(&[(DIG_LOCAL, true), (LOCALHOST, true)]);
-        let resolved =
-            resolve_node(&OverrideInputs::default(), DIG_LOCAL, LOCALHOST, &probe, T).await;
-        assert_eq!(resolved.base_url, DIG_LOCAL);
+        let probe = ScriptedProbe::new(&[(DIG_LOCAL_HTTPS, true), (LOCALHOST_HTTP, true)]);
+        let resolved = resolve_node(&OverrideInputs::default(), &rungs(), &probe, T).await;
+        assert_eq!(resolved.base_url, DIG_LOCAL_HTTPS);
         assert_eq!(resolved.tier, ResolvedTier::DigLocal);
-        // localhost must NOT have been probed once dig.local answered — first responder wins.
-        assert_eq!(probe.calls(), vec![DIG_LOCAL.to_string()]);
+        // Later rungs must NOT be probed once the first dig.local rung answered — first responder wins.
+        assert_eq!(probe.calls(), vec![DIG_LOCAL_HTTPS.to_string()]);
+    }
+
+    #[tokio::test]
+    async fn falls_soft_to_http_dig_local_when_https_is_unreachable() {
+        // §4.1a fail-soft: the portless TLS listener is unprovisioned, the portless plaintext answers.
+        let probe = ScriptedProbe::new(&[(DIG_LOCAL_HTTPS, false), (DIG_LOCAL_HTTP, true)]);
+        let resolved = resolve_node(&OverrideInputs::default(), &rungs(), &probe, T).await;
+        assert_eq!(resolved.base_url, DIG_LOCAL_HTTP);
+        assert_eq!(resolved.tier, ResolvedTier::DigLocal);
+        assert_eq!(
+            probe.calls(),
+            vec![DIG_LOCAL_HTTPS.to_string(), DIG_LOCAL_HTTP.to_string()]
+        );
     }
 
     #[tokio::test]
     async fn falls_through_to_localhost_when_dig_local_is_unreachable() {
-        let probe = ScriptedProbe::new(&[(DIG_LOCAL, false), (LOCALHOST, true)]);
-        let resolved =
-            resolve_node(&OverrideInputs::default(), DIG_LOCAL, LOCALHOST, &probe, T).await;
-        assert_eq!(resolved.base_url, LOCALHOST);
+        let probe = ScriptedProbe::new(&[
+            (DIG_LOCAL_HTTPS, false),
+            (DIG_LOCAL_HTTP, false),
+            (LOCALHOST_HTTP, true),
+        ]);
+        let resolved = resolve_node(&OverrideInputs::default(), &rungs(), &probe, T).await;
+        assert_eq!(resolved.base_url, LOCALHOST_HTTP);
         assert_eq!(resolved.tier, ResolvedTier::Localhost);
         assert_eq!(
             probe.calls(),
-            vec![DIG_LOCAL.to_string(), LOCALHOST.to_string()]
+            vec![
+                DIG_LOCAL_HTTPS.to_string(),
+                DIG_LOCAL_HTTP.to_string(),
+                LOCALHOST_HTTP.to_string(),
+            ]
         );
     }
 
     #[tokio::test]
     async fn falls_through_to_public_gateway_as_final_fallback() {
-        let probe = ScriptedProbe::new(&[(DIG_LOCAL, false), (LOCALHOST, false)]);
-        let resolved =
-            resolve_node(&OverrideInputs::default(), DIG_LOCAL, LOCALHOST, &probe, T).await;
+        // No local rung answers — the gateway is returned un-probed as the last resort.
+        let probe = ScriptedProbe::new(&[]);
+        let resolved = resolve_node(&OverrideInputs::default(), &rungs(), &probe, T).await;
         assert_eq!(resolved.base_url, RPC_DIG_NET);
         assert_eq!(resolved.tier, ResolvedTier::PublicGateway);
     }
@@ -380,8 +439,7 @@ mod tests {
         }
         let resolved = resolve_node(
             &OverrideInputs::default(),
-            DIG_LOCAL,
-            LOCALHOST,
+            &rungs(),
             &NeverRespondsProbe,
             Duration::from_millis(5),
         )
@@ -391,12 +449,12 @@ mod tests {
 
     #[tokio::test]
     async fn explicit_override_wins_without_probing_anything() {
-        let probe = ScriptedProbe::new(&[(DIG_LOCAL, true), (LOCALHOST, true)]);
+        let probe = ScriptedProbe::new(&[(DIG_LOCAL_HTTPS, true), (LOCALHOST_HTTP, true)]);
         let overrides = OverrideInputs {
             flag: Some("https://custom.example:9999".to_string()),
             ..Default::default()
         };
-        let resolved = resolve_node(&overrides, DIG_LOCAL, LOCALHOST, &probe, T).await;
+        let resolved = resolve_node(&overrides, &rungs(), &probe, T).await;
         assert_eq!(resolved.base_url, "https://custom.example:9999");
         assert_eq!(resolved.tier, ResolvedTier::Override);
         // An override is trusted outright — the ladder is never consulted.
@@ -410,7 +468,7 @@ mod tests {
             flag: Some("https://custom.example/".to_string()),
             ..Default::default()
         };
-        let resolved = resolve_node(&overrides, DIG_LOCAL, LOCALHOST, &probe, T).await;
+        let resolved = resolve_node(&overrides, &rungs(), &probe, T).await;
         assert_eq!(resolved.base_url, "https://custom.example");
     }
 
@@ -448,11 +506,65 @@ mod tests {
         assert_eq!(override_source(&OverrideInputs::default()), None);
     }
 
+    /// Regression for #2164: each local rung MUST address a listener `dig-node` actually serves, so
+    /// this asserts the DECOMPOSED (scheme, host, port, tier) of every rung against the `dig-node`
+    /// listener table AS DATA — not against a re-spelled copy of `local_urls`' own `format!` output.
+    /// A future `dig-node/SPEC.md` listener change should therefore break this test rather than let
+    /// the ladder silently diverge back to unreachable URLs.
     #[test]
-    fn local_urls_uses_https_host_and_port() {
-        let (dig_local, localhost) = local_urls(DEFAULT_LOCAL_NODE_PORT);
-        assert_eq!(dig_local, "https://dig.local:9778");
-        assert_eq!(localhost, "https://localhost:9778");
+    fn local_rungs_target_real_dig_node_listeners() {
+        /// A rung's structural shape + the tier it resolves to.
+        struct Listener {
+            scheme: &'static str,
+            host: &'static str,
+            port: Option<u16>,
+            tier: ResolvedTier,
+        }
+
+        // `dig-node/SPEC.md` §4.1/§4.1a — the listeners a local node exposes, in ladder probe order:
+        //   §4.1a  https://dig.local       PORTLESS :443, gated on the dig-cert leaf   -> DigLocal
+        //   §4.1a  http://dig.local        PORTLESS :80, plaintext fail-soft           -> DigLocal
+        //   §4.1   http://localhost:9778   loopback, PLAINTEXT (not TLS)               -> Localhost
+        let expected = [
+            Listener {
+                scheme: "https",
+                host: "dig.local",
+                port: None,
+                tier: ResolvedTier::DigLocal,
+            },
+            Listener {
+                scheme: "http",
+                host: "dig.local",
+                port: None,
+                tier: ResolvedTier::DigLocal,
+            },
+            Listener {
+                scheme: "http",
+                host: "localhost",
+                port: Some(9778),
+                tier: ResolvedTier::Localhost,
+            },
+        ];
+
+        // Decompose `scheme://host[:port]` into its parts so the assertion is structural, not a
+        // string re-spelling of the builder.
+        fn decompose(url: &str) -> (&str, &str, Option<u16>) {
+            let (scheme, rest) = url.split_once("://").expect("rung URL has a scheme");
+            match rest.split_once(':') {
+                Some((host, port)) => (scheme, host, Some(port.parse().expect("numeric port"))),
+                None => (scheme, rest, None),
+            }
+        }
+
+        let rungs = local_urls(DEFAULT_LOCAL_NODE_PORT);
+        assert_eq!(rungs.len(), expected.len(), "one rung per SPEC listener");
+        for (rung, want) in rungs.iter().zip(expected.iter()) {
+            let (scheme, host, port) = decompose(&rung.url);
+            assert_eq!(scheme, want.scheme, "scheme for {}", rung.url);
+            assert_eq!(host, want.host, "host for {}", rung.url);
+            assert_eq!(port, want.port, "port for {}", rung.url);
+            assert_eq!(rung.tier, want.tier, "tier for {}", rung.url);
+        }
     }
 
     #[tokio::test]
@@ -473,12 +585,8 @@ mod tests {
         let cache = CachedResolver::new();
         let overrides = OverrideInputs::default();
 
-        let first = cache
-            .get_or_resolve(&overrides, DIG_LOCAL, LOCALHOST, &probe, T)
-            .await;
-        let second = cache
-            .get_or_resolve(&overrides, DIG_LOCAL, LOCALHOST, &probe, T)
-            .await;
+        let first = cache.get_or_resolve(&overrides, &rungs(), &probe, T).await;
+        let second = cache.get_or_resolve(&overrides, &rungs(), &probe, T).await;
 
         assert_eq!(first, second);
         assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
