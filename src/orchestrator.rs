@@ -898,7 +898,9 @@ impl Job {
             .find(|p| p.provider_peer_id == peer)
             .cloned();
         let transport = self.transport.clone();
-        let req = self.range_request(range.offset, range.length);
+        // A scheduled DATA range: the commitment already holds the layout, so tell the holder to skip
+        // re-paging the prologue (#1668).
+        let req = self.range_request(range.offset, range.length, true);
         let timeout = self.config.range_timeout;
         Box::pin(async move {
             let started = Instant::now();
@@ -1147,7 +1149,9 @@ impl Job {
         };
 
         for provider in &candidates {
-            let req = self.range_request(0, 1)?;
+            // The ESTABLISH probe: request the layout prologue (skip_layout = false) so this one stream
+            // pages in the whole `chunk_lens` array, which `adopt_layout` reassembles (#1668).
+            let req = self.range_request(0, 1, false)?;
             let fetched = match self.probe_metadata(provider, &req).await {
                 Ok(fetched) => fetched,
                 Err(e) => {
@@ -1265,14 +1269,11 @@ impl Job {
             return Err("first frame declared no total_length/chunk_lens".into());
         };
 
-        // A layout too large to state on one frame is served as a paged prologue, so a first frame can
-        // legitimately carry only the FIRST page while declaring the whole array's `chunk_count`. This
-        // reader does not reassemble pages yet, so such a holder is one it cannot use.
-        //
-        // The metadata probe asks for a 1-byte range and therefore stops after the first frame, which is
-        // exactly why this is NOT reported as the holder failing to page: from here, a conforming pager
-        // and a holder that would never have paged look identical, and guessing would blame a peer that
-        // did nothing wrong.
+        // BELT-AND-SUSPENDERS. `assemble_range_stream` now reassembles a paged prologue and sets
+        // `meta.chunk_lens` to the COMPLETE array (or refuses the holder fail-closed), so a `chunk_lens`
+        // whose length matches `chunk_count` is the normal outcome. This equality check remains as a
+        // second, independent gate: were a shorter array to reach here, adopting it would sum short of
+        // `total_length` and decrypt every chunk to garbage, so it is refused rather than trusted (#1668).
         if let Some(declared) = meta.chunk_count {
             let delivered = chunk_lens.len() as u64;
             if declared != delivered {
@@ -1431,27 +1432,39 @@ impl Job {
 
     /// The `dig.fetchRange` request for `[offset, offset+length)` of this content id.
     ///
-    /// `skip_layout` is deliberately left UNSET, which asks every holder for the layout metadata on
-    /// every stream — the pre-0.13.0 behaviour. Suppressing it is only correct once the orchestrator
-    /// tracks "I already hold a complete `chunk_lens` for this root", and `chunk_lens` is a DECRYPT
-    /// input: per-chunk AES-GCM-SIV needs the WHOLE array, so a fan-out that suppressed it before the
-    /// first stream had paged in a complete set would produce undecryptable bytes. Asking for
-    /// redundant metadata costs bandwidth; asking for none too early costs correctness.
-    fn range_request(&self, offset: u64, length: u64) -> Result<RangeRequest, DownloadError> {
-        match &self.content {
-            ContentId::Store { .. } => Err(DownloadError::NotDownloadable),
+    /// `skip_layout` tells a holder NOT to send the layout prologue (`chunk_lens` + `inclusion_proof`)
+    /// on this stream. The ESTABLISH probe leaves it unset (`skip_layout = false`) so exactly one stream
+    /// pages in the whole layout, which the establish path reassembles into the commitment. Every
+    /// SCHEDULED data range then sets it, because the orchestrator already holds a complete `chunk_lens`
+    /// for this root: re-paging a large prologue on every parallel stream is pure waste. `chunk_lens` is
+    /// a DECRYPT input (per-chunk AES-GCM-SIV needs the WHOLE array), so suppressing it before the
+    /// commitment is established would produce undecryptable bytes — hence establish-first, then skip. An
+    /// older holder that ignores the field simply sends the prologue anyway, which the reader tolerates.
+    fn range_request(
+        &self,
+        offset: u64,
+        length: u64,
+        skip_layout: bool,
+    ) -> Result<RangeRequest, DownloadError> {
+        let req = match &self.content {
+            ContentId::Store { .. } => return Err(DownloadError::NotDownloadable),
             ContentId::Root { store_id, root } => {
-                Ok(RangeRequest::capsule(hex32(store_id), offset, length).with_root(hex32(root)))
+                RangeRequest::capsule(hex32(store_id), offset, length).with_root(hex32(root))
             }
             ContentId::Resource {
                 store_id,
                 root,
                 retrieval_key,
-            } => Ok(
-                RangeRequest::resource(hex32(store_id), hex32(retrieval_key), offset, length)
-                    .with_root(hex32(root)),
-            ),
-        }
+            } => RangeRequest::resource(hex32(store_id), hex32(retrieval_key), offset, length)
+                .with_root(hex32(root)),
+        };
+        // Left ABSENT on the establish probe (an absent field reads as "send the layout"), so the wire is
+        // byte-identical to the pre-#1668 request an older holder expects.
+        Ok(if skip_layout {
+            req.with_skip_layout(true)
+        } else {
+            req
+        })
     }
 }
 

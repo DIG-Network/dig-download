@@ -162,24 +162,23 @@ pub enum DownloadError {
         reasons: Vec<String>,
     },
 
-    /// The resource's `chunk_lens` layout is delivered as a **paged prologue**, which this reader does
-    /// not yet reassemble. **Recoverable per holder**: the range is retried elsewhere and the adoption
-    /// path probes the next holder.
+    /// The resource's `chunk_lens` **paged prologue** could not be COMPLETED — the stream ended short of
+    /// the declared `chunk_count`, or a first frame that declared no multi-page layout was followed by a
+    /// frame paging one. **Recoverable per holder**: the range is retried elsewhere and the adoption path
+    /// probes the next holder.
     ///
-    /// # This names a READER limitation, not a holder fault
+    /// # Fail-closed, not a reader limitation
     ///
-    /// Deliberately not phrased as an accusation, because this reader cannot tell the two apart and
-    /// guessing would blame a conforming peer. A holder paging its prologue is doing exactly what the
-    /// wire contract prescribes for a layout too large to state on one frame. Meanwhile the metadata
-    /// probe asks for a 1-byte range, so it legitimately receives only the FIRST page and stops — which
-    /// looks identical to a holder that declared a large `chunk_count` and then paged nothing. Since the
-    /// same observation has an innocent and a guilty explanation, the error reports what THIS reader
-    /// could not do.
-    ///
-    /// Reassembling the prologue across frames removes this error entirely (`SPEC.md` §2.2).
+    /// This reader DOES reassemble a paged prologue (`SPEC.md` §2.2), so a conforming multi-page holder
+    /// reads end-to-end. The error is raised only when the layout stays INCOMPLETE — a decrypt-input array
+    /// short of `chunk_count` would decrypt every chunk to garbage, so it is refused rather than adopted
+    /// partial. It reports the declared count and the entries delivered so a short prologue is
+    /// distinguishable from "nobody holds this content". (A page that violates a placement rule —
+    /// misaligned, duplicated, overshooting — surfaces instead as a recoverable [`Transport`](Self::Transport)
+    /// naming the broken rule.)
     #[error(
-        "provider {} serves a {chunk_count}-entry chunk_lens layout as a paged prologue ({delivered} \
-         entries so far); this reader does not yet reassemble a paged prologue",
+        "provider {} served a {chunk_count}-entry chunk_lens paged prologue that ended incomplete \
+         ({delivered} of {chunk_count} entries)",
         hex64_or_sentinel(provider, "peer-id")
     )]
     PagedPrologueUnsupported {

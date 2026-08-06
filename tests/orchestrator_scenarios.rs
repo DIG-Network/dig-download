@@ -100,6 +100,49 @@ async fn multi_source_concurrent_reassembles_whole_resource() {
     assert!(used >= 2, "expected ≥2 sources used, got {used}");
 }
 
+/// A resource with MORE than `MAX_CHUNK_LENS_PER_FRAME` (2048) chunks is downloaded end-to-end.
+///
+/// Its layout cannot be stated on one frame, so on the wire it arrives as a paged prologue that
+/// `assemble_range_stream` reassembles (unit-tested there). At the orchestrator level this confirms the
+/// consequence #1668 unlocks: a >2048-entry `chunk_lens` now flows through `adopt_layout`'s
+/// equality gate, `ResourceCommitment::from_first_frame_bounded`'s sum check, chunk-aligned planning,
+/// and per-range verification, reassembling the whole resource — the exact size class the pre-#1668
+/// first-frame-only reader refused. Chunk sizes are DISTINCT (cycling 1..=5 bytes) so a layout that
+/// planned the wrong offsets would place bytes wrong and fail the whole-resource check.
+#[tokio::test]
+async fn a_resource_above_the_single_frame_layout_ceiling_reassembles_end_to_end() {
+    let n_chunks = 2100usize; // above the 2048 single-frame ceiling
+    let chunk_lens: Vec<u64> = (0..n_chunks).map(|i| 1 + (i % 5) as u64).collect();
+    let total: usize = chunk_lens.iter().map(|&l| l as usize).sum();
+    let bytes: Vec<u8> = (0..total).map(|i| (i % 251) as u8).collect();
+    let content = MockContent::new(bytes, chunk_lens);
+    let transport = Arc::new(MockRangeTransport::new(content.clone()));
+    let cid = mock_content_id();
+    let providers = vec![mock_provider(1, &cid), mock_provider(2, &cid)];
+
+    // A window wide enough to keep the range count sane, and a resource ceiling above the whole
+    // resource so the >2048-entry layout is adopted rather than refused for size.
+    let mut config = test_config(4096);
+    config.max_resource_size = 1 << 20;
+
+    let dl = downloader(
+        transport.clone(),
+        Arc::new(MockProviderLocator::fixed(providers)),
+        Arc::new(InMemoryStateStore::new()),
+        Arc::new(MerkleVerifier::insecure_structural_only()),
+        config,
+    );
+    let sink = Arc::new(InMemorySink::new());
+    join_ok(dl.download(cid, sink.clone(), DownloadOptions::default()))
+        .await
+        .unwrap();
+    assert_eq!(
+        sink.contents().await,
+        content.bytes,
+        "a resource with more than 2048 chunks reassembles byte-for-byte"
+    );
+}
+
 #[tokio::test]
 async fn bad_source_range_is_refetched_from_another() {
     let content = MockContent::even(30, 3);
