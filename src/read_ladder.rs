@@ -218,8 +218,8 @@ pub async fn resolve_node(
 ///    which is PLAINTEXT (not TLS), so it MUST be `http`, never `https`.
 ///
 /// The `dig.local` rungs are portless (they hit `:443`/`:80`); only the loopback rung is port-bound.
-/// Hostnames (`dig.local`/`localhost`) are used verbatim — no literal IPs — so the OS resolver picks
-/// IPv6 first (`[::1]`) with IPv4 fallback (`CLAUDE.md` §5.2).
+/// `dig.local` (installer hosts entry) resolves IPv4-only to 127.0.0.2; the `localhost` rung uses
+/// the hostname so the OS resolver prefers IPv6 (`[::1]`) with IPv4 fallback (`CLAUDE.md` §5.2).
 #[must_use]
 pub fn local_urls(port: u16) -> Vec<LocalRung> {
     vec![
