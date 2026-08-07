@@ -7,7 +7,7 @@ This project adheres to [Semantic Versioning](https://semver.org) and
 ## [0.17.1] - 2026-08-07
 
 ### Chores
-- **plan:** Re-export `MAX_RESOURCE_CHUNK_COUNT` from `dig_nat` instead of redefining it, so the two crates can never drift onto different ceilings for the same wire limit (#2231)
+- **plan:** Re-export MAX_RESOURCE_CHUNK_COUNT from dig_nat instead of redefining
 
 ## [0.17.0] - 2026-08-06
 
