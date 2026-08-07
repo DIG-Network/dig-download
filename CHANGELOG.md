@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.17.2] - 2026-08-07
+
+### Chores
+- **dig-download:** Correct dig.local IPv4-only doc comment (#2226)
+
 ## [0.17.1] - 2026-08-07
 
 ### Chores
