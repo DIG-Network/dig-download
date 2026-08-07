@@ -630,10 +630,10 @@ expose a single uniform listener — each rung MUST address a listener the node 
 
 The first rung to answer the probe wins; the tier reported is per the table (both `dig.local` rungs
 report `DigLocal`). `dig.local` rungs are portless (they hit `:443`/`:80`); only the loopback rung
-carries the port. Hostnames are used verbatim (`dig.local`/`localhost`, never literal IPs) so the OS
-resolver prefers IPv6 (`[::1]`) with IPv4 fallback (`CLAUDE.md` §5.2). A single `https://host:{port}`
-shape for all local rungs (the pre-#2164 defect) addresses listeners that do not exist and MUST NOT
-be reintroduced.
+carries the port. `dig.local` (installer hosts entry) resolves IPv4-only to 127.0.0.2; the `localhost`
+rung uses the hostname so the OS resolver prefers IPv6 (`[::1]`) with IPv4 fallback (`CLAUDE.md` §5.2).
+A single `https://host:{port}` shape for all local rungs (the pre-#2164 defect) addresses listeners
+that do not exist and MUST NOT be reintroduced.
 
 - **Probe seam (MUST)** — resolution is transport-free: it takes a `HealthProbe` trait so the
   fall-through ORDER is unit-testable without a network. The optional `HttpHealthProbe` (feature
