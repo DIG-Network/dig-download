@@ -20,7 +20,7 @@
 # by dig-node (see the implementers' note in the crate docs).
 [package]
 name = "dig-download"
-version = "0.17.2"
+version = "0.17.3"
 edition = "2021"
 rust-version = "1.75.0"
 license = "Apache-2.0 OR MIT"
@@ -40,21 +40,16 @@ dig-constants = "0.8"
 # LOCATE — "which peers hold this content?" dig-download derives a `ContentId` (store / root /
 # capsule / resource) and asks dig-dht `find_providers` for the holders' `ProviderRecord`s.
 #
-# Sourcing: crates.io. dig-dht 0.8 keeps the SAME `find_providers` public API this crate consumes
-# (`DhtService::find_providers` — the true distributed iterative lookup); its own bump is to move onto
-# dig-nat 0.15 (below), so dig-dht + dig-peer + dig-download's direct dig-nat dep all agree on dig-nat
-# 0.15 and the tree carries exactly ONE dig-nat instance (asserted by `tests/dependency_tree.rs`, not
+# Sourcing: crates.io. dig-dht 0.11 keeps the SAME `find_providers` public API this crate consumes
+# (`DhtService::find_providers` — the true distributed iterative lookup); its bump from 0.8 moved onto
+# dig-nat 0.18 (below), so dig-dht + dig-peer + dig-download's direct dig-nat dep all agree on dig-nat
+# 0.18 and the tree carries exactly ONE dig-nat instance (asserted by `tests/dependency_tree.rs`, not
 # assumed).
 #
 # That agreement is why all THREE deps move in one commit. A 0.x MINOR is semver-INCOMPATIBLE, so
-# `dig-nat = "0.15"` here is unresolvable while any intermediate consumer still requires `^0.14`:
-# bumping dig-nat alone produced a lock with two dig-nat entries and four E0308s on the
-# `DigPeer::fetch_range` seam. Never bump one leg of this trio by itself.
-#
-# `^0.9` rather than an older caret because a 0.x MINOR is semver-INCOMPATIBLE: `"0.8"` means
-# `>=0.8.0, <0.9`, which can never resolve 0.9.0 no matter how long it has been published. An outdated
-# requirement therefore pins the locate leg to a dig-dht that drags an older dig-nat in
-# transitively, while the manifest looked current.
+# bumping dig-nat alone produces a lock with multiple dig-nat entries and type mismatches on the
+# `DigPeer::fetch_range` seam. Never bump one leg of this trio by itself — use release-first,
+# coordinating all three releases.
 #
 # dig-dht defines its OWN `PeerId`/`ProviderRecord` types (NOT re-exported from dig-nat), and this
 # crate RE-EXPORTS `ContentId`/`ProviderRecord`, so their identity is part of dig-download's public
@@ -65,48 +60,41 @@ dig-dht = "0.11"
 # WIRE — the whole-`.dig`-module pull descriptor + method names (#1576). `ModuleInfo`
 # (`total_size` / `module_hash` / `chunk_hashes` / `chunk_lens`) is the canonical byte-contract a
 # `getModuleInfo` handshake returns; the `ModuleDownloader` consumes it directly rather than
-# re-declaring the shape (single source of truth, no drift vs the dig-node serve leg). Foundation-level
-# (L00), zero DIG deps — a legal downward edge from L30. NC-7: prefer the crates.io release over
-# bare-git.
+# re-declaring the shape (single source of truth, no drift vs the dig-node serve leg). dig-rpc-protocol
+# 0.6 is pinned to match dig-peer's dependency. Foundation-level (L00), zero DIG deps — a legal
+# downward edge from L30. NC-7: prefer the crates.io release over bare-git.
 dig-rpc-protocol = "0.6"
 
 # REACH + FETCH — the mTLS peer transport the range fetch rides: `dig.getAvailability` +
 # `dig.fetchRange` over dig-nat mux streams, plus the wire shapes (`RangeRequest`, `RangeFrame`,
 # `AvailabilityItem`/`Answer`/`Response`) and `PeerId`/`PeerTarget`/`NodeCert`/`connect`.
 #
-# Sourcing: crates.io "0.14". The dial API (`connect`/`connect_with_runtime`/`NatRuntime`) is unchanged;
+# Sourcing: crates.io 0.18. The dial API (`connect`/`connect_with_runtime`/`NatRuntime`) is unchanged;
 # dig-nat re-exports dig-tls 0.3 for ALL cert/mTLS/peer_id/BLS-binding plumbing.
 #
-# `^0.14` is REQUIRED, not merely current, and for correctness reasons that accumulated across three
-# releases (#1640). Through dig-nat 0.11 the framed ENCODE side was UNCAPPED while the DECODE side
-# already capped a body at `MAX_FRAMED_BODY` (64 KiB), so a holder emitted frames every conforming reader
-# was obliged to reject and every DIG read or reshare above ~48 KiB failed to decode. 0.12 made
-# `RangeFrame::encode` fallible and capped the payload at `MAX_RANGE_FRAME_PAYLOAD`. 0.13 marked the wire
-# types `#[non_exhaustive]` with public constructors and gave `chunk_index` a setter separate from the
-# inclusion proof, so a chunk-aligned CONTINUATION frame can state its alignment without repeating a
-# once-per-stream proof. 0.14 adds the paged-prologue reassembly primitives (`ChunkLensAssembler`,
-# `MAX_RESOURCE_CHUNK_COUNT`, `RangeFrame::split_chunk_lens_pages`) plus `chunk_lens_offset`, which is the
-# field that distinguishes a conforming NEXT page from a restatement.
+# 0.18 continues the correctness + capability arc started in 0.12–0.14 (#1640): better framing bounds,
+# wire resilience, paged reassembly for large ranges, and IPv6-first peer transport. The wire shapes
+# (`RangeRequest`, `RangeFrame`, `AvailabilityItem`/`Answer`/`Response`) appear in this crate's public
+# `RangeTransport` trait, so their identity is part of dig-download's public API and every dig-nat bump
+# is breaking for consumers.
 #
-# The wire shapes (`RangeRequest`, `RangeFrame`, `AvailabilityItem`/`Answer`/`Response`) appear in this
-# crate's public `RangeTransport` trait, so their identity is part of dig-download's public API and this
-# bump is breaking for consumers. NC-7: prefer the crates.io release over bare-git.
+# The wire is CANONICAL in dig-nat; never re-declare or fork the shapes here. NC-7: prefer the
+# crates.io release over bare-git.
 dig-nat = "0.18"
 
 # REACH + FETCH via the shared client — dig-download talks to peers through `DigPeer`, the one DIG
 # Network peer client (#1283), rather than driving dig-nat directly: `DigPeer::connect_with_runtime`
-# (peer_id-PINNED mTLS over the full NAT ladder) + `get_availability` / `fetch_range`. dig-peer 0.8
-# re-exports the SAME dig-nat 0.15 / dig-tls 0.3 shapes this crate already uses (`PeerTarget`,
+# (peer_id-PINNED mTLS over the full NAT ladder) + `get_availability` / `fetch_range`. dig-peer 0.9
+# re-exports the SAME dig-nat 0.18 / dig-tls 0.3 shapes this crate already uses (`PeerTarget`,
 # `RangeRequest`, `AvailabilityItem`/`AvailabilityResponse`, `NodeCert`, `PeerId`), so the tree still
 # carries exactly ONE dig-nat + dig-tls instance. NC-7: prefer the crates.io release over bare-git.
 #
-# Kept on the same dig-rpc-protocol line as this crate to collapse a `ModuleInfo` SHAPE SKEW, not merely to stay current (#1576). dig-peer 0.4
-# pulled dig-rpc-protocol 0.3 while this crate consumes 0.5 — the major that carries the module wire —
-# so the resolved tree held TWO `ModuleInfo` types either side of a trust boundary, on the very field
-# (`chunk_lens`/`chunk_hashes`) that drives the whole pull plan. That is the #836 `serde_bytes`-vs-base64
-# class of defect, which cost six blind diagnosis rounds. dig-peer 0.5 is on dig-rpc-protocol 0.5, so
-# the tree now carries exactly ONE. dig-peer 0.5 also adds the `get_module_info` / `fetch_module_range`
-# client methods dig-node's `ModuleTransport` adapter is built on.
+# Kept on the same dig-rpc-protocol line (0.6) as this crate to collapse a `ModuleInfo` SHAPE SKEW,
+# not merely to stay current (#1576). An earlier version skew held TWO `ModuleInfo` types either side
+# of a trust boundary, on the very field (`chunk_lens`/`chunk_hashes`) that drives the whole pull plan —
+# the #836 `serde_bytes`-vs-base64 class of defect that cost six diagnosis rounds. Pinning dig-peer to
+# the SAME dig-rpc-protocol version as this crate prevents regression. dig-peer 0.9 also exports the
+# `get_module_info` / `fetch_module_range` client methods dig-node's `ModuleTransport` adapter uses.
 dig-peer = "0.9"
 
 # Async runtime for the orchestrator task + the concurrent range fan-out + backoff timers.
