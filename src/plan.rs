@@ -28,7 +28,10 @@ pub struct ChunkLayout {
 /// vectors, so an absurd count is a one-message allocation attack — bounded here, before any
 /// allocation. 1 Mi chunks covers any real resource at any sane chunk size (the module puller's
 /// [`MAX_MODULE_CHUNK_COUNT`](crate::module::MAX_MODULE_CHUNK_COUNT) mirror).
-pub const MAX_RESOURCE_CHUNK_COUNT: usize = 1024 * 1024;
+///
+/// Re-exported from `dig_nat` (the wire's own bound, #2231) rather than redefined, so the two
+/// crates can never drift onto different ceilings for the same wire limit.
+pub use dig_nat::MAX_RESOURCE_CHUNK_COUNT;
 
 impl ChunkLayout {
     /// Build a layout from TRUSTED per-chunk lengths. Zero-length chunks are permitted (an empty
