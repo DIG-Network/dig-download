@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.17.3] - 2026-08-08
+
+### Chores
+- **dig-download:** Refresh stale dep comments + DRY hex encoder (#2333) (#28)
+
 ## [0.17.2] - 2026-08-07
 
 ### Chores
