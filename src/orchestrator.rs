@@ -40,6 +40,7 @@ use tokio::sync::mpsc;
 use crate::error::DownloadError;
 use crate::gc::ActiveDownloads;
 use crate::locate::ProviderLocator;
+use crate::module::hex_of;
 use crate::plan::{plan_ranges, Range, RangeState};
 use crate::progress::{DownloadEvent, DownloadProgress, DownloadState, StateStore};
 use crate::select::{
@@ -1409,15 +1410,15 @@ impl Job {
         match &self.content {
             ContentId::Store { .. } => Err(DownloadError::NotDownloadable),
             ContentId::Root { store_id, root } => {
-                Ok(AvailabilityItem::store(hex32(store_id)).with_root(hex32(root)))
+                Ok(AvailabilityItem::store(hex_of(store_id)).with_root(hex_of(root)))
             }
             ContentId::Resource {
                 store_id,
                 root,
                 retrieval_key,
-            } => Ok(AvailabilityItem::store(hex32(store_id))
-                .with_root(hex32(root))
-                .with_retrieval_key(hex32(retrieval_key))),
+            } => Ok(AvailabilityItem::store(hex_of(store_id))
+                .with_root(hex_of(root))
+                .with_retrieval_key(hex_of(retrieval_key))),
         }
     }
 
@@ -1426,7 +1427,7 @@ impl Job {
     fn content_root_hex(&self) -> Option<String> {
         match &self.content {
             ContentId::Store { .. } => None,
-            ContentId::Root { root, .. } | ContentId::Resource { root, .. } => Some(hex32(root)),
+            ContentId::Root { root, .. } | ContentId::Resource { root, .. } => Some(hex_of(root)),
         }
     }
 
@@ -1449,14 +1450,14 @@ impl Job {
         let req = match &self.content {
             ContentId::Store { .. } => return Err(DownloadError::NotDownloadable),
             ContentId::Root { store_id, root } => {
-                RangeRequest::capsule(hex32(store_id), offset, length).with_root(hex32(root))
+                RangeRequest::capsule(hex_of(store_id), offset, length).with_root(hex_of(root))
             }
             ContentId::Resource {
                 store_id,
                 root,
                 retrieval_key,
-            } => RangeRequest::resource(hex32(store_id), hex32(retrieval_key), offset, length)
-                .with_root(hex32(root)),
+            } => RangeRequest::resource(hex_of(store_id), hex_of(retrieval_key), offset, length)
+                .with_root(hex_of(root)),
         };
         // Left ABSENT on the establish probe (an absent field reads as "send the layout"), so the wire is
         // byte-identical to the pre-#1668 request an older holder expects.
@@ -1468,16 +1469,6 @@ impl Job {
     }
 }
 
-/// Lowercase-hex a 32-byte id (store_id / root / retrieval_key) for the wire.
-fn hex32(b: &[u8; 32]) -> String {
-    let mut s = String::with_capacity(64);
-    for x in b {
-        s.push(char::from_digit((x >> 4) as u32, 16).unwrap());
-        s.push(char::from_digit((x & 0x0f) as u32, 16).unwrap());
-    }
-    s
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1487,10 +1478,5 @@ mod tests {
         let c = ContentId::resource([1; 32], [2; 32], [3; 32]);
         assert_eq!(download_key(&c), c.to_key().to_hex());
         assert_eq!(download_key(&c).len(), 64);
-    }
-
-    #[test]
-    fn hex32_round_trips_length() {
-        assert_eq!(hex32(&[0xAB; 32]), "ab".repeat(32));
     }
 }

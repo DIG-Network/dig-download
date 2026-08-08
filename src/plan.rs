@@ -26,8 +26,9 @@ pub struct ChunkLayout {
 ///
 /// `chunk_lens` arrives from an untrusted peer's first frame and its COUNT sizes the layout's own
 /// vectors, so an absurd count is a one-message allocation attack — bounded here, before any
-/// allocation. 1 Mi chunks covers any real resource at any sane chunk size (the module puller's
-/// [`MAX_MODULE_CHUNK_COUNT`](crate::module::MAX_MODULE_CHUNK_COUNT) mirror).
+/// allocation. 1 Mi chunks covers any real resource at any sane chunk size (an independently-chosen
+/// equal ceiling for the module puller's [`MAX_MODULE_CHUNK_COUNT`](crate::module::MAX_MODULE_CHUNK_COUNT)
+/// — NOT wired to the same source; they bound different wire messages, so they may legally diverge).
 ///
 /// Re-exported from `dig_nat` (the wire's own bound, #2231) rather than redefined, so the two
 /// crates can never drift onto different ceilings for the same wire limit.

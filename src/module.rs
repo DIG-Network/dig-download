@@ -1168,10 +1168,11 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hex_of(Sha256::digest(bytes))
 }
 
-/// Lower-hex a digest. Split out from [`sha256_hex`] because the whole-module hash is now accumulated
-/// INCREMENTALLY over the chunks (#1610) and so finalizes a digest that never had a contiguous
-/// `&[u8]` behind it.
-fn hex_of(digest: impl AsRef<[u8]>) -> String {
+/// Lower-hex encode bytes. The single shared hex encoder for the crate.
+///
+/// Split out from [`sha256_hex`] because the whole-module hash is now accumulated INCREMENTALLY
+/// over the chunks (#1610) and so finalizes a digest that never had a contiguous `&[u8]` behind it.
+pub(crate) fn hex_of(digest: impl AsRef<[u8]>) -> String {
     let mut out = String::with_capacity(64);
     for b in digest.as_ref() {
         out.push(char::from_digit((b >> 4) as u32, 16).unwrap());
