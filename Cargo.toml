@@ -20,7 +20,7 @@
 # by dig-node (see the implementers' note in the crate docs).
 [package]
 name = "dig-download"
-version = "0.17.3"
+version = "0.17.4"
 edition = "2021"
 rust-version = "1.75.0"
 license = "Apache-2.0 OR MIT"
@@ -35,7 +35,17 @@ categories = ["network-programming"]
 # ecosystem SSOT (#1283). The §5.3 read-ladder re-exports these rather than re-deriving the values,
 # so there is exactly ONE source of truth for the endpoints across the ecosystem. Foundation-level
 # (L00), zero DIG deps. NC-7: prefer the crates.io release over bare-git.
-dig-constants = "0.8"
+#
+# The 0.8 → 0.10 move is additive for the three literals this crate re-exports (0.9 added a profile
+# sealing label; 0.10 is a dep-family migration inside dig-constants itself). It has ONE cost worth
+# stating rather than discovering: dig-constants 0.10 moves its own `chia-consensus`/`chia-protocol`
+# from ^0.26 to ^0.36.1, while dig-nat 0.18 still requires `dig-constants >=0.4, <0.6`. The resolved
+# tree therefore carries TWO dig-constants (0.10.0 direct, 0.5.1 under dig-nat) and hence two chia
+# stacks. That is BUILD WEIGHT, not a type seam — dig-download names no chia type and consumes only
+# the three endpoint literals, so nothing crosses between the copies. Relaxing the `<0.6` pin is
+# dig-nat's to do; `tests/dependency_tree.rs` fails if the count ever moves off two in either
+# direction, so neither the fix nor a further regression can land silently.
+dig-constants = "0.10"
 
 # LOCATE — "which peers hold this content?" dig-download derives a `ContentId` (store / root /
 # capsule / resource) and asks dig-dht `find_providers` for the holders' `ProviderRecord`s.

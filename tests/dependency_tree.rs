@@ -121,6 +121,60 @@ fn the_transport_is_on_the_capped_encode_line() {
     );
 }
 
+/// **Proves:** the §5.3 endpoint literals this crate re-exports come from the dig-constants line the
+/// manifest names, and that the tree carries exactly the two copies the manifest graph accounts for.
+///
+/// **Catches:** two distinct regressions, neither of which the compiler can see.
+///
+/// First, a stale endpoint SSOT. `RPC_DIG_NET_URL`, `DIG_LOCAL_HOST` and `DIG_NODE_PORT` are
+/// `pub use`d straight out of `read_ladder`, so an older dig-constants would republish stale
+/// endpoints under THIS crate's own name — the drift dig-constants exists to end (#1283). Unlike the
+/// type-identity invariants above, that is invisible to `cargo build`: the re-exports are a `&str`
+/// and a `u16`, so every version of them type-checks identically.
+///
+/// Second, an unaccounted-for spread of dig-constants copies. Two is not a number copied back out of
+/// a lock file; it is what the manifest graph requires. Exactly two edges reach dig-constants: this
+/// crate's direct `^0.10`, and dig-nat 0.18's `>=0.4, <0.6`, whose ceiling resolves 0.5.1. Nothing
+/// else in the tree depends on it (dig-dht → dig-ip + dig-nat; dig-peer → dig-message, dig-nat,
+/// dig-rpc-protocol, dig-tls; dig-tls, dig-ip and dig-identity carry no dig deps at all).
+///
+/// The duplication is BUILD WEIGHT, not a wire seam, and the distinction is the point: dig-constants
+/// 0.10 carries `chia-consensus`/`chia-protocol` 0.36.1 where 0.5.1 carries 0.26, so the tree
+/// compiles two chia stacks. Nothing crosses between them — dig-download names no chia type and
+/// consumes only the three literals — so unlike the dig-nat and dig-rpc-protocol invariants above
+/// there is no `ModuleInfo`-style shape skew to fear here. It is still a cost that must not grow
+/// unnoticed. A THIRD copy fails this test as unaccounted-for weight; a SINGLE copy fails it too,
+/// which is the intended signal that dig-nat relaxed its `<0.6` pin and this assertion should be
+/// tightened to demand exactly one.
+#[test]
+fn the_endpoint_ssot_resolves_the_named_constants_line() {
+    // Counted by line rather than indexed after a sort: version strings do not order
+    // lexicographically ("0.10.0" sorts BEFORE "0.5.1"), so an index here would assert the opposite
+    // of what it reads like.
+    let versions = locked_versions("dig-constants");
+    let on_line = |prefix: &str| versions.iter().filter(|v| v.starts_with(prefix)).count();
+
+    assert_eq!(
+        versions.len(),
+        2,
+        "expected exactly two dig-constants — 0.10 on this crate's direct edge and 0.5.1 dragged in \
+         by dig-nat 0.18's `>=0.4, <0.6` pin — found {versions:?}. More is unaccounted-for build \
+         weight; fewer means dig-nat relaxed its pin and this assertion should now demand one"
+    );
+    assert_eq!(
+        on_line("0.10."),
+        1,
+        "the read ladder re-exports its endpoint literals from dig-constants, so the direct edge must \
+         resolve the 0.10 line the manifest names; the tree resolved {versions:?}"
+    );
+    assert_eq!(
+        on_line("0.5."),
+        1,
+        "the other copy must be the 0.5 line dig-nat 0.18's `>=0.4, <0.6` pin selects; anything else \
+         is an edge this test does not account for, found {versions:?}"
+    );
+}
+
 /// **Proves:** exactly one `dig-dht`, on the 0.11 line that itself carries dig-nat 0.18.
 ///
 /// **Catches:** the published-but-unresolvable class this cascade exists to fix — a caret like
