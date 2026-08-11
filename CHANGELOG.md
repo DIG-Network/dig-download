@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.17.4] - 2026-08-11
+
+### Chores
+- **deps:** Dig-constants 0.10 + dig-dht 0.11.1, guarded by a tree assertion (#29)
+
 ## [0.17.3] - 2026-08-08
 
 ### Chores
