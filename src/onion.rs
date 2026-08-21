@@ -208,7 +208,7 @@ impl Default for StreamRelayConfig {
 
 /// Decide whether this hop carries an inbound transfer.
 ///
-/// `relay_bytes_available` is what remains of this node's [`relay_bytes_per_window`] allowance — the
+/// `relay_bytes_available` is what remains of this node's [`StreamRelayConfig::relay_bytes_per_window`] allowance — the
 /// caller owns the window and its refill. It is a separate allowance from anything this node spends on
 /// its OWN transfers, for the reason `dig-sex` records for asks: billing relayed work to the victim's
 /// own budget lets one admitted request spend a stranger's allowance.

@@ -903,3 +903,105 @@ serve. This is what makes reshare safe: only chain-anchored bytes can ever be re
 This crate ships the ENGINE and the two seams. The production `ModuleTransport` adapter over the peer
 client is wired by dig-node once module client methods exist on the shared peer client; the in-memory
 `testkit::MockModuleTransport` is the reference double.
+
+---
+
+## 18. Onion mode — a transfer carried back through the hops (`onion`)
+
+In **direct mode** the requestor learns a holder's dial address and fetches from it. In **onion mode**
+the bytes travel back up the hop path that carried the ask: each hop hands them to its predecessor, so
+the requestor never dials the holder and the holder never sees the requestor.
+
+This crate owns two things in that picture and deliberately not a third. It owns the **admission
+decision a hop makes about carrying bytes** and the **seam that plugs a hop-carried transfer into the
+verification engine specified above**. It does NOT implement onion cryptography, circuits, cells, or
+relay selection: those are `dig-onion`'s, and they are reached through the `OnionChannel` seam. Both
+crates sit at level 30, so a direct dependency is forbidden by the crate hierarchy and the layered
+transport MUST be injected from above (dig-node).
+
+### 18.1 Trust (MUST)
+
+- **A hop is untrusted (NC-12).** Bytes arriving through a hop are accepted because they verify under
+  §7 and §8 — never because of who relayed them. An onion-delivered range and a directly fetched range
+  face byte-for-byte the same checks.
+- **A hostile hop can deny, never forge.** Corrupting a relayed range does not produce a false success:
+  the corruption fails the §8 chain-anchored gate and nothing is promoted. Per-range checks are
+  structural, so a content-byte flip is caught at §8 rather than §7 — the whole-resource gate is the
+  guarantee, not an optimisation.
+- **A denial MUST NOT be permanent.** A failed onion transfer discards the checkpoint and the bytes it
+  describes (§10), so a later attempt over an honest path completes.
+- **Verified content is not safe content.** §7/§8 prove provenance; nothing here makes a `.dig` from a
+  stranger safe to act on.
+
+### 18.2 NC-1 / §5.4 composition (normative statement)
+
+NC-1 requires a directed message to be end-to-end sealed to its recipient, so an intermediary that
+terminates transport sees ciphertext. Streaming content through intermediaries satisfies that rather
+than trading against it, because both things an intermediary could learn are separately sealed:
+
+- **The request and response payloads** are onion-layered. A hop peels exactly its own layer, which
+  names the next hop and nothing beneath. The innermost layer is sealed to the exit, and the exit is the
+  only hop that learns WHICH content is fetched — the disclosure radius, a property of onion routing.
+- **The content bytes** are `.dig` capsule ciphertext independently of any transport. A hop that peeled
+  every layer it is entitled to peel holds store ciphertext for which it has no retrieval key.
+
+No hop is a recipient and no hop holds plaintext, so NC-1 is satisfied by construction. Two properties
+MUST NOT be inferred from it: onion mode hides the requestor from the holder, not the fact of a
+transfer from an on-path observer (padding is `dig-onion`'s concern), and it makes no safety claim about
+the content.
+
+### 18.3 What bounds a relay's bandwidth (MUST)
+
+An ask and a transfer are different costs — a forwarded ask costs a hop a few hundred bytes, a
+forwarded transfer costs it the content twice — so they draw on different allowances. The ask budget
+(`dig-sex`) MUST NOT be reused for a stream.
+
+- **Off by default.** A node relays nothing until an operator enables it. The switch is taken as a
+  value; a node parses it fail-closed with `dig_sex::discovery::parse_enabled`, and this crate adds no
+  second parser.
+- **A node MAY relay asks while refusing streams** (`relays_asks_only`, the default when enabled). The
+  refusal carries its own reason and MUST NOT be reported as, or collapsed into, "the content was not
+  found": conflating a refusal to carry with an absence of content teaches a requestor that content
+  does not exist when in truth nobody would relay it.
+- **An unreadable declared length is REFUSED, never carried optimistically.** An unbounded byte cost is
+  the same class of defect as an unbounded reach, and the ask policy already settled that class.
+- **A transfer that does not fit is refused WHOLE, never silently truncated.** A truncated relay is
+  indistinguishable to the requestor from a mid-stream disconnect, so it would spend the requestor's
+  retry budget to discover a limit the relay already knew. The requestor asks for smaller ranges
+  instead; the engine is range-based, so a smaller window always exists.
+- **Two bounds, both enforced:** a per-stream ceiling (`max_bytes_per_stream`, default 16 MiB — one
+  range window, not one capsule) and a per-window total carried on others' behalf
+  (`relay_bytes_per_window`, default 256 MiB). The window and its refill belong to the caller, which
+  owns the clock.
+- **The originator is held to the same per-stream ceiling, before any hop is asked.** The asymmetry is
+  where amplification lives: a requestor free to ask for a window every hop is bound to refuse spends
+  the network N transfers to deliver nothing, and the requestor is the one node that could have known
+  in advance.
+
+### 18.4 Hop paths (MUST)
+
+- **A path MUST contain at least one hop.** Onion mode with no hops is direct mode wearing onion mode's
+  name: the requestor would dial the holder while believing it had not, and the privacy loss would be
+  silent.
+- **A peer MUST NOT occupy two positions on one path.** One peer presenting itself as two inflates the
+  apparent path length while learning both of its own positions.
+- **A path MUST NOT exceed `MAX_HOP_PATH` (8) hops**, because path length multiplies the bandwidth every
+  relay spends: an N-hop transfer costs the network N times the content. This is a refusal ceiling, not
+  a recommendation.
+- Validation happens in the constructor, so an invalid path cannot exist.
+
+### 18.5 Resume across a hop path (MUST)
+
+Onion mode changes how bytes arrive and nothing about how a partial is trusted. Every §10 rule applies
+unchanged, and in particular a poisoned partial completed by honest ranges MUST be REJECTED: the
+tampered prefix has the right LENGTH, each honest range verifies individually, and only the §8 gate —
+which a resumed run MUST also reach — sees that the assembly is wrong. A length-only check passes that
+case, which is why it is not one.
+
+### 18.6 Implementation status
+
+This crate ships the policy, the hop-path type, and the transport seam. The layered transport itself is
+`dig-onion`, whose protocol bodies are unimplemented at the time of writing; until they land, the seam
+is exercised over the in-memory hop channel in `tests/onion_transfer.rs` and no production onion path
+exists. The relay-side accounting window (when it opens, closes and refills) belongs to the node that
+holds the clock, and is not specified here.

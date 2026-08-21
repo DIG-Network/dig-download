@@ -26,6 +26,12 @@
 //!     [`FileStateStore`]).
 //!   - [`Verifier`] / [`ProofVerifier`] — per-range + chain-anchored integrity ([`MerkleVerifier`];
 //!     dig-node injects the digstore proof verifier to bind to the on-chain root).
+//! - [`onion`] — **onion mode**: a transfer carried back through the hops that carried the ask, as an
+//!   [`OnionRangeTransport`] over an injected [`OnionChannel`] (the layered transport is `dig-onion`'s).
+//!   Delivery changes; trust does not — an onion-delivered byte faces the same per-range and
+//!   chain-anchored checks as a directly fetched one. Includes the byte-denominated
+//!   [`StreamRelayConfig`] that bounds what a hop spends carrying someone else's transfer, and which is
+//!   OFF by default.
 //! - [`gc`] — reap stale `.download.tmp` staging files, never a live/paused-resumable one
 //!   ([`ActiveDownloads`] + [`TmpGc`]; run [`Downloader::gc`] on an interval like dig-dht's provider
 //!   `gc()`).
