@@ -181,10 +181,9 @@ async fn join_ok(handle: dig_download::DownloadHandle) -> Result<u64, DownloadEr
 }
 
 fn temp_dir(tag: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "dig-download-onion-{tag}-{}",
-        std::process::id() as u64 * 7 + tag.len() as u64
-    ));
+    // Keyed on the tag ITSELF, not on its length: two different tags of equal length shared one
+    // directory, so concurrent tests raced over each other's staging files.
+    let dir = std::env::temp_dir().join(format!("dig-download-onion-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("temp dir");
     dir
@@ -416,13 +415,17 @@ async fn a_window_above_the_per_stream_ceiling_is_refused_before_any_hop_is_aske
         DownloadOptions::default(),
     ))
     .await;
-    assert!(
-        result.is_err(),
-        "a transfer no hop would carry is not attempted; got {result:?}"
-    );
+    // The specific refusal, not merely "an error": an outcome-shaped assertion would also pass if
+    // the download failed for an unrelated reason (a dead hop, a verification miss) while the
+    // oversized window was in fact carried.
+    match result {
+        Err(DownloadError::State(ref reason))
+            if reason.contains("larger than this node will relay") => {}
+        other => panic!("expected the per-stream-ceiling refusal to surface; got {other:?}"),
+    }
     assert_eq!(
         channel.range_calls(),
         1,
-        "the only thing a hop carried is the 1-byte metadata probe, which is legitimately under the          ceiling; every 10-byte window was refused before it left this node"
+        "the only thing a hop carried is the 1-byte metadata probe, which is legitimately under the ceiling; every 10-byte window was refused before it left this node"
     );
 }

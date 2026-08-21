@@ -969,10 +969,14 @@ forwarded transfer costs it the content twice — so they draw on different allo
   indistinguishable to the requestor from a mid-stream disconnect, so it would spend the requestor's
   retry budget to discover a limit the relay already knew. The requestor asks for smaller ranges
   instead; the engine is range-based, so a smaller window always exists.
-- **Two bounds, both enforced:** a per-stream ceiling (`max_bytes_per_stream`, default 16 MiB — one
-  range window, not one capsule) and a per-window total carried on others' behalf
-  (`relay_bytes_per_window`, default 256 MiB). The window and its refill belong to the caller, which
-  owns the clock.
+- **Two bounds, one enforced here and one supplied by the caller.** The per-stream ceiling
+  (`max_bytes_per_stream`, default 16 MiB — one range window, not one capsule) is configured and
+  enforced by this crate. The per-window total a node carries on others' behalf is NOT a config field
+  here: it is passed in per decision as `relay_bytes_available`, and this crate only compares against
+  it. Opening, closing and refilling that window belongs to whoever holds the clock — `dig-node` —
+  which MAY initialise its counter from the `DEFAULT_RELAY_BYTES_PER_WINDOW` suggestion (256 MiB). A
+  crate with no clock cannot enforce a window across calls, so declaring one as configuration would
+  misstate a bound rather than provide one.
 - **The originator is held to the same per-stream ceiling, before any hop is asked.** The asymmetry is
   where amplification lives: a requestor free to ask for a window every hop is bound to refuse spends
   the network N transfers to deliver nothing, and the requestor is the one node that could have known
@@ -1004,4 +1008,5 @@ This crate ships the policy, the hop-path type, and the transport seam. The laye
 `dig-onion`, whose protocol bodies are unimplemented at the time of writing; until they land, the seam
 is exercised over the in-memory hop channel in `tests/onion_transfer.rs` and no production onion path
 exists. The relay-side accounting window (when it opens, closes and refills) belongs to the node that
-holds the clock, and is not specified here.
+holds the clock — `dig-node` — and is not specified here; consistent with §18.3, this crate exposes no
+configuration field for it and consumes only the remaining allowance the caller passes per decision.

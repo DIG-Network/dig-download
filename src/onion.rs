@@ -178,9 +178,6 @@ pub struct StreamRelayConfig {
     pub relays_asks_only: bool,
     /// The largest single transfer this node will carry for someone else.
     pub max_bytes_per_stream: u64,
-    /// The total bytes this node will carry on others' behalf per accounting window. The window and
-    /// its refill are the caller's (it owns the clock); this module only compares.
-    pub relay_bytes_per_window: u64,
 }
 
 /// 16 MiB — the default per-stream ceiling, which is one range window rather than one capsule.
@@ -190,26 +187,33 @@ pub struct StreamRelayConfig {
 /// while admitting per capsule costs a relay the whole capsule.
 pub const DEFAULT_MAX_BYTES_PER_STREAM: u64 = 16 * 1024 * 1024;
 
-/// 256 MiB per window — the default total a node carries on others' behalf.
+/// 256 MiB — the suggested size of a relay's per-window byte allowance.
+///
+/// Deliberately NOT a [`StreamRelayConfig`] field: this crate holds no clock, so it can neither open,
+/// close nor refill a window, and a configured window it could never enforce would be a knob that
+/// misstates a bound. A caller that owns the clock initialises its own counter from this value and
+/// passes what remains of it to [`decide_relay_stream`] as `relay_bytes_available`.
 pub const DEFAULT_RELAY_BYTES_PER_WINDOW: u64 = 256 * 1024 * 1024;
 
 impl Default for StreamRelayConfig {
-    /// A node that carries nothing: onion mode off, and if switched on, streams refused until the
-    /// operator says otherwise.
+    /// A node that carries nothing for anyone else: onion mode off, and if switched on, OTHER
+    /// peers' streams refused until the operator says otherwise. `relays_asks_only` withholds
+    /// relaying only; the node's own originated transfers are gated by `enabled` alone.
     fn default() -> Self {
         StreamRelayConfig {
             enabled: false,
             relays_asks_only: true,
             max_bytes_per_stream: DEFAULT_MAX_BYTES_PER_STREAM,
-            relay_bytes_per_window: DEFAULT_RELAY_BYTES_PER_WINDOW,
         }
     }
 }
 
 /// Decide whether this hop carries an inbound transfer.
 ///
-/// `relay_bytes_available` is what remains of this node's [`StreamRelayConfig::relay_bytes_per_window`] allowance — the
-/// caller owns the window and its refill. It is a separate allowance from anything this node spends on
+/// One bound is enforced here — [`StreamRelayConfig::max_bytes_per_stream`], the per-stream ceiling.
+/// `relay_bytes_available` is the second bound and it is the CALLER's: what remains of this node's
+/// per-window allowance (see [`DEFAULT_RELAY_BYTES_PER_WINDOW`]), supplied per call because the caller
+/// owns the clock, the window and its refill. This module only compares against it. It is a separate allowance from anything this node spends on
 /// its OWN transfers, for the reason `dig-sex` records for asks: billing relayed work to the victim's
 /// own budget lets one admitted request spend a stranger's allowance.
 ///
@@ -454,6 +458,42 @@ mod tests {
             hops_remaining: Some(hops),
             declared_len: Some(len),
         }
+    }
+
+    /// The public config surface offers NO knob that claims a per-window byte bound.
+    ///
+    /// This crate holds no clock, so a configured window would be a value nothing here could open,
+    /// close, refill or enforce across calls — exactly the shape of a field that misstates a bound.
+    /// The window is the caller's, supplied per call as `relay_bytes_available`.
+    ///
+    /// The destructuring pattern is the assertion, and it is deliberately exhaustive (no `..`): it
+    /// stops compiling the moment a field is ADDED to `StreamRelayConfig`, so re-introducing a
+    /// window knob — or any other unenforced knob — trips this test rather than passing silently.
+    /// An `assert!(true)`-shaped runtime check could not do that, because a dead field has no
+    /// runtime effect to observe.
+    #[test]
+    fn the_config_surface_declares_no_window_bound_it_cannot_enforce() {
+        let StreamRelayConfig {
+            enabled,
+            relays_asks_only,
+            max_bytes_per_stream,
+        } = StreamRelayConfig::default();
+        assert!(!enabled);
+        assert!(relays_asks_only);
+        assert_eq!(max_bytes_per_stream, DEFAULT_MAX_BYTES_PER_STREAM);
+
+        // The window's default survives as a free const for a caller to initialise its OWN counter
+        // from, which is the only place it can honestly live.
+        let mut caller_owned_window = DEFAULT_RELAY_BYTES_PER_WINDOW;
+        caller_owned_window -= 1024;
+        assert_eq!(
+            decide_relay_stream(&relaying(), &inbound(2, 1024), caller_owned_window),
+            StreamRelayDecision::Carry {
+                hops_remaining: 1,
+                byte_ceiling: 1024
+            },
+            "the bound that applies is the one the caller passed, never a configured field"
+        );
     }
 
     #[test]
