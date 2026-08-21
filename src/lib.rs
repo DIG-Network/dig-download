@@ -79,6 +79,7 @@ pub mod error;
 pub mod gc;
 pub mod locate;
 pub mod module;
+pub mod onion;
 pub mod orchestrator;
 pub mod plan;
 pub mod progress;
@@ -118,6 +119,11 @@ pub use module::AcceptAnyModuleAnchor;
 // Re-export the wire descriptor so consumers use ONE `ModuleInfo` shape (the dig-rpc-protocol
 // byte-contract) across the module pull — no divergent local copy (#1576).
 pub use dig_rpc_protocol::types::ModuleInfo;
+pub use onion::{
+    decide_relay_stream, HopPath, HopPathError, InboundStream, OnionChannel, OnionRangeTransport,
+    StreamRelayConfig, StreamRelayDecision, StreamRelayRefusal, DEFAULT_MAX_BYTES_PER_STREAM,
+    DEFAULT_RELAY_BYTES_PER_WINDOW, MAX_HOP_PATH,
+};
 pub use orchestrator::{
     download_key, DownloadConfig, DownloadHandle, DownloadOptions, Downloader,
     DEFAULT_RANGE_TIMEOUT, DEFAULT_REFRESH_INTERVAL,
