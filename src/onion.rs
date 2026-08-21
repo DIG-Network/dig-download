@@ -459,7 +459,10 @@ mod tests {
     #[test]
     fn a_node_carries_nothing_by_default() {
         let config = StreamRelayConfig::default();
-        assert!(!config.enabled, "onion mode is off until an operator says so");
+        assert!(
+            !config.enabled,
+            "onion mode is off until an operator says so"
+        );
         assert!(
             config.relays_asks_only,
             "and even switched on, streams are refused until an operator opts in"
