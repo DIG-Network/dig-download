@@ -20,7 +20,7 @@
 # by dig-node (see the implementers' note in the crate docs).
 [package]
 name = "dig-download"
-version = "0.18.0"
+version = "0.19.0"
 edition = "2021"
 rust-version = "1.75.0"
 license = "Apache-2.0 OR MIT"
@@ -71,9 +71,9 @@ dig-dht = "0.11"
 # (`total_size` / `module_hash` / `chunk_hashes` / `chunk_lens`) is the canonical byte-contract a
 # `getModuleInfo` handshake returns; the `ModuleDownloader` consumes it directly rather than
 # re-declaring the shape (single source of truth, no drift vs the dig-node serve leg). dig-rpc-protocol
-# 0.6 is pinned to match dig-peer's dependency. Foundation-level (L00), zero DIG deps — a legal
+# 0.10 is pinned to match dig-peer's dependency. Foundation-level (L00), zero DIG deps — a legal
 # downward edge from L30. NC-7: prefer the crates.io release over bare-git.
-dig-rpc-protocol = "0.6"
+dig-rpc-protocol = "0.10"
 
 # REACH + FETCH — the mTLS peer transport the range fetch rides: `dig.getAvailability` +
 # `dig.fetchRange` over dig-nat mux streams, plus the wire shapes (`RangeRequest`, `RangeFrame`,
@@ -94,18 +94,18 @@ dig-nat = "0.18"
 
 # REACH + FETCH via the shared client — dig-download talks to peers through `DigPeer`, the one DIG
 # Network peer client (#1283), rather than driving dig-nat directly: `DigPeer::connect_with_runtime`
-# (peer_id-PINNED mTLS over the full NAT ladder) + `get_availability` / `fetch_range`. dig-peer 0.9
+# (peer_id-PINNED mTLS over the full NAT ladder) + `get_availability` / `fetch_range`. dig-peer 0.11
 # re-exports the SAME dig-nat 0.18 / dig-tls 0.3 shapes this crate already uses (`PeerTarget`,
 # `RangeRequest`, `AvailabilityItem`/`AvailabilityResponse`, `NodeCert`, `PeerId`), so the tree still
 # carries exactly ONE dig-nat + dig-tls instance. NC-7: prefer the crates.io release over bare-git.
 #
-# Kept on the same dig-rpc-protocol line (0.6) as this crate to collapse a `ModuleInfo` SHAPE SKEW,
+# Kept on the same dig-rpc-protocol line (0.10) as this crate to collapse a `ModuleInfo` SHAPE SKEW,
 # not merely to stay current (#1576). An earlier version skew held TWO `ModuleInfo` types either side
 # of a trust boundary, on the very field (`chunk_lens`/`chunk_hashes`) that drives the whole pull plan —
 # the #836 `serde_bytes`-vs-base64 class of defect that cost six diagnosis rounds. Pinning dig-peer to
-# the SAME dig-rpc-protocol version as this crate prevents regression. dig-peer 0.9 also exports the
+# the SAME dig-rpc-protocol version as this crate prevents regression. dig-peer 0.11 also exports the
 # `get_module_info` / `fetch_module_range` client methods dig-node's `ModuleTransport` adapter uses.
-dig-peer = "0.9"
+dig-peer = "0.11"
 
 # Async runtime for the orchestrator task + the concurrent range fan-out + backoff timers.
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync", "io-util"] }
@@ -177,3 +177,4 @@ dig-tls = "0.3"
 # allocation an untrusted length sizes. In a library, a wrapping add is a silent ACCEPT, not a panic —
 # never delegate that to a profile flag. The `overflow-checks-off` CI job builds + runs the tests with
 # the checks explicitly DISABLED so this class fails loudly if it ever creeps back.
+

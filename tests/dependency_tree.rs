@@ -33,7 +33,7 @@ fn locked_versions(crate_name: &str) -> Vec<&str> {
         .collect()
 }
 
-/// **Proves:** the resolved tree carries EXACTLY ONE `dig-rpc-protocol`, and it is the 0.6 line that
+/// **Proves:** the resolved tree carries EXACTLY ONE `dig-rpc-protocol`, and it is the 0.10 line that
 /// defines the whole-module wire (`ModuleInfo`, `GetModuleInfoParams`, `FetchModuleRangeParams`).
 /// **Catches:** a consumer (today dig-peer) reintroducing an older dig-rpc-protocol major, which would
 /// silently place two `ModuleInfo` shapes either side of the module pull's trust boundary — a defect the
@@ -48,13 +48,13 @@ fn the_tree_carries_exactly_one_dig_rpc_protocol_and_it_is_the_module_wire_major
          means two `ModuleInfo` shapes across a trust boundary"
     );
     assert!(
-        versions[0].starts_with("0.6."),
-        "the module wire ships in dig-rpc-protocol 0.6; the tree resolved {}",
+        versions[0].starts_with("0.10."),
+        "the module wire ships in dig-rpc-protocol 0.10; the tree resolved {}",
         versions[0]
     );
 }
 
-/// **Proves:** the peer client itself is on the dig-rpc-protocol 0.6 line — the transitive entry, not
+/// **Proves:** the peer client itself is on the dig-rpc-protocol 0.10 line — the transitive entry, not
 /// just the direct caret dep, since a consumer's own lock is what actually decides which patch is
 /// compiled.
 #[test]
@@ -62,8 +62,8 @@ fn the_peer_client_is_on_the_module_wire_major() {
     let versions = locked_versions("dig-peer");
     assert_eq!(versions.len(), 1, "one dig-peer only, found {versions:?}");
     assert!(
-        versions[0].starts_with("0.9."),
-        "dig-peer must be on the 0.9 line (dig-rpc-protocol 0.6 + the module client methods, re-exporting          dig-nat 0.18, whose `SafeText` crosses dig-peer's own error surface); the tree resolved {}",
+        versions[0].starts_with("0.11."),
+        "dig-peer must be on the 0.11 line (dig-rpc-protocol 0.10 + the module client methods, re-exporting          dig-nat 0.18, whose `SafeText` crosses dig-peer's own error surface); the tree resolved {}",
         versions[0]
     );
 }
