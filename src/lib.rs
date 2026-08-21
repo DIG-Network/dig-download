@@ -26,6 +26,12 @@
 //!     [`FileStateStore`]).
 //!   - [`Verifier`] / [`ProofVerifier`] — per-range + chain-anchored integrity ([`MerkleVerifier`];
 //!     dig-node injects the digstore proof verifier to bind to the on-chain root).
+//! - [`onion`] — **onion mode**: a transfer carried back through the hops that carried the ask, as an
+//!   [`OnionRangeTransport`] over an injected [`OnionChannel`] (the layered transport is `dig-onion`'s).
+//!   Delivery changes; trust does not — an onion-delivered byte faces the same per-range and
+//!   chain-anchored checks as a directly fetched one. Includes the byte-denominated
+//!   [`StreamRelayConfig`] that bounds what a hop spends carrying someone else's transfer, and which is
+//!   OFF by default.
 //! - [`gc`] — reap stale `.download.tmp` staging files, never a live/paused-resumable one
 //!   ([`ActiveDownloads`] + [`TmpGc`]; run [`Downloader::gc`] on an interval like dig-dht's provider
 //!   `gc()`).
@@ -79,6 +85,7 @@ pub mod error;
 pub mod gc;
 pub mod locate;
 pub mod module;
+pub mod onion;
 pub mod orchestrator;
 pub mod plan;
 pub mod progress;
@@ -93,6 +100,12 @@ pub mod source;
 pub mod testkit;
 pub mod throttle;
 pub mod verify;
+
+// Re-export the dig-nat wire shapes that appear in this crate's public trait signatures
+// (`RangeTransport`, `OnionChannel`), so a consumer implementing a transport names ONE copy of each
+// shape rather than adding its own dig-nat dependency and risking a version skew across the seam —
+// the `ModuleInfo` skew class recorded in Cargo.toml, which cost six diagnosis rounds on #836.
+pub use dig_nat::{AvailabilityItem, AvailabilityResponse, RangeRequest};
 
 // Re-export the content id from dig-dht so consumers use ONE `ContentId` type across locate +
 // download (no divergent shape).
@@ -118,6 +131,11 @@ pub use module::AcceptAnyModuleAnchor;
 // Re-export the wire descriptor so consumers use ONE `ModuleInfo` shape (the dig-rpc-protocol
 // byte-contract) across the module pull — no divergent local copy (#1576).
 pub use dig_rpc_protocol::types::ModuleInfo;
+pub use onion::{
+    decide_relay_stream, HopPath, HopPathError, InboundStream, OnionChannel, OnionRangeTransport,
+    StreamRelayConfig, StreamRelayDecision, StreamRelayRefusal, DEFAULT_MAX_BYTES_PER_STREAM,
+    DEFAULT_RELAY_BYTES_PER_WINDOW, MAX_HOP_PATH,
+};
 pub use orchestrator::{
     download_key, DownloadConfig, DownloadHandle, DownloadOptions, Downloader,
     DEFAULT_RANGE_TIMEOUT, DEFAULT_REFRESH_INTERVAL,
