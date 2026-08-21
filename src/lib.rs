@@ -95,6 +95,12 @@ pub mod testkit;
 pub mod throttle;
 pub mod verify;
 
+// Re-export the dig-nat wire shapes that appear in this crate's public trait signatures
+// (`RangeTransport`, `OnionChannel`), so a consumer implementing a transport names ONE copy of each
+// shape rather than adding its own dig-nat dependency and risking a version skew across the seam —
+// the `ModuleInfo` skew class recorded in Cargo.toml, which cost six diagnosis rounds on #836.
+pub use dig_nat::{AvailabilityItem, AvailabilityResponse, RangeRequest};
+
 // Re-export the content id from dig-dht so consumers use ONE `ContentId` type across locate +
 // download (no divergent shape).
 pub use dig_dht::{ContentId, ProviderRecord};
