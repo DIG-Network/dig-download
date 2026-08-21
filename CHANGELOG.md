@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.19.0] - 2026-08-21
+
+### Chores
+- **deps:** Adopt dig-rpc-protocol 0.10 (#34)
+
 ## [0.18.0] - 2026-08-21
 
 ### Features
