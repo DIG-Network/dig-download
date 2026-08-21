@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.18.0] - 2026-08-21
+
+### Features
+- **onion:** Onion-mode transfer seam, stream-relay bandwidth policy, SPEC 18 (#33)
+
 ## [0.17.4] - 2026-08-11
 
 ### Chores
