@@ -65,7 +65,7 @@ dig-constants = "0.10"
 # crate RE-EXPORTS `ContentId`/`ProviderRecord`, so their identity is part of dig-download's public
 # API — which is why this bump is breaking for consumers.
 # NC-7: prefer the crates.io release over bare-git.
-dig-dht = "0.11"
+dig-dht = "0.12"
 
 # WIRE — the whole-`.dig`-module pull descriptor + method names (#1576). `ModuleInfo`
 # (`total_size` / `module_hash` / `chunk_hashes` / `chunk_lens`) is the canonical byte-contract a
@@ -90,7 +90,7 @@ dig-rpc-protocol = "0.10"
 #
 # The wire is CANONICAL in dig-nat; never re-declare or fork the shapes here. NC-7: prefer the
 # crates.io release over bare-git.
-dig-nat = "0.18"
+dig-nat = "0.20"
 
 # REACH + FETCH via the shared client — dig-download talks to peers through `DigPeer`, the one DIG
 # Network peer client (#1283), rather than driving dig-nat directly: `DigPeer::connect_with_runtime`
@@ -105,7 +105,7 @@ dig-nat = "0.18"
 # the #836 `serde_bytes`-vs-base64 class of defect that cost six diagnosis rounds. Pinning dig-peer to
 # the SAME dig-rpc-protocol version as this crate prevents regression. dig-peer 0.11 also exports the
 # `get_module_info` / `fetch_module_range` client methods dig-node's `ModuleTransport` adapter uses.
-dig-peer = "0.11"
+dig-peer = "0.12"
 
 # Async runtime for the orchestrator task + the concurrent range fan-out + backoff timers.
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync", "io-util"] }
@@ -160,7 +160,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"
 # dependency (dig-download's own code only ever holds/passes an `Arc<dig_nat::NodeCert>` it is
 # handed, never mints one). Pinned to 0.3 to match the dig-tls that dig-nat 0.15 re-exports — two
 # dig-tls majors in the test build would otherwise produce an E0308 type mismatch on `NodeCert`.
-dig-tls = "0.3"
+dig-tls = "0.4"
 
 # NO `[profile.release] overflow-checks` here, DELIBERATELY (#1608).
 #
