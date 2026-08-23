@@ -184,17 +184,20 @@ fn the_locator_is_on_the_cascaded_dht_line() {
         versions[0]
     );
 }
-/// Every package in the resolved lock whose name begins with `chia`, paired with the set of packages
-/// that depend on it, keyed as `"name version"`.
+/// Every package in `lock` whose name begins with `chia`, mapped to the set of packages that depend
+/// on it. Both keys and values are `"name version"`.
 ///
-/// Built by reverse-walking the lock's dependency lists rather than by reading `Cargo.toml`, because
-/// the question this answers is about the RESOLVED graph: a manifest can name one chia line while an
-/// intermediate consumer drags in another.
-fn chia_reverse_dependencies() -> std::collections::BTreeMap<String, std::collections::BTreeSet<String>> {
+/// Takes the lock TEXT rather than reading [`LOCK`] directly so the rule below can be exercised
+/// against synthetic trees. That matters here: cargo REWRITES `Cargo.lock` before it compiles
+/// anything, so a mutation applied to the real lock to prove this rule load-bearing is silently
+/// undone and the test passes for the wrong reason.
+fn chia_reverse_dependencies(
+    lock: &str,
+) -> std::collections::BTreeMap<String, std::collections::BTreeSet<String>> {
     let mut rev: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
         std::collections::BTreeMap::new();
 
-    for block in LOCK.split("[[package]]") {
+    for block in lock.split("[[package]]") {
         let field = |key: &str| {
             block.lines().find_map(|l| {
                 l.trim()
@@ -207,12 +210,12 @@ fn chia_reverse_dependencies() -> std::collections::BTreeMap<String, std::collec
         };
         let dependant = format!("{name} {version}");
 
-        // A dependency line is `` "name",`` or `` "name version",`` — the version is present only
-        // where the lock had to disambiguate duplicates, which is precisely the case of interest.
+        // A dependency line is `"name",` or `"name version",` once trimmed — the version appears
+        // only where the lock had to disambiguate duplicates, which is exactly the case of interest.
         for dep in block
             .lines()
             .map(|l| l.trim().trim_end_matches(','))
-            .filter(|l| l.starts_with('"') && l.ends_with('"'))
+            .filter(|l| l.starts_with('"') && l.ends_with('"') && l.len() > 1)
             .map(|l| l.trim_matches('"'))
         {
             if dep.starts_with("chia") {
@@ -225,65 +228,69 @@ fn chia_reverse_dependencies() -> std::collections::BTreeMap<String, std::collec
     rev
 }
 
-/// **Proves:** every chia crate a DIG crate can reach is on the 0.36 line — stated as a property of
-/// the graph, not as a count, and not against an enumerated list of chia crate names.
+/// The only root permitted to reach a chia crate off the 0.36 line: the CLVM virtual machine, whose
+/// internals pin `chia-bls` 0.28.2 and `chia-sha2` 0.34.0 and across which no DIG type passes.
+const PERMITTED_OFF_LINE_ROOT: &str = "clvmr";
+
+/// The unification rule itself: `Err(reason)` names the first package that reaches a chia crate off
+/// the 0.36 line without rooting at [`PERMITTED_OFF_LINE_ROOT`].
 ///
-/// **Catches:** the exact defect that shipped twice in this cascade. dig-gossip 0.29.0 and the
-/// published dig-nat 0.19.0 both went out internally SPLIT — part of their tree on chia 0.26, part on
-/// 0.36 — because the pre-merge check was a hand-written list of chia crates to look at, and
-/// `chia-bls` was not on it. `chia-bls` is the one that matters most here: `NodeCert`, the mTLS
-/// identity every dig-download consumer must mint to dial a provider, is generated from a
-/// `chia_bls::SecretKey` re-exported through `dig_tls::bls`. Two `chia-bls` lines in a consumer's tree
-/// is an `E0308` at that call, and dig-download names no chia type anywhere in `src/`, so no grep of
-/// THIS crate could ever have seen it coming.
-///
-/// **Why the assertion is shaped as an allow-list of ROOTS rather than a duplicate count:**
-/// `cargo tree -d` is not the gate here and a count would be a false red. The 0.36 chia stack
-/// legitimately vendors `clvmr` 0.16.4, whose own internals pin `chia-bls` 0.28.2 and `chia-sha2`
-/// 0.34.0 — an implementation detail of the CLVM virtual machine that no DIG type crosses. So the
-/// off-line copies are permitted, but only where every path to them begins at `clvmr`. A DIG crate
-/// appearing as a dependant of an off-line chia crate reddens this test by name, which is the
-/// property a count cannot express.
-#[test]
-fn the_chia_stack_reachable_from_dig_crates_is_unified() {
-    /// The only root permitted to reach a chia crate off the 0.36 line.
-    const PERMITTED_OFF_LINE_ROOT: &str = "clvmr";
-
-    let rev = chia_reverse_dependencies();
-    assert!(
-        !rev.is_empty(),
-        "no chia packages found in the lock at all — the parser, not the tree, has drifted"
-    );
-
-    let off_line: Vec<&String> = rev
-        .keys()
-        .filter(|k| {
-            k.split(' ')
-                .nth(1)
-                .is_some_and(|v| !v.starts_with("0.36."))
-        })
-        .collect();
-
-    for pkg in off_line {
-        for dependant in &rev[pkg] {
-            let dependant_name = dependant.split(' ').next().unwrap_or(dependant);
-            let permitted = dependant_name == PERMITTED_OFF_LINE_ROOT
-                // A chia crate off the line may of course depend on its own line-mates; the root of
-                // every such chain is still checked, because the root itself appears here too.
-                || (dependant_name.starts_with("chia")
-                    && rev.contains_key(dependant.as_str()));
-            assert!(
-                permitted,
-                "`{dependant}` depends on `{pkg}`, which is not on the chia-0.36 line. Only \
-                 `{PERMITTED_OFF_LINE_ROOT}` may reach an off-line chia crate (its CLVM VM internals \
-                 pin chia-bls 0.28.2 / chia-sha2 0.34.0 and no DIG type crosses them). A DIG crate \
-                 here is the split that shipped in dig-gossip 0.29.0 and dig-nat 0.19.0"
-            );
-        }
+/// A chia crate off the line may depend on its own line-mates — `chia-bls` 0.28.2 needs
+/// `chia-sha2` 0.28.2 — so an off-line chia dependant is walked through rather than accused; the
+/// root of every such chain is itself a key in the map and is therefore still judged.
+fn chia_unification_violation(lock: &str) -> Result<(), String> {
+    let rev = chia_reverse_dependencies(lock);
+    if rev.is_empty() {
+        return Err("no chia packages found at all — the parser, not the tree, has drifted".into());
     }
 
-    // The chia crates the DIG stack actually names must be present AND singular, so the check above
-    // cannot pass vacuously on a tree that resolved no 0.36 line at all.
+    let off_line = |pkg: &str| {
+        pkg.split(' ')
+            .nth(1)
+            .is_some_and(|v| !v.starts_with("0.36."))
+    };
+
+    for (pkg, dependants) in rev.iter().filter(|(pkg, _)| off_line(pkg)) {
+        for dependant in dependants {
+            let name = dependant.split(' ').next().unwrap_or(dependant);
+            let walked_through = name.starts_with("chia") && rev.contains_key(dependant.as_str());
+            if name != PERMITTED_OFF_LINE_ROOT && !walked_through {
+                return Err(format!(
+                    "`{dependant}` depends on `{pkg}`, which is not on the chia-0.36 line"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// **Proves:** every chia crate a DIG crate can reach is on the 0.36 line — stated as a property of
+/// the resolved graph, not as a count, and not against an enumerated list of chia crate names.
+///
+/// **Catches:** the exact defect that shipped twice in this cascade. dig-gossip 0.29.0 and the
+/// published dig-nat 0.19.0 both went out internally SPLIT — part of their tree on chia 0.26, part
+/// on 0.36 — because the pre-merge check was a hand-written list of chia crates to look at, and
+/// `chia-bls` was not on it. `chia-bls` is the one that matters most here: `NodeCert`, the mTLS
+/// identity every dig-download consumer must mint to dial a provider, is generated from a
+/// `chia_bls::SecretKey` re-exported through `dig_tls::bls`. Two `chia-bls` lines in a consumer's
+/// tree is an `E0308` at that call — and dig-download names no chia type anywhere in `src/`, so no
+/// grep of THIS crate could ever have seen it coming.
+///
+/// **Why an allow-list of ROOTS and not a duplicate count:** `cargo tree -d` is not the gate here,
+/// and a count would be a false red. The 0.36 stack legitimately vendors `clvmr` 0.16.4, whose CLVM
+/// VM internals pin chia-bls 0.28.2 and chia-sha2 0.34.0. Those copies are permitted; a DIG crate
+/// reaching one is not, and that is the distinction a count cannot express.
+#[test]
+fn the_chia_stack_reachable_from_dig_crates_is_unified() {
+    if let Err(reason) = chia_unification_violation(LOCK) {
+        panic!(
+            "{reason}. Only `{PERMITTED_OFF_LINE_ROOT}` may reach an off-line chia crate; a DIG \
+             crate here is the split that shipped in dig-gossip 0.29.0 and dig-nat 0.19.0"
+        );
+    }
+
+    // The chia crates the DIG stack actually names must be present AND singular, so the rule above
+    // cannot pass vacuously over a tree that resolved no 0.36 line at all.
     for named in ["chia-protocol", "chia-consensus"] {
         let versions = locked_versions(named);
         assert_eq!(
@@ -297,4 +304,83 @@ fn the_chia_stack_reachable_from_dig_crates_is_unified() {
             versions[0]
         );
     }
+}
+
+/// A minimal but structurally faithful lock: a 0.36 chia crate, the `clvmr` it vendors, and the
+/// off-line `chia-bls` that `clvmr` alone pins. `$EXTRA` is spliced into `dig-tls`'s dependency list
+/// so a single actor can be varied while the rest of the tree stays truthful.
+fn synthetic_lock(dig_tls_extra_dep: &str) -> String {
+    format!(
+        r#"
+[[package]]
+name = "chia-protocol"
+version = "0.36.1"
+dependencies = [
+ "clvmr",
+]
+
+[[package]]
+name = "clvmr"
+version = "0.16.4"
+dependencies = [
+ "chia-bls 0.28.2",
+]
+
+[[package]]
+name = "chia-bls"
+version = "0.28.2"
+dependencies = [
+ "blst",
+]
+
+[[package]]
+name = "chia-bls"
+version = "0.36.1"
+dependencies = [
+ "blst",
+]
+
+[[package]]
+name = "dig-tls"
+version = "0.4.0"
+dependencies = [
+ "chia-bls 0.36.1",{dig_tls_extra_dep}
+]
+"#
+    )
+}
+
+/// **Proves:** [`chia_unification_violation`] is load-bearing — it accuses a DIG crate that reaches
+/// an off-line chia crate, and it does NOT accuse the `clvmr` copy sitting right beside it.
+///
+/// The control and the mutant differ in exactly ONE dependency edge. Without the control, an
+/// over-firing rule would look like a working one; without the mutant, a rule that accuses nobody
+/// would too. Mutating the real `Cargo.lock` cannot serve here: cargo rewrites the lock before it
+/// compiles, so the mutation is undone and the test passes for the wrong reason.
+#[test]
+fn the_unification_rule_accuses_a_dig_crate_and_spares_clvmr() {
+    chia_unification_violation(&synthetic_lock(""))
+        .expect("clvmr's own off-line chia-bls must be permitted — this is the truthful control");
+
+    let violation = chia_unification_violation(&synthetic_lock("\n \"chia-bls 0.28.2\","))
+        .expect_err("a dig-tls edge onto the off-line chia-bls must be refused");
+
+    assert!(
+        violation.contains("dig-tls 0.4.0") && violation.contains("chia-bls 0.28.2"),
+        "the refusal must name the offending crate AND the off-line chia crate it reached, so the \
+         failure is actionable without re-deriving the graph; got: {violation}"
+    );
+}
+
+/// **Proves:** the vacuity guard inside [`chia_unification_violation`] fires — a lock the parser
+/// cannot read is reported as parser drift rather than silently passing as a clean tree.
+///
+/// This guard is not hypothetical: the first version of the dependency-line parser required a
+/// closing quote before the trailing comma, matched nothing, and returned an empty map. Every
+/// mutation ran green against it.
+#[test]
+fn an_unparseable_lock_is_reported_rather_than_passing_clean() {
+    let reason = chia_unification_violation("[[package]]\nname = \"serde\"\nversion = \"1.0.0\"\n")
+        .expect_err("a tree with no chia packages must be reported, not accepted");
+    assert!(reason.contains("parser"), "got: {reason}");
 }
