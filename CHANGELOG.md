@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.20.1] - 2026-08-23
+
+### Bug Fixes
+- **progress:** Name checkpoints by digest so a real module key fits NAME_MAX (#39)
+
 ## [0.20.0] - 2026-08-23
 
 ### Build
