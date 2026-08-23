@@ -1,7 +1,14 @@
-# On merge to the default branch: regenerate CHANGELOG.md from Conventional Commits (git-cliff),
-# commit it to the default branch, THEN tag that commit vX.Y.Z and push the tag. The changelog is
-# therefore INCLUDED in the tag. The pushed tag triggers this repo's deploy/release workflow
-# (wired `on: push: tags: ['v*']`).
+# On a push to a RELEASE LINE — the default branch, or any `release/X.Y` maintenance branch —
+# regenerate CHANGELOG.md from Conventional Commits (git-cliff), commit it to that same branch, THEN
+# tag that commit vX.Y.Z and push the tag. The changelog is therefore INCLUDED in the tag. The pushed
+# tag triggers this repo's deploy/release workflow (wired `on: push: tags: ['v*']`).
+#
+# `release/X.Y` branches exist because a downstream consumer can be pinned to an older minor while a
+# breaking cascade lands on `main` (dig-node pins `dig-download = "0.19"`; see
+# .github/RELEASE_LINES.md). Before this workflow understood them, a backport had no path to a tag at
+# all, which is how 0.19.1 reached crates.io untagged and untraceable to a commit (#41). Every branch
+# this fires on pushes its OWN ref back — never a hard-coded `main`, which would push a 0.19 changelog
+# onto the 0.20 line.
 #
 # The tag is pushed with RELEASE_TOKEN (a PAT) — a tag pushed by the default GITHUB_TOKEN does NOT
 # trigger downstream workflows (GitHub anti-recursion), which would break deploy-on-tag. The same
@@ -15,6 +22,7 @@ on:
   push:
     branches:
       - main
+      - 'release/**'
 
 concurrency:
   group: release-${{ github.ref }}
@@ -77,6 +85,8 @@ jobs:
           # `chore(release):` prefix so this workflow skips its own push (loop guard above).
           git commit -m "chore(release): ${{ steps.ver.outputs.tag }}" || echo "changelog unchanged"
           git tag -a "${{ steps.ver.outputs.tag }}" -m "Release ${{ steps.ver.outputs.tag }}"
-          git push origin "HEAD:main"
+          # Push back to the branch that triggered us. A hard-coded `main` here would land a
+          # maintenance line's changelog on the development line.
+          git push origin "HEAD:${{ github.ref_name }}"
           git push origin "${{ steps.ver.outputs.tag }}"
           echo "Pushed changelog commit + ${{ steps.ver.outputs.tag }} — deploy-on-tag will fire."

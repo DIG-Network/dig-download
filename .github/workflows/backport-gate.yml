@@ -1,0 +1,72 @@
+# A PR to `main` that touches library source must state, on the PR itself, whether the maintained
+# 0.19 line needs the same change. See .github/RELEASE_LINES.md for why that line exists.
+#
+# WHY A GATE AND NOT A CHECKLIST: the failure being fixed is someone not remembering the other line
+# (#41 — two fixes reached 0.19 by hand, and 0.19.1 reached crates.io with no tag and no PR). A
+# checklist item is only read by someone who already remembers, so it cannot catch that failure. This
+# demands a recorded decision instead, without deciding it: `no-backport` is always a legitimate
+# answer and the label is the record of having made it.
+#
+# IT RETIRES ITSELF. The gate is inert unless `release/0.19` actually exists on the remote, so when the
+# dig-node pin moves to 0.20 and the branch is deleted, the requirement disappears with it rather than
+# outliving its reason and becoming ritual.
+name: Backport gate
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, labeled, unlabeled, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  decide:
+    name: 0.19 backport decision recorded
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Require a decision when source changed and the line is live
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        run: |
+          set -euo pipefail
+
+          if ! git ls-remote --exit-code --heads origin 'refs/heads/release/0.19' >/dev/null 2>&1; then
+            echo "release/0.19 does not exist — the 0.19 line is retired. Nothing to decide."
+            exit 0
+          fi
+
+          if ! git diff --name-only "$BASE_SHA" "$HEAD_SHA" | grep -q '^src/'; then
+            echo "No change under src/ — a backport decision is not required."
+            exit 0
+          fi
+
+          has() { printf '%s' "$LABELS" | python3 -c 'import sys,json; sys.exit(0 if sys.argv[1] in json.load(sys.stdin) else 1)' "$1"; }
+
+          back=false; none=false
+          has 'backport:0.19' && back=true || true
+          has 'no-backport'   && none=true || true
+
+          if [ "$back" = true ] && [ "$none" = true ]; then
+            echo "::error::This PR carries BOTH 'backport:0.19' and 'no-backport'. Pick one."
+            exit 1
+          fi
+          if [ "$back" = false ] && [ "$none" = false ]; then
+            echo "::error::This PR changes src/ while the 0.19 maintenance line is live. Label it 'backport:0.19' (and open the companion PR against release/0.19) or 'no-backport' with a one-line reason. See .github/RELEASE_LINES.md."
+            exit 1
+          fi
+
+          if [ "$back" = true ]; then
+            echo "Labelled backport:0.19 — the companion PR against release/0.19 is part of this unit of work."
+          else
+            echo "Labelled no-backport — decision recorded."
+          fi
