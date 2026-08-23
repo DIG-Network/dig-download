@@ -813,9 +813,18 @@ reshare: the bytes verify per chunk, the pull assembles, and only the final gate
   the first round. Each round asks each un-demoted holder at most once, so the worst-case wait is
   `MAX_DESCRIPTOR_ATTEMPTS × holders × the transport's per-ask timeout` and an unanswerable holder set
   cannot hold a pull open indefinitely.
-- Demotion is bounded by `MAX_DESCRIPTOR_ATTEMPTS` (3) and by the supply of un-demoted holders; when it is
-  exhausted the pull fails with the **descriptor** failure (a gate `Verify`), never a `NotFound` — blaming
-  discovery for a descriptor lie is the ambiguity §17.4's reason-surfacing rule exists to prevent.
+- Demotion is bounded by `MAX_DESCRIPTOR_ATTEMPTS` (3) and by the supply of un-demoted holders. There are
+  TWO ways to exhaust that budget, and each MUST report the failure it actually had — the error names what
+  went wrong, and a pull MUST NOT manufacture an attribution it cannot support:
+  - **A descriptor was OBTAINED and its pull failed.** The failure is the **descriptor's** (a gate
+    `Verify`, or an unsatisfiable-descriptor error), and it MUST be reported as such — never as a
+    `NotFound`. Blaming discovery for a descriptor lie is the ambiguity §17.4's reason-surfacing rule
+    exists to prevent, and a holder that supplied a rejected plan IS attributable.
+  - **No descriptor ever ARRIVED.** Every ask failed at the transport, so nothing was proven false and NO
+    source is attributable. The failure is the one `get_module_info` produced — a `NotFound` carrying each
+    holder's own reason (§17.4) — and it MUST NOT be recast as a `Verify`. Raising a gate failure here
+    would MANUFACTURE blame against holders that merely did not answer, which is the same ambiguity in the
+    opposite direction.
 - **Chunk exhaustion is attributed to the DESCRIPTOR (MUST).** Exhaustion is ambiguous: unavailable bytes
   and an unsatisfiable descriptor are indistinguishable from inside one attempt. So exhaustion always
   demotes the descriptor's source and re-handshakes, bounded by `MAX_DESCRIPTOR_ATTEMPTS` and the supply of

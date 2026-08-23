@@ -312,7 +312,9 @@ impl ModuleDownloader {
     /// trust model.
     ///
     /// # Errors
-    /// - [`DownloadError::NotFound`] — no holders located.
+    /// - [`DownloadError::NotFound`] — no holders located, or no located holder ANSWERED
+    ///   `getModuleInfo` within the attempt budget. Nothing was proven false in either case, so no
+    ///   source is attributable and the failure is not recast as a gate `Verify` (SPEC §17.5a).
     /// - [`DownloadError::NoProviders`] — holders exhausted with chunks still missing.
     /// - [`DownloadError::Verify`] — the whole-blob `module_hash` or the chain-anchor gate failed
     ///   (fail-closed; the sink is NOT finalized).
@@ -3134,6 +3136,13 @@ mod tests {
         assert!(
             err.to_string().contains("getModuleInfo"),
             "the error names the step that failed: {err}"
+        );
+        // Nobody answered, so nothing was proven false and no source is attributable: the honest
+        // report is a `NotFound` carrying each holder's own reason, NOT a gate `Verify` that would
+        // manufacture blame against holders that merely did not answer (SPEC 17.5a).
+        assert!(
+            matches!(err, DownloadError::NotFound { .. }),
+            "an unanswered descriptor ask attributes nothing to any holder: {err:?}"
         );
         assert_eq!(
             transport.module_info_calls().await.len(),
