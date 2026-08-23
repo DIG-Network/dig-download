@@ -490,6 +490,13 @@ A provider record's candidate `host` is an IP **literal** (IPv4, IPv6, or v4-map
 - **Resume** — per-range progress is checkpointed to a `StateStore`. A paused or crashed download
   resumes into the same staging file and re-fetches ONLY the still-missing ranges; a verified range is
   never re-fetched, but it IS re-checked from staging before the §8 backstop.
+- **Checkpoint file naming** — a file-backed `StateStore` MUST name each checkpoint
+  `SHA-256(key)` in lower hex, plus the sidecar suffix, and MUST NOT embed the key's own bytes in the
+  filename. The digest is path-safe by construction (no key text can shape a path), collision-resistant
+  (distinct keys never alias onto one checkpoint), and — unlike an encoding of the key — FIXED-WIDTH, so
+  the produced name is bounded at 64 + suffix characters however long the key is. A module key is
+  `module:<64hex>:<64hex>` = 136 bytes, which any doubling encoding pushes past the 255-character
+  `NAME_MAX` of common filesystems. Truncation MUST NOT be used to obtain the bound.
 - **GC** — a stale `.download.tmp` is reaped by the GC sweep; a live or paused-resumable staging file
   (registered in `ActiveDownloads`) MUST NOT be reaped.
 
