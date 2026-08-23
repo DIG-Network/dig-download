@@ -4,6 +4,14 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.19.1] - 2026-08-23
+
+### Bug Fixes
+- **progress:** Name checkpoints by digest so a real module key fits NAME_MAX
+
+### CI
+- **release:** Adopt the release-line plumbing on the 0.19 maintenance line
+
 ## [0.19.0] - 2026-08-21
 
 ### Chores
