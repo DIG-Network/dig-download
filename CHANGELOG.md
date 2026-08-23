@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.20.0] - 2026-08-23
+
+### Build
+- **deps:** Uplift the transport stack onto the chia-0.36 line (#36)
+
 ## [0.19.0] - 2026-08-21
 
 ### Chores
