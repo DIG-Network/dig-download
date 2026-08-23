@@ -353,9 +353,35 @@ impl ModuleDownloader {
                 );
                 continue;
             }
-            let (source, info) = self
+            // A descriptor that never ARRIVES spends an attempt too (#37). The budget used to be
+            // charged only for descriptors successfully obtained whose pull then failed, so a holder
+            // set that was merely slow or transiently unreachable ended the whole pull on the first
+            // ask — the one failure mode a retry budget exists for. `fetch_module_info` already asks
+            // every un-demoted holder within one round; what was missing is the ACROSS-round re-ask.
+            //
+            // Worst case is unchanged in shape and bounded by the same constant: at most
+            // `MAX_DESCRIPTOR_ATTEMPTS` rounds, each asking each un-demoted holder once, so the wait
+            // is `MAX_DESCRIPTOR_ATTEMPTS × holders × the transport's own per-ask timeout`. No holder
+            // is re-asked inside a round and no round is added beyond the budget, so an unanswerable
+            // holder set cannot hold the pull open indefinitely.
+            let (source, info) = match self
                 .fetch_module_info(&providers, &exclusions.excluded(), store_id, root)
-                .await?;
+                .await
+            {
+                Ok(obtained) => obtained,
+                Err(e) => {
+                    attempts += 1;
+                    if attempts >= MAX_DESCRIPTOR_ATTEMPTS {
+                        return Err(e);
+                    }
+                    tracing::warn!(
+                        error = %e,
+                        attempts,
+                        "module pull: no holder answered getModuleInfo; re-asking the holder set"
+                    );
+                    continue;
+                }
+            };
             attempts += 1;
             let failure = match self
                 .pull_with_descriptor(&info, store_id, root, sink, &mut providers)
@@ -402,13 +428,29 @@ impl ModuleDownloader {
                     PullFailure::Terminal(e) => e,
                 });
             }
-            // The whole plan came from the demoted holder, so its partial progress is not resumable
-            // against the next descriptor — drop the checkpoint AND the bytes it staged. A demoted
-            // plan may have been LONGER than the next one, and a staging area is never shortened by
-            // writing, so leaving it would let the demoted holder's tail survive into a later
-            // promotion.
-            self.state_store.clear(&key).await?;
-            sink.truncate(0).await?;
+            // The checkpoint and the bytes it describes are KEPT across the demotion (dig-node#328).
+            // Demoting a source says nothing about the bytes already verified under the old
+            // descriptor, and three guards already make carrying them into the next attempt safe:
+            //
+            //   1. a resumed chunk is re-read and re-hashed against the CURRENT descriptor's
+            //      `chunk_hashes[i]` (`read_back_verified_chunk`), so a byte staged under a lying
+            //      descriptor can never count toward an honest one — it simply re-fetches;
+            //   2. a descriptor of a DIFFERENT shape does not resume at all: `load_or_fresh_state`
+            //      returns `resumes_staging: false` on any `chunk_lens` mismatch and
+            //      `pull_with_descriptor` then truncates the staging area itself;
+            //   3. a longer tail cannot survive into the artifact: `promote_verified` shortens the
+            //      staging area to the verified length and REFUSES to promote if a byte is still
+            //      readable past it.
+            //
+            // Wiping here was therefore redundant, and it cost a full re-download on EVERY demotion —
+            // including a pure transport abort, where the descriptor was never shown to be false. On
+            // real hardware that turned a 135 MB capsule with ~20 MB already staged into 182 MB of
+            // inbound traffic, 0.12% MORE than starting from scratch.
+            //
+            // This holds for a PROVEN-false descriptor too, and deliberately: guard (1) re-attributes
+            // every resumed chunk against the next descriptor, so a liar's bytes are re-fetched rather
+            // than trusted, and a local read-back is orders of magnitude cheaper than the refetch a
+            // fail-closed wipe would force in the rare proven-liar case.
         }
     }
 
@@ -2960,5 +3002,143 @@ mod tests {
             "local corruption is never evidence against a holder that served correct bytes"
         );
         assert!(!sink.0.is_finalized().await, "and nothing is promoted");
+    }
+
+    /// A source demoted by a TRANSPORT failure keeps the bytes it already staged: the next holder's
+    /// identical descriptor resumes from the checkpoint and fetches only the chunks that are missing.
+    ///
+    /// The fixture is built so that the ONLY way to pass is to preserve staging. Every holder serves
+    /// the same honest descriptor and the same honest bytes; the transport is merely SEVERED beyond
+    /// chunk 5 for the duration of the first descriptor attempt, so nothing here is a lie and no gate
+    /// can be reached by a fail-closed path. The assertion counts SERVED RANGES rather than a final
+    /// length: a re-download produces the identical artifact, so only the ranges can tell the two
+    /// apart. With the wipe restored, offsets 0..40 are served twice and the duplicate assertion
+    /// fires (dig-node#328).
+    #[tokio::test]
+    async fn a_transport_demotion_resumes_from_its_partial_instead_of_refetching_the_module() {
+        let store_id = hex_id(0x5A);
+        let root = hex_id(0x5B);
+        // 80 bytes over 8-byte chunks = 10 chunks; the sever bites at chunk 5.
+        let module: Vec<u8> = (0..80u8).collect();
+        let severed_at = 40u64;
+
+        let transport = Arc::new(
+            MockModuleTransport::serving(&store_id, &root, module.clone(), 8)
+                .severing_beyond(severed_at),
+        );
+        let downloader = ModuleDownloader::new(
+            locator_with(2, &store_id, &root),
+            transport.clone(),
+            Arc::new(crate::testkit::OnlyThisModuleAnchor::new(module.clone())),
+            Arc::new(InMemoryStateStore::new()),
+            ModuleDownloadConfig::default(),
+        );
+        let sink = InMemorySink::new();
+
+        let len = downloader.download(&store_id, &root, &sink).await.unwrap();
+        assert_eq!(len, module.len() as u64);
+        assert_eq!(
+            sink.contents().await,
+            module,
+            "and the artifact is the module"
+        );
+
+        let mut served: Vec<u64> = transport
+            .fetches()
+            .await
+            .into_iter()
+            .map(|(_, o)| o)
+            .collect();
+        served.sort_unstable();
+        let deduped = {
+            let mut d = served.clone();
+            d.dedup();
+            d
+        };
+        assert_eq!(
+            served, deduped,
+            "a chunk verified before the demotion was re-fetched after it: served offsets {served:?}"
+        );
+        assert_eq!(
+            served,
+            (0..10).map(|i| i * 8).collect::<Vec<u64>>(),
+            "every chunk is served exactly once across both descriptor attempts"
+        );
+        assert!(
+            transport.module_info_calls().await.len() >= 2,
+            "the fixture must actually drive the descriptor-demotion loop"
+        );
+    }
+
+    /// A descriptor that never ARRIVES spends an attempt and the holder set is re-asked (#37).
+    ///
+    /// Both holders time out on the first round of `getModuleInfo`, then answer. Before the fix the
+    /// `?` on `fetch_module_info` returned before `attempts += 1`, so the pull ended on the first
+    /// round with holders that would have answered a second ask standing right there.
+    #[tokio::test]
+    async fn a_holder_set_that_times_out_on_the_first_descriptor_ask_is_asked_again() {
+        let store_id = hex_id(0x5C);
+        let root = hex_id(0x5D);
+        let module = b"a whole module".to_vec();
+
+        let transport = Arc::new(
+            MockModuleTransport::serving(&store_id, &root, module.clone(), 8)
+                .failing_the_first_info_asks(2), // exactly one full round of asks, both holders
+        );
+        let downloader = ModuleDownloader::new(
+            locator_with(2, &store_id, &root),
+            transport.clone(),
+            Arc::new(crate::testkit::OnlyThisModuleAnchor::new(module.clone())),
+            Arc::new(InMemoryStateStore::new()),
+            ModuleDownloadConfig::default(),
+        );
+        let sink = InMemorySink::new();
+
+        let len = downloader
+            .download(&store_id, &root, &sink)
+            .await
+            .expect("a transiently unreachable holder set is re-asked, not surrendered to");
+        assert_eq!(len, module.len() as u64);
+        assert_eq!(
+            transport.module_info_calls().await.len(),
+            3,
+            "one failed round over both holders, then one answered ask"
+        );
+    }
+
+    /// The re-ask is BOUNDED: a holder set that never answers cannot hold the pull open. The budget
+    /// is the same `MAX_DESCRIPTOR_ATTEMPTS` a failed pull spends, and the error names the descriptor
+    /// step rather than blaming discovery.
+    #[tokio::test]
+    async fn a_holder_set_that_never_answers_gives_up_within_the_attempt_budget() {
+        let store_id = hex_id(0x5E);
+        let root = hex_id(0x5F);
+        let module = b"a whole module".to_vec();
+
+        let transport = Arc::new(
+            MockModuleTransport::serving(&store_id, &root, module.clone(), 8)
+                .failing_the_first_info_asks(usize::MAX),
+        );
+        let downloader = ModuleDownloader::new(
+            locator_with(2, &store_id, &root),
+            transport.clone(),
+            Arc::new(crate::testkit::OnlyThisModuleAnchor::new(module.clone())),
+            Arc::new(InMemoryStateStore::new()),
+            ModuleDownloadConfig::default(),
+        );
+
+        let err = downloader
+            .download(&store_id, &root, &InMemorySink::new())
+            .await
+            .expect_err("an unanswerable holder set must end the pull, not retry forever");
+        assert!(
+            err.to_string().contains("getModuleInfo"),
+            "the error names the step that failed: {err}"
+        );
+        assert_eq!(
+            transport.module_info_calls().await.len(),
+            2 * MAX_DESCRIPTOR_ATTEMPTS,
+            "at most MAX_DESCRIPTOR_ATTEMPTS rounds, each asking each holder once"
+        );
     }
 }

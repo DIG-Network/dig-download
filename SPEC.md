@@ -800,8 +800,19 @@ The descriptor defines the WHOLE plan, and holder order is deterministic, so a h
 reshare: the bytes verify per chunk, the pull assembles, and only the final gates (§17.6) reject it.
 
 - A pull whose assembled blob fails EITHER final gate, or whose descriptor is unusable, MUST **demote that
-  descriptor's source** and re-handshake `get_module_info` with a holder that has not been demoted,
-  discarding the checkpoint the rejected plan produced.
+  descriptor's source** and re-handshake `get_module_info` with a holder that has not been demoted.
+- **The checkpoint and the bytes it describes MUST be KEPT across a demotion.** Demoting a source is not
+  evidence against the bytes already verified, and §17.5's re-attribution is what makes carrying them safe:
+  every resumed chunk is re-hashed against the CURRENT descriptor's `chunk_hashes[i]`, so a byte staged
+  under a rejected descriptor can never count toward the next one — it is simply re-fetched. A descriptor
+  of a different SHAPE does not resume at all (§17.5), and §17.5b's promotion proof bounds the artifact
+  from both sides regardless. Discarding staging on demotion re-downloads a whole capsule for a single
+  transport blip, which costs MORE than starting over once the discarded partial is counted.
+- **A descriptor that never ARRIVES MUST spend an attempt (MUST).** A holder set that is merely slow or
+  transiently unreachable MUST be re-asked within the same budget as a failed pull, not surrendered to on
+  the first round. Each round asks each un-demoted holder at most once, so the worst-case wait is
+  `MAX_DESCRIPTOR_ATTEMPTS × holders × the transport's per-ask timeout` and an unanswerable holder set
+  cannot hold a pull open indefinitely.
 - Demotion is bounded by `MAX_DESCRIPTOR_ATTEMPTS` (3) and by the supply of un-demoted holders; when it is
   exhausted the pull fails with the **descriptor** failure (a gate `Verify`), never a `NotFound` — blaming
   discovery for a descriptor lie is the ambiguity §17.4's reason-surfacing rule exists to prevent.
@@ -867,11 +878,11 @@ shortened by writing**. So:
   MUST be reduced to the verified length (`Sink::truncate`), and a staged length ≠ the verified length is a
   **fail-closed `Verify(Metadata)` error, never a promotion**. `Sink::truncate` only ever shrinks; it never
   zero-extends.
-- **An abandoned plan's bytes MUST be discarded with its checkpoint.** On descriptor demotion (§17.5a) the
-  sink is RESET alongside the checkpoint, and a pull whose checkpoint does not resume the current plan
-  (absent, or a different shape) resets the sink before staging. Otherwise a longer earlier attempt —
-  a demoted holder's fabrication, or a leftover file from another shape — survives as a tail on a later,
-  shorter promotion.
+- **A plan's bytes MUST NOT ride into a plan of a different SHAPE.** A pull whose checkpoint does not
+  resume the current plan (absent, or a different `chunk_lens`) resets the sink before staging. Otherwise
+  a longer earlier attempt — a demoted holder's fabrication, or a leftover file from another shape —
+  survives as a tail on a later, shorter promotion. A demotion alone does NOT reset the sink (§17.5a): a
+  same-shape retry resumes, and every resumed chunk is re-attributed against the new descriptor.
 - Violating this is a cache-poisoning primitive, not a cosmetic length bug: the promoted `.dig` would hash
   to something other than `module_hash` while the pull reports success, so the reshare leg would announce
   the node as a holder of content every downstream peer rejects.
