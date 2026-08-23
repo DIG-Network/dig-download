@@ -128,7 +128,7 @@ pub trait ModuleTransport: Send + Sync {
 ///
 /// Every byte this reader returns is already **chunk-hash-verified against the descriptor**, and the
 /// readable window is exactly the `total_size` the whole-module-hash gate has already accepted — the
-/// gate never sees an unverified or out-of-window byte ([`StagedModuleReader`] is this crate's
+/// gate never sees an unverified or out-of-window byte (`StagedModuleReader` is this crate's
 /// implementation and enforces both).
 #[async_trait]
 pub trait ModuleReader: Send + Sync {

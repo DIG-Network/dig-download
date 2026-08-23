@@ -70,7 +70,7 @@ pub const DEFAULT_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
 /// literal. The attribute makes the documented intent MECHANICAL, so every future field really is a minor
 /// change instead of relying on a convention. Applied in the same breaking window as the attribute on
 /// [`RangeMeta`](crate::RangeMeta) and
-/// [`ResourceCommitment`](crate::verify::ResourceCommitment), rather than costing a second one.
+/// [`crate::verify::ResourceCommitment`], rather than costing a second one.
 /// Construct with `DownloadConfig { window: …, ..Default::default() }`.
 #[derive(Clone)]
 #[non_exhaustive]

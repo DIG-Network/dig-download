@@ -20,7 +20,7 @@
 # by dig-node (see the implementers' note in the crate docs).
 [package]
 name = "dig-download"
-version = "0.19.0"
+version = "0.20.0"
 edition = "2021"
 rust-version = "1.75.0"
 license = "Apache-2.0 OR MIT"
@@ -37,23 +37,22 @@ categories = ["network-programming"]
 # (L00), zero DIG deps. NC-7: prefer the crates.io release over bare-git.
 #
 # The 0.8 → 0.10 move is additive for the three literals this crate re-exports (0.9 added a profile
-# sealing label; 0.10 is a dep-family migration inside dig-constants itself). It has ONE cost worth
-# stating rather than discovering: dig-constants 0.10 moves its own `chia-consensus`/`chia-protocol`
-# from ^0.26 to ^0.36.1, while dig-nat 0.18 still requires `dig-constants >=0.4, <0.6`. The resolved
-# tree therefore carries TWO dig-constants (0.10.0 direct, 0.5.1 under dig-nat) and hence two chia
-# stacks. That is BUILD WEIGHT, not a type seam — dig-download names no chia type and consumes only
-# the three endpoint literals, so nothing crosses between the copies. Relaxing the `<0.6` pin is
-# dig-nat's to do; `tests/dependency_tree.rs` fails if the count ever moves off two in either
-# direction, so neither the fix nor a further regression can land silently.
+# sealing label; 0.10 is a dep-family migration inside dig-constants itself, from `chia-consensus`/
+# `chia-protocol` ^0.26 to ^0.36.1).
+#
+# That migration used to cost a duplicate: dig-nat 0.18 required `dig-constants >=0.4, <0.6`, so the
+# tree carried TWO dig-constants and hence two chia stacks. dig-nat 0.20 requires `^0.10`, both edges
+# now agree, and the tree carries ONE copy on ONE chia line. `tests/dependency_tree.rs` fails if a
+# second copy ever returns, because a second dig-constants is also a second chia stack.
 dig-constants = "0.10"
 
 # LOCATE — "which peers hold this content?" dig-download derives a `ContentId` (store / root /
 # capsule / resource) and asks dig-dht `find_providers` for the holders' `ProviderRecord`s.
 #
-# Sourcing: crates.io. dig-dht 0.11 keeps the SAME `find_providers` public API this crate consumes
-# (`DhtService::find_providers` — the true distributed iterative lookup); its bump from 0.8 moved onto
-# dig-nat 0.18 (below), so dig-dht + dig-peer + dig-download's direct dig-nat dep all agree on dig-nat
-# 0.18 and the tree carries exactly ONE dig-nat instance (asserted by `tests/dependency_tree.rs`, not
+# Sourcing: crates.io. dig-dht 0.12 keeps the SAME `find_providers` public API this crate consumes
+# (`DhtService::find_providers` — the true distributed iterative lookup); its bump from 0.11 moved onto
+# dig-nat 0.20 (below), so dig-dht + dig-peer + dig-download's direct dig-nat dep all agree on dig-nat
+# 0.20 and the tree carries exactly ONE dig-nat instance (asserted by `tests/dependency_tree.rs`, not
 # assumed).
 #
 # That agreement is why all THREE deps move in one commit. A 0.x MINOR is semver-INCOMPATIBLE, so
@@ -79,11 +78,17 @@ dig-rpc-protocol = "0.10"
 # `dig.fetchRange` over dig-nat mux streams, plus the wire shapes (`RangeRequest`, `RangeFrame`,
 # `AvailabilityItem`/`Answer`/`Response`) and `PeerId`/`PeerTarget`/`NodeCert`/`connect`.
 #
-# Sourcing: crates.io 0.18. The dial API (`connect`/`connect_with_runtime`/`NatRuntime`) is unchanged;
-# dig-nat re-exports dig-tls 0.3 for ALL cert/mTLS/peer_id/BLS-binding plumbing.
+# Sourcing: crates.io 0.20. The dial API (`connect`/`connect_with_runtime`/`NatRuntime`) is unchanged;
+# dig-nat re-exports dig-tls 0.4 for ALL cert/mTLS/peer_id/BLS-binding plumbing.
 #
-# 0.18 continues the correctness + capability arc started in 0.12–0.14 (#1640): better framing bounds,
-# wire resilience, paged reassembly for large ranges, and IPv6-first peer transport. The wire shapes
+# 0.20 is where the chia-0.36 uplift reaches this crate, and it does so WITHOUT a chia type appearing
+# anywhere in `src/`. dig-tls 0.4 re-exports `chia_bls::SecretKey` on the 0.36 line, and that key is
+# the sole way to mint the `NodeCert` a caller hands to `NatRangeTransport`. So a consumer still on
+# chia-bls 0.26 gets an `E0308` at the mint, not here — which is exactly why the invariant is
+# asserted over the resolved lock rather than by grepping this crate for `chia`.
+#
+# 0.20 also continues the correctness + capability arc started in 0.12–0.14 (#1640): better framing
+# bounds, wire resilience, paged reassembly for large ranges, and IPv6-first peer transport. The wire shapes
 # (`RangeRequest`, `RangeFrame`, `AvailabilityItem`/`Answer`/`Response`) appear in this crate's public
 # `RangeTransport` trait, so their identity is part of dig-download's public API and every dig-nat bump
 # is breaking for consumers.
@@ -94,8 +99,8 @@ dig-nat = "0.20"
 
 # REACH + FETCH via the shared client — dig-download talks to peers through `DigPeer`, the one DIG
 # Network peer client (#1283), rather than driving dig-nat directly: `DigPeer::connect_with_runtime`
-# (peer_id-PINNED mTLS over the full NAT ladder) + `get_availability` / `fetch_range`. dig-peer 0.11
-# re-exports the SAME dig-nat 0.18 / dig-tls 0.3 shapes this crate already uses (`PeerTarget`,
+# (peer_id-PINNED mTLS over the full NAT ladder) + `get_availability` / `fetch_range`. dig-peer 0.12
+# re-exports the SAME dig-nat 0.20 / dig-tls 0.4 shapes this crate already uses (`PeerTarget`,
 # `RangeRequest`, `AvailabilityItem`/`AvailabilityResponse`, `NodeCert`, `PeerId`), so the tree still
 # carries exactly ONE dig-nat + dig-tls instance. NC-7: prefer the crates.io release over bare-git.
 #
@@ -103,7 +108,7 @@ dig-nat = "0.20"
 # not merely to stay current (#1576). An earlier version skew held TWO `ModuleInfo` types either side
 # of a trust boundary, on the very field (`chunk_lens`/`chunk_hashes`) that drives the whole pull plan —
 # the #836 `serde_bytes`-vs-base64 class of defect that cost six diagnosis rounds. Pinning dig-peer to
-# the SAME dig-rpc-protocol version as this crate prevents regression. dig-peer 0.11 also exports the
+# the SAME dig-rpc-protocol version as this crate prevents regression. dig-peer 0.12 also exports the
 # `get_module_info` / `fetch_module_range` client methods dig-node's `ModuleTransport` adapter uses.
 dig-peer = "0.12"
 
@@ -158,8 +163,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"
 # certificate with no public constructor besides `generate_signed`/`load_or_generate`/`from_pem`,
 # which need a BLS identity `SecretKey`. dig-tls owns that type; not needed as a PRODUCTION
 # dependency (dig-download's own code only ever holds/passes an `Arc<dig_nat::NodeCert>` it is
-# handed, never mints one). Pinned to 0.3 to match the dig-tls that dig-nat 0.15 re-exports — two
-# dig-tls majors in the test build would otherwise produce an E0308 type mismatch on `NodeCert`.
+# handed, never mints one). Pinned to 0.4 to match the dig-tls that dig-nat 0.20 re-exports — two
+# dig-tls majors in the test build would otherwise produce an E0308 type mismatch on `NodeCert`, and
+# on 0.4 that mismatch is specifically a chia-bls one, since `SecretKey` comes straight through.
 dig-tls = "0.4"
 
 # NO `[profile.release] overflow-checks` here, DELIBERATELY (#1608).

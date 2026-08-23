@@ -66,7 +66,9 @@ pub trait Sink: Send + Sync {
     /// // …and it MUST also make its staged length OBSERVABLE, or it can never be promoted — reading
     /// // THE ARTIFACT `finalize` promotes, never a cache or shadow buffer of it:
     /// fn supports_read_back(&self) -> bool { true }
-    /// async fn read_at(&self, offset: u64, len: u64) -> Result<Vec<u8>, DownloadError> { … }
+    /// async fn read_at(&self, offset: u64, len: u64) -> Result<Vec<u8>, DownloadError> {
+    ///     /* … */
+    /// }
     /// ```
     ///
     /// **`truncate` alone is not enough.** Overriding it while leaving `read_at` on its default used to
@@ -97,7 +99,7 @@ pub trait Sink: Send + Sync {
     /// reads already-verified chunks back on **resume** rather than re-fetching them, and a resumed
     /// resource download reads its prior process's ranges back to feed the whole-resource backstop
     /// (#1605). Both degrade gracefully by RE-FETCHING what they cannot read back — never a silent
-    /// partial. [`promote_verified`] additionally uses it to PROVE the staged length equals the verified
+    /// partial. `promote_verified` additionally uses it to PROVE the staged length equals the verified
     /// one, and that use does not degrade: it fails closed.
     ///
     /// An `Err` means "these bytes are not readable" (absent, short, or unsupported); it never means
@@ -105,7 +107,7 @@ pub trait Sink: Send + Sync {
     ///
     /// **`read_at` MUST read the artifact [`finalize`](Self::finalize) will promote** — not a write-back
     /// cache, a shadow buffer, or anything else that merely mirrors it. This is the whole remaining trust
-    /// assumption of [`promote_verified`]: the length proof compares what `read_at` reports against the
+    /// assumption of `promote_verified`: the length proof compares what `read_at` reports against the
     /// verified length, so a sink answering from a shadow can satisfy the proof while the artifact
     /// actually promoted keeps a longer tail. Nothing in this crate can enforce that — it is the
     /// implementer's obligation.
