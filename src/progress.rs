@@ -327,9 +327,21 @@ impl StateStore for InMemoryStateStore {
     }
 }
 
+/// The fixed-width, path-safe file stem a download key maps to: `SHA-256(key)` in lower hex.
+///
+/// Always exactly [`CHECKPOINT_STEM_LEN`] characters, for every key. See [`FileStateStore::file_for`]
+/// for why this is a digest and not the key's own bytes.
+fn checkpoint_file_stem(key: &str) -> String {
+    use sha2::Digest;
+    crate::module::hex_of(sha2::Sha256::digest(key.as_bytes()))
+}
+
+/// Length in characters of every [`checkpoint_file_stem`] — a SHA-256 digest in lower hex.
+const CHECKPOINT_STEM_LEN: usize = 64;
+
 /// A file-backed [`StateStore`]: one JSON checkpoint file per download key, under a directory. A
-/// crashed download resumes by re-reading its checkpoint. The filename is a hex encoding of the key so
-/// it is filesystem-safe.
+/// crashed download resumes by re-reading its checkpoint. The filename is a fixed-width SHA-256
+/// DIGEST of the key, so it is both filesystem-safe and bounded in length whatever the key is.
 #[derive(Debug, Clone)]
 pub struct FileStateStore {
     dir: std::path::PathBuf,
@@ -352,14 +364,26 @@ impl FileStateStore {
         self.file_for(key, ".holders.json")
     }
 
-    /// `<hex(key)><suffix>` under this store's directory — the key is hex-encoded so no key text can
-    /// shape a path.
+    /// `<sha256_hex(key)><suffix>` under this store's directory.
+    ///
+    /// The key is DIGESTED rather than hex-encoded (#38). Hex encoding gave path-safety — no key text
+    /// can shape a path — but its output grows with the key, and the real keys are long: a module
+    /// checkpoint key is `module:<64hex>:<64hex>` = 136 bytes, which hex-encodes to 272 characters and
+    /// with `.json` reaches 277 — past Linux's `NAME_MAX` of 255. Every capsule checkpoint write on
+    /// Linux therefore failed with `File name too long (os error 36)`, deterministically.
+    ///
+    /// A digest keeps BOTH properties the hex encoding was chosen for and adds the missing one:
+    /// the output alphabet is still `[0-9a-f]` (path-safe by construction, no key text reaches the
+    /// path), distinct keys still get distinct names (collision resistance, unlike a truncation, which
+    /// would silently alias two capsules onto one checkpoint and corrupt resume state), and the name is
+    /// now FIXED-WIDTH at 64 characters however long the key is. The longest name this can produce is
+    /// 64 + `".holders.json".len()` = 77 characters, asserted by [`digest_name_is_bounded`].
+    ///
+    /// [`digest_name_is_bounded`]: tests::digest_name_is_bounded
     fn file_for(&self, key: &str, suffix: &str) -> std::path::PathBuf {
-        let mut name = String::with_capacity(key.len() * 2 + suffix.len());
-        for b in key.as_bytes() {
-            name.push(char::from_digit((b >> 4) as u32, 16).unwrap());
-            name.push(char::from_digit((b & 0x0f) as u32, 16).unwrap());
-        }
+        let mut name = checkpoint_file_stem(key);
+        debug_assert_eq!(name.len(), CHECKPOINT_STEM_LEN);
+        name.reserve_exact(suffix.len());
         name.push_str(suffix);
         self.dir.join(name)
     }
@@ -490,6 +514,120 @@ mod tests {
         assert!(store.load("abc").await.unwrap().is_none());
         // clear on a missing key is a no-op.
         store.clear("abc").await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The longest name `FileStateStore` can produce must fit in a filename, on every platform.
+    ///
+    /// `NAME_MAX` is 255 on Linux (and 255 UTF-16 units on Windows/NTFS), so the bound is checked
+    /// against 255 rather than a `cfg`-gated constant. This is the ARITHMETIC half of #38: it holds
+    /// for ANY key the key constructors can emit, because the stem is a fixed-width digest and the
+    /// only variable left is the suffix.
+    #[test]
+    fn digest_name_is_bounded() {
+        const NAME_MAX: usize = 255;
+        let long_key = crate::module::module_download_key(&"ab".repeat(32), &"cd".repeat(32));
+        assert_eq!(
+            long_key.len(),
+            136,
+            "the production key really is this long"
+        );
+
+        // Measured on what `FileStateStore` ACTUALLY produces — not on the stem helper — so a
+        // regression in `file_for` itself is visible here and not only in the round-trip test. The
+        // reputation sidecar carries the longest suffix any call site passes: the worst case.
+        let store = FileStateStore::new("dir");
+        for produced in [
+            store.path_for(&long_key),
+            store.reputation_path_for(&long_key),
+        ] {
+            let name = produced.file_name().unwrap().to_string_lossy().into_owned();
+            assert!(
+                name.chars().count() < NAME_MAX,
+                "{} chars exceeds NAME_MAX: {name}",
+                name.chars().count()
+            );
+        }
+        assert_eq!(
+            store
+                .reputation_path_for(&long_key)
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .chars()
+                .count(),
+            CHECKPOINT_STEM_LEN + ".holders.json".len(),
+        );
+
+        // The bound holds for ANY key because the stem is fixed-width: the 136-byte production key
+        // and a 3-byte key produce the same-length stem.
+        assert_eq!(checkpoint_file_stem(&long_key).len(), CHECKPOINT_STEM_LEN);
+        assert_eq!(checkpoint_file_stem("abc").len(), CHECKPOINT_STEM_LEN);
+        // Distinct keys stay distinct — the property a truncation would have destroyed.
+        assert_ne!(
+            checkpoint_file_stem(&long_key),
+            checkpoint_file_stem(&crate::module::module_download_key(
+                &"ab".repeat(32),
+                &"ce".repeat(32)
+            ))
+        );
+    }
+
+    /// #38: a checkpoint under a REAL `module:<64hex>:<64hex>` key must round-trip through
+    /// `FileStateStore`.
+    ///
+    /// The suite could not see this defect before: every `module.rs` test uses `InMemoryStateStore`,
+    /// which has no filename at all, and the one `FileStateStore` test used a 3-character key. The
+    /// old hex-encoding scheme turned this 136-byte key into a 277-character name and every write
+    /// failed on Linux with `File name too long (os error 36)`.
+    #[tokio::test]
+    async fn file_store_round_trips_a_real_module_download_key() {
+        let dir = std::env::temp_dir().join(format!(
+            "dig-download-modkey-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let key = crate::module::module_download_key(&"ab".repeat(32), &"cd".repeat(32));
+        let store = FileStateStore::new(&dir);
+
+        let mut s = DownloadState::new(&key);
+        s.total_length = 100;
+        s.chunk_lens = vec![10, 20];
+        s.mark_done(0);
+        // The write is where `os error 36` struck.
+        store.save(&s).await.unwrap();
+
+        // A restarted process reads the same checkpoint back under the same long key.
+        assert_eq!(
+            FileStateStore::new(&dir).load(&key).await.unwrap().unwrap(),
+            s
+        );
+
+        // The reputation sidecar carries the longest suffix, so it is the worst case — exercise it too.
+        let peer = "ef".repeat(32);
+        store.record_bad_descriptor(&key, &peer).await.unwrap();
+        assert_eq!(
+            FileStateStore::new(&dir)
+                .bad_descriptor_peers(&key)
+                .await
+                .unwrap(),
+            vec![peer]
+        );
+
+        // Nothing on disk exceeds the filename limit.
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let name = entry.unwrap().file_name();
+            assert!(
+                name.to_string_lossy().chars().count() < 255,
+                "checkpoint filename must fit NAME_MAX: {name:?}"
+            );
+        }
+
+        store.clear(&key).await.unwrap();
+        assert!(store.load(&key).await.unwrap().is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

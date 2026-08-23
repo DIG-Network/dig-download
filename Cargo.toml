@@ -20,7 +20,7 @@
 # by dig-node (see the implementers' note in the crate docs).
 [package]
 name = "dig-download"
-version = "0.20.0"
+version = "0.20.1"
 edition = "2021"
 rust-version = "1.75.0"
 license = "Apache-2.0 OR MIT"
@@ -44,6 +44,12 @@ categories = ["network-programming"]
 # tree carried TWO dig-constants and hence two chia stacks. dig-nat 0.20 requires `^0.10`, both edges
 # now agree, and the tree carries ONE copy on ONE chia line. `tests/dependency_tree.rs` fails if a
 # second copy ever returns, because a second dig-constants is also a second chia stack.
+#
+# HELD at 0.10 while 0.11 exists (§2.4b). dig-nat 0.20 — this crate's transport, and the edge that
+# actually decides the resolved tree — requires `dig-constants ^0.10`. A 0.x MINOR is
+# semver-INCOMPATIBLE, so declaring 0.11 here would resolve TWO dig-constants, and a second
+# dig-constants is a second chia stack. `tests/dependency_tree.rs` fails on exactly that. Move both
+# edges together when dig-nat adopts 0.11.
 dig-constants = "0.10"
 
 # LOCATE — "which peers hold this content?" dig-download derives a `ContentId` (store / root /
