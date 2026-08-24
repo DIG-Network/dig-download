@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.20.3] - 2026-08-24
+
+### CI
+- **release:** Give the 0.19 line a release branch, tags, and a backport gate (#42)
+
 ## [0.20.2] - 2026-08-23
 
 ### Bug Fixes
