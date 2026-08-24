@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.19.2] - 2026-08-24
+
+### Bug Fixes
+- **module:** Preserve staged bytes across a descriptor demotion (0.19 backport, v0.19.2) (#43)
+
 ## [0.19.1] - 2026-08-23
 
 ### Bug Fixes
