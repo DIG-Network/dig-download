@@ -3151,75 +3151,148 @@ mod tests {
         );
     }
 
+
     /// **Guard (2) of the three named at the demotion site, made falsifiable.**
     ///
     /// `load_or_fresh_state` refuses to resume a checkpoint whose `chunk_lens` do not match the
     /// CURRENT descriptor's, and `pull_with_descriptor` then wipes the staging area. The comment at
     /// the demotion site and `SPEC.md` both cite that refusal as one of the three reasons staged bytes
     /// may safely survive a descriptor demotion — but deleting the `prev.chunk_lens ==
-    /// layout.chunk_lens` condition left the whole suite green, including the two tests named for it.
-    /// A load-bearing guarantee no test can falsify is how the next refactor deletes it.
+    /// layout.chunk_lens` condition left the entire suite green, including the two tests named for it.
+    /// A load-bearing guarantee that no test can falsify is how the next refactor deletes it.
     ///
-    /// It is genuinely redundant for CORRECTNESS — guard (1) re-hashes every resumed chunk against the
-    /// current descriptor, so stale bytes can never be *counted* — which is exactly why the earlier
-    /// tests could not see it: they assert the artifact is right, and it is right either way. What the
-    /// guard uniquely prevents is a LONGER previous shape's tail outliving its plan. Without it,
-    /// `promote_verified` correctly refuses a staging area with bytes past the verified end, so every
-    /// byte is fetched and verified and the pull **fails anyway** — a self-inflicted denial of the
-    /// capsule rather than a corruption. That is the observable this test pins.
+    /// **What it does NOT do, which is why the earlier tests were blind and why a first attempt at
+    /// this one was blind too:** it does not keep a longer stale tail out of the artifact, because
+    /// `promote_verified` truncates the staging area to the verified length before it probes. And it
+    /// does not keep stale BYTES out, because guard (1) re-hashes every resumed chunk against the
+    /// current descriptor. Any test asserting the artifact's contents therefore passes with the guard
+    /// deleted — the artifact is correct either way.
     ///
-    /// So the fixture varies exactly that: a checkpoint from a 100-byte, two-chunk shape over a
-    /// staging area still holding its 100 stale bytes, then a pull of a DIFFERENT 30-byte, one-chunk
-    /// shape. **100 > 30 is the load-bearing choice** — an equal-or-shorter previous shape leaves no
-    /// tail to survive, and this test would pass with the guard deleted.
+    /// What the guard uniquely delivers is the claim `load_or_fresh_state`'s own doc makes: **a stale
+    /// checkpoint is never PARTIALLY reused.** Without it, the abandoned plan's `done_ranges` are
+    /// carried into a differently-shaped plan and the puller reads back chunks it never staged, on a
+    /// staging area belonging to a plan it has abandoned — safe only because a lower layer catches it.
+    /// That is observable directly, so this test observes it directly.
+    ///
+    /// The fixture varies exactly one thing and keeps a truthful control: the SAME staged bytes and
+    /// the SAME checkpointed indices are replayed against a matching descriptor, where resuming is
+    /// correct and expected. Without the control, an implementation that simply never resumed anything
+    /// would satisfy the mismatch half and this test would be pinning a coincidence.
     #[tokio::test]
-    async fn a_checkpoint_from_a_different_shape_wipes_the_stale_tail_it_describes() {
-        let store_id = hex_id(0xD1);
-        let root = hex_id(0xD2);
+    async fn a_stale_shaped_checkpoint_is_discarded_whole_not_partially_reused() {
+        /// Records every staging-area operation the puller performs, so "did it try to resume?" is a
+        /// direct observation rather than an inference from the artifact.
+        #[derive(Default)]
+        struct SpyingSink {
+            inner: InMemorySink,
+            truncates: tokio::sync::Mutex<Vec<u64>>,
+            reads: tokio::sync::Mutex<Vec<(u64, u64)>>,
+        }
 
-        // The pull that is about to happen: ONE 30-byte chunk.
-        let module: Vec<u8> = (0..30u8).collect();
-        let transport = Arc::new(MockModuleTransport::serving(
-            &store_id,
-            &root,
-            module.clone(),
-            30,
-        ));
+        #[async_trait]
+        impl Sink for SpyingSink {
+            async fn write_at(&self, offset: u64, bytes: &[u8]) -> Result<(), DownloadError> {
+                self.inner.write_at(offset, bytes).await
+            }
+            async fn truncate(&self, len: u64) -> Result<(), DownloadError> {
+                self.truncates.lock().await.push(len);
+                self.inner.truncate(len).await
+            }
+            fn supports_read_back(&self) -> bool {
+                true
+            }
+            async fn read_at(&self, offset: u64, len: u64) -> Result<Vec<u8>, DownloadError> {
+                self.reads.lock().await.push((offset, len));
+                self.inner.read_at(offset, len).await
+            }
+            async fn finalize(&self) -> Result<(), DownloadError> {
+                self.inner.finalize().await
+            }
+        }
 
-        // The staging area still holds 100 bytes from an abandoned, differently-shaped attempt.
-        let sink = InMemorySink::new();
-        sink.write_at(0, &[0xAA; 100])
+        /// Runs one pull against a staging area holding 100 bytes of an abandoned two-chunk plan and a
+        /// checkpoint declaring `checkpoint_lens` with both of its chunks done. Returns the
+        /// staging-area operations the puller performed.
+        async fn pull_over_a_checkpoint_of(
+            tag: u8,
+            checkpoint_lens: Vec<u64>,
+            module: Vec<u8>,
+            chunk_size: usize,
+        ) -> (Vec<u64>, Vec<(u64, u64)>, Vec<u8>) {
+            let store_id = hex_id(tag);
+            let root = hex_id(tag ^ 0xFF);
+            let transport = Arc::new(MockModuleTransport::serving(
+                &store_id,
+                &root,
+                module.clone(),
+                chunk_size,
+            ));
+
+            let sink = Arc::new(SpyingSink::default());
+            sink.write_at(0, &vec![0xAA; module.len()])
+                .await
+                .expect("seed the staging area of the abandoned attempt");
+
+            let state_store = Arc::new(InMemoryStateStore::new());
+            let mut stale = DownloadState::new(module_download_key(&store_id, &root));
+            stale.total_length = checkpoint_lens.iter().sum();
+            stale.chunk_lens = checkpoint_lens;
+            stale.done_ranges = BTreeSet::from([0usize, 1usize]);
+            state_store.save(&stale).await.expect("seed the checkpoint");
+
+            ModuleDownloader::new(
+                locator_with(1, &store_id, &root),
+                transport,
+                Arc::new(AcceptAnyModuleAnchor),
+                state_store,
+                ModuleDownloadConfig::default(),
+            )
+            .download(&store_id, &root, sink.as_ref())
             .await
-            .expect("seed the stale staging area");
+            .expect("the pull completes either way — the artifact is not what distinguishes them");
 
-        // ...and the checkpoint that describes THAT shape: two 50-byte chunks, both "done".
-        let state_store = Arc::new(InMemoryStateStore::new());
-        let key = module_download_key(&store_id, &root);
-        let mut stale = DownloadState::new(&key);
-        stale.total_length = 100;
-        stale.chunk_lens = vec![50, 50];
-        stale.done_ranges = BTreeSet::from([0usize, 1usize]);
-        state_store
-            .save(&stale)
-            .await
-            .expect("seed the stale checkpoint");
+            let truncates = sink.truncates.lock().await.clone();
+            let reads = sink.reads.lock().await.clone();
+            (truncates, reads, sink.inner.contents().await)
+        }
 
-        let len = ModuleDownloader::new(
-            locator_with(1, &store_id, &root),
-            transport,
-            Arc::new(AcceptAnyModuleAnchor),
-            state_store,
-            ModuleDownloadConfig::default(),
-        )
-        .download(&store_id, &root, &sink)
-        .await
-        .expect("a checkpoint of a different shape is discarded WITH its staging area");
+        // The plan actually being pulled: two 50-byte chunks.
+        let module: Vec<u8> = (0..100u8).collect();
 
-        assert_eq!(len, module.len() as u64);
-        assert_eq!(
-            sink.contents().await,
-            module,
-            "the artifact is exactly the new shape's bytes — no 0xAA tail survived the plan change",
+        // MISMATCHED — the checkpoint describes four 25-byte chunks, a shape this descriptor does not
+        // have. `[25; 4]` sums to the same 100 bytes as the real plan on purpose: the guard keys on
+        // the SHAPE, so an equal total is the case a length-only check would wave through.
+        let (truncates, reads, contents) =
+            pull_over_a_checkpoint_of(0xD1, vec![25; 4], module.clone(), 50).await;
+
+        assert_eq!(contents, module, "the artifact is correct (it is either way)");
+        assert!(
+            truncates.contains(&0),
+            "the abandoned plan's staging area is discarded WHOLE before the new plan stages a byte; \
+             truncates were {truncates:?}",
+        );
+        assert!(
+            !reads.iter().any(|&(_, len)| len == 50),
+            "no chunk of the NEW plan is read back, because the stale checkpoint granted no licence \
+             to resume one; reads were {reads:?}",
+        );
+
+        // CONTROL — the same staged bytes and the same checkpointed indices, against a descriptor of
+        // the MATCHING shape. Here resuming is correct, and it must actually happen: an
+        // implementation that had simply stopped resuming would satisfy the assertions above while
+        // breaking the feature they are meant to bound.
+        let (truncates, reads, contents) =
+            pull_over_a_checkpoint_of(0xD2, vec![50, 50], module.clone(), 50).await;
+
+        assert_eq!(contents, module, "the artifact is correct here too");
+        assert!(
+            !truncates.contains(&0),
+            "a MATCHING checkpoint keeps its staging area — it is not discarded; truncates were \
+             {truncates:?}",
+        );
+        assert!(
+            reads.iter().any(|&(_, len)| len == 50),
+            "and its checkpointed chunks ARE read back for resume; reads were {reads:?}",
         );
     }
 }
