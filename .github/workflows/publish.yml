@@ -47,13 +47,40 @@ jobs:
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
 
+      # A tag can legitimately be created for a version that is ALREADY on crates.io: retroactively
+      # tagging a release that was published before its line had a release branch (#41), or re-cutting
+      # a tag after a repair. `cargo publish` fails hard on a duplicate version, which would paint the
+      # repo red for a no-op. Skip instead, and say so.
+      #
+      # The `User-Agent` header is REQUIRED: without it the index answers with something that reads
+      # exactly like "this crate was never published", which would make this guard silently useless.
+      - name: Skip if this version is already on crates.io
+        id: published
+        shell: bash
+        run: |
+          set -euo pipefail
+          export VER
+          VER="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["package"]["version"])')"
+          echo "Cargo.toml version: $VER"
+          if curl -sfH 'User-Agent: dig-download-ci' https://index.crates.io/di/g-/dig-download \
+               | python3 -c 'import sys, json, os; vs = {json.loads(l)["vers"] for l in sys.stdin if l.strip()}; sys.exit(0 if os.environ["VER"] in vs else 1)'
+          then
+            echo "already=true" >>"$GITHUB_OUTPUT"
+            echo "::notice::dig-download $VER is already on crates.io - publish is a no-op."
+          else
+            echo "already=false" >>"$GITHUB_OUTPUT"
+          fi
+
       - name: Verify the package builds
+        if: steps.published.outputs.already == 'false'
         run: cargo build --release
 
       - name: Verify the package can be packaged
+        if: steps.published.outputs.already == 'false'
         run: cargo package --locked
 
       - name: Check CARGO_REGISTRY_TOKEN is set
+        if: steps.published.outputs.already == 'false'
         run: |
           if [ -z "${{ secrets.CARGO_REGISTRY_TOKEN }}" ]; then
             echo "CARGO_REGISTRY_TOKEN secret is not set in repository settings"
@@ -61,6 +88,7 @@ jobs:
           fi
 
       - name: Publish to crates.io
+        if: steps.published.outputs.already == 'false'
         run: cargo publish --locked --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
