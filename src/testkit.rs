@@ -637,6 +637,8 @@ pub struct MockModuleTransport {
     fabricated_chunk_hashes_for: Option<String>,
     one_byte_liar: Option<String>,
     budget: Option<Arc<AtomicUsize>>,
+    severed_beyond: Option<u64>,
+    info_failures_left: Option<Arc<AtomicUsize>>,
     fetches: Mutex<Vec<(String, u64)>>,
     info_calls: Mutex<Vec<String>>,
 }
@@ -660,6 +662,8 @@ impl MockModuleTransport {
             fabricated_chunk_hashes_for: None,
             one_byte_liar: None,
             budget: None,
+            severed_beyond: None,
+            info_failures_left: None,
             fetches: Mutex::new(Vec::new()),
             info_calls: Mutex::new(Vec::new()),
         }
@@ -758,6 +762,31 @@ impl MockModuleTransport {
     /// progress so a test can assert resume re-fetches ONLY the missing chunks.
     pub fn with_success_budget(mut self, n: usize) -> Self {
         self.budget = Some(Arc::new(AtomicUsize::new(n)));
+        self
+    }
+
+    /// EVERY holder refuses any `fetchModuleRange` at or beyond `offset` until the descriptor has
+    /// been re-asked (a second `getModuleInfo` handshake), then all of them serve honestly again.
+    ///
+    /// This models a TRANSIENT transport outage that outlives one descriptor attempt — the shape of
+    /// the dig-node#328 hardware trace, where chunk 19 of a 135 MB capsule failed from every holder,
+    /// the descriptor source was demoted, and the pull re-planned against a second holder offering an
+    /// IDENTICAL descriptor. Nothing here lies: every holder's descriptor is the honest one, so a
+    /// puller that keeps its staged bytes must re-fetch only the chunks at and beyond `offset`, and
+    /// one that wipes them re-fetches the whole blob.
+    pub fn severing_beyond(mut self, offset: u64) -> Self {
+        self.severed_beyond = Some(offset);
+        self
+    }
+
+    /// The first `n` `getModuleInfo` asks fail with a transport error (as a merely-slow or
+    /// transiently-unreachable holder set does); every ask after that answers honestly.
+    ///
+    /// The double for the retry budget (#37): with `n` equal to the holder count, the FIRST round of
+    /// asks fails entirely and a puller that charges the budget only for descriptors it actually
+    /// obtained ends the pull without ever re-asking.
+    pub fn failing_the_first_info_asks(mut self, n: usize) -> Self {
+        self.info_failures_left = Some(Arc::new(AtomicUsize::new(n)));
         self
     }
 
@@ -893,6 +922,17 @@ impl crate::module::ModuleTransport for MockModuleTransport {
             .lock()
             .await
             .push(provider_peer_id.to_string());
+        if let Some(left) = &self.info_failures_left {
+            // `fetch_sub` returns the PREVIOUS value; 0 means the configured failures are spent.
+            if left.fetch_sub(1, Ordering::SeqCst) == 0 {
+                left.fetch_add(1, Ordering::SeqCst); // keep it pinned at 0
+            } else {
+                return Err(DownloadError::transport(
+                    provider_peer_id,
+                    "descriptor ask timed out",
+                ));
+            }
+        }
         if store_id != self.store_id || root != self.root {
             // The crate's OWN idiom stamps the raw `provider_peer_id` into the error (see
             // `source.rs`), and the real sub-family-4 adapter will mirror it — so the mock must too,
@@ -941,6 +981,15 @@ impl crate::module::ModuleTransport for MockModuleTransport {
             if budget.fetch_sub(1, Ordering::SeqCst) == 0 {
                 budget.fetch_add(1, Ordering::SeqCst); // keep it pinned at 0
                 return Err(DownloadError::transport(provider_peer_id, "budget spent"));
+            }
+        }
+        if let Some(severed) = self.severed_beyond {
+            // Healed once the descriptor has been re-asked, so attempt 2 can complete the blob.
+            if offset >= severed && self.info_calls.lock().await.len() < 2 {
+                return Err(DownloadError::transport(
+                    provider_peer_id,
+                    "connection reset mid-transfer",
+                ));
             }
         }
         self.fetches
