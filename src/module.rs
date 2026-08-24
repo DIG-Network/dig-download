@@ -256,8 +256,15 @@ pub const MAX_DESCRIPTOR_ATTEMPTS: usize = 3;
 /// Tunables for a module pull.
 #[derive(Debug, Clone)]
 pub struct ModuleDownloadConfig {
-    /// Per-range fetch timeout — a holder that does not return a chunk within this window is treated
-    /// as a failed source for that chunk and the next holder is tried.
+    /// Per-ASK timeout — the window any single transport call to a holder gets, whether it is a
+    /// `fetchModuleRange` or the `getModuleInfo` handshake. A holder that does not answer within it is
+    /// treated as a failed source for that ask and the next holder is tried.
+    ///
+    /// It covers the descriptor ask as well as ranges because the descriptor phase's worst-case wait
+    /// (`MAX_DESCRIPTOR_ATTEMPTS` × holders × this window) has to be enforceable by this crate; a
+    /// transport whose `get_module_info` never resolves otherwise holds a pull open forever. The name
+    /// is kept for compatibility — renaming a public field is a breaking change, and a truthful bound
+    /// is worth more than a tidier name.
     pub range_timeout: std::time::Duration,
 
     /// Upper bound on the `total_size` a [`ModuleInfo`] may declare. The descriptor comes from an
@@ -643,10 +650,38 @@ impl ModuleDownloader {
                 continue; // demoted in this call, or carrying a remembered verdict
             }
             tried += 1;
-            match self.transport.get_module_info(peer, store_id, root).await {
-                Ok(info) => return Ok((peer.clone(), info)),
-                Err(e) if e.is_recoverable() => reasons.record(peer, e),
-                Err(e) => return Err(e),
+            // BOUND THE ASK HERE, not in the transport. `SPEC.md` states the descriptor phase's
+            // worst-case wait as `MAX_DESCRIPTOR_ATTEMPTS x holders x the per-ask timeout`; before
+            // this, nothing in the crate enforced the last factor, so the promise rested on an
+            // INJECTED transport happening to have a timeout. A `ModuleTransport` whose
+            // `get_module_info` never resolves satisfies the trait and held a pull open forever, and
+            // #37's across-round re-ask multiplied the asks that exposure applies to.
+            //
+            // `range_timeout` is deliberately reused rather than a new knob added: the sibling
+            // orchestrator already bounds its holder METADATA probe by the same field
+            // (`orchestrator.rs`), so one per-ask window covering every per-holder transport call is
+            // this crate's established contract, not an invention. A new public field would also be a
+            // semver-incompatible bump on a `0.x` config struct with public fields, forcing every
+            // consumer to re-adopt for a knob nobody asked for.
+            //
+            // A timeout is the holder's failure, not the descriptor's: it is recorded like any other
+            // recoverable per-holder reason, so the next holder is asked and the budget still governs.
+            let asked = tokio::time::timeout(
+                self.config.range_timeout,
+                self.transport.get_module_info(peer, store_id, root),
+            )
+            .await;
+            match asked {
+                Ok(Ok(info)) => return Ok((peer.clone(), info)),
+                Ok(Err(e)) if e.is_recoverable() => reasons.record(peer, e),
+                Ok(Err(e)) => return Err(e),
+                Err(_) => reasons.record(
+                    peer,
+                    format!(
+                        "getModuleInfo timed out after {:?}",
+                        self.config.range_timeout
+                    ),
+                ),
             }
         }
         Err(DownloadError::NotFound {
@@ -3151,7 +3186,6 @@ mod tests {
         );
     }
 
-
     /// **Guard (2) of the three named at the demotion site, made falsifiable.**
     ///
     /// `load_or_fresh_state` refuses to resume a checkpoint whose `chunk_lens` do not match the
@@ -3265,7 +3299,10 @@ mod tests {
         let (truncates, reads, contents) =
             pull_over_a_checkpoint_of(0xD1, vec![25; 4], module.clone(), 50).await;
 
-        assert_eq!(contents, module, "the artifact is correct (it is either way)");
+        assert_eq!(
+            contents, module,
+            "the artifact is correct (it is either way)"
+        );
         assert!(
             truncates.contains(&0),
             "the abandoned plan's staging area is discarded WHOLE before the new plan stages a byte; \
@@ -3293,6 +3330,85 @@ mod tests {
         assert!(
             reads.iter().any(|&(_, len)| len == 50),
             "and its checkpointed chunks ARE read back for resume; reads were {reads:?}",
+        );
+    }
+
+    /// **F2 — `SPEC.md` promised a descriptor-phase bound that this crate did not enforce.**
+    ///
+    /// The clause reads: the worst-case wait is `MAX_DESCRIPTOR_ATTEMPTS × holders × the transport's
+    /// per-ask timeout`, and *"an unanswerable holder set cannot hold a pull open indefinitely"*.
+    /// `tokio::time::timeout` appeared exactly once in this module — around `fetch_module_range` — so
+    /// the descriptor half of that bound rested entirely on an **injected** transport choosing to have
+    /// a timeout. A `ModuleTransport` whose `get_module_info` simply never resolves satisfied the
+    /// trait and hung the pull forever, and #37's across-round re-ask tripled the number of asks that
+    /// exposure applies to.
+    ///
+    /// The fixture is a holder whose `getModuleInfo` never returns — the nearest thing to a real
+    /// half-open connection, and the one case a per-ask timeout exists for. Time is virtual
+    /// (`start_paused`), so the assertion is about the BOUND existing, not about wall-clock duration.
+    ///
+    /// The outer `timeout` is what makes this test fail rather than HANG when the bound is removed:
+    /// under paused time an unbounded inner await leaves the runtime idle, the outer timer
+    /// auto-advances, and the `expect` below fires with a message naming the defect. A test whose
+    /// revert-proof is "the suite stops responding" is not a usable revert-proof.
+    #[tokio::test(start_paused = true)]
+    async fn a_holder_that_never_answers_getmoduleinfo_cannot_hold_the_pull_open() {
+        /// Answers `getModuleInfo` with a future that never resolves; ranges are never reached.
+        struct NeverAnswersInfo;
+
+        #[async_trait]
+        impl ModuleTransport for NeverAnswersInfo {
+            async fn get_module_info(
+                &self,
+                _peer: &str,
+                _store_id: &str,
+                _root: &str,
+            ) -> Result<ModuleInfo, DownloadError> {
+                std::future::pending().await
+            }
+            async fn fetch_module_range(
+                &self,
+                _peer: &str,
+                _store_id: &str,
+                _root: &str,
+                _offset: u64,
+                _len: u64,
+            ) -> Result<Vec<u8>, DownloadError> {
+                unreachable!("the pull never gets a descriptor, so no range is ever asked for")
+            }
+        }
+
+        let store_id = hex_id(0xE1);
+        let root = hex_id(0xE2);
+        let config = ModuleDownloadConfig::default();
+
+        // Generous next to the 30s per-ask default and the 3-attempt budget, so this can only elapse
+        // if NO per-ask bound exists at all — it cannot mask a bound that is merely slow.
+        let outer = config.range_timeout * (MAX_DESCRIPTOR_ATTEMPTS as u32) * 100;
+
+        let error = tokio::time::timeout(
+            outer,
+            ModuleDownloader::new(
+                locator_with(1, &store_id, &root),
+                Arc::new(NeverAnswersInfo),
+                Arc::new(AcceptAnyModuleAnchor),
+                Arc::new(InMemoryStateStore::new()),
+                config,
+            )
+            .download(&store_id, &root, &InMemorySink::new()),
+        )
+        .await
+        .expect("the descriptor ask is bounded by the crate, not by the transport's good manners")
+        .expect_err("a holder that never answers cannot produce a module");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("getModuleInfo"),
+            "the failure names the step that timed out: {message}",
+        );
+        assert!(
+            message.contains("timed out") || message.contains("Timeout"),
+            "and reports it as a timeout, not as a fabricated not-found: {message}",
         );
     }
 }

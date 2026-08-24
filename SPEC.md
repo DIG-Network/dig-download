@@ -811,8 +811,13 @@ reshare: the bytes verify per chunk, the pull assembles, and only the final gate
 - **A descriptor that never ARRIVES MUST spend an attempt (MUST).** A holder set that is merely slow or
   transiently unreachable MUST be re-asked within the same budget as a failed pull, not surrendered to on
   the first round. Each round asks each un-demoted holder at most once, so the worst-case wait is
-  `MAX_DESCRIPTOR_ATTEMPTS × holders × the transport's per-ask timeout` and an unanswerable holder set
-  cannot hold a pull open indefinitely.
+  `MAX_DESCRIPTOR_ATTEMPTS × holders × range_timeout` and an unanswerable holder set cannot hold a pull
+  open indefinitely.
+- **The descriptor ask MUST be bounded by the puller, not by the transport (MUST).** Each
+  `getModuleInfo` ask is issued under `range_timeout`; exceeding it is recorded as that HOLDER's
+  recoverable failure and the next holder is asked. The bound above is therefore a property of this
+  crate, not a promise about an injected `ModuleTransport` — a transport whose `get_module_info` never
+  resolves satisfies the trait, and before this bound existed it held a pull open indefinitely.
 - Demotion is bounded by `MAX_DESCRIPTOR_ATTEMPTS` (3) and by the supply of un-demoted holders. There are
   TWO ways to exhaust that budget, and each MUST report the failure it actually had — the error names what
   went wrong, and a pull MUST NOT manufacture an attribution it cannot support:
