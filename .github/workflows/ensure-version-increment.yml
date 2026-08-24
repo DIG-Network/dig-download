@@ -11,6 +11,7 @@ on:
   pull_request:
     branches:
       - main
+      - 'release/**'
 
 concurrency:
   group: ${{ github.ref }}-${{ github.workflow }}-${{ github.event_name }}
@@ -26,10 +27,13 @@ jobs:
         with:
           path: branch-repo
 
+      # The PR's OWN base, not a hard-coded `main`: a backport onto `release/0.19` must be compared
+      # against the 0.19 line, where `main`'s 0.20.x version would make every bump look like a
+      # decrease and fail the gate for the wrong reason.
       - name: Checkout base branch
         uses: actions/checkout@v4
         with:
-          ref: main
+          ref: ${{ github.base_ref }}
           path: base-repo
 
       - name: Check version increment

@@ -1,10 +1,14 @@
 name: CI
 
+# Runs on the development line AND every `release/X.Y` maintenance line. A maintenance line is not
+# a lesser line: it is what a pinned consumer actually builds (see .github/RELEASE_LINES.md), so a
+# backport must clear the same gates as a change to `main`. Before this, a PR into `release/0.19`
+# reported "no checks" and could be merged and published entirely ungated.
 on:
   push:
-    branches: [main]
+    branches: [main, 'release/**']
   pull_request:
-    branches: [main]
+    branches: [main, 'release/**']
 
 permissions:
   contents: read
