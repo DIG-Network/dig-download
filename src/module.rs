@@ -3150,4 +3150,76 @@ mod tests {
             "at most MAX_DESCRIPTOR_ATTEMPTS rounds, each asking each holder once"
         );
     }
+
+    /// **Guard (2) of the three named at the demotion site, made falsifiable.**
+    ///
+    /// `load_or_fresh_state` refuses to resume a checkpoint whose `chunk_lens` do not match the
+    /// CURRENT descriptor's, and `pull_with_descriptor` then wipes the staging area. The comment at
+    /// the demotion site and `SPEC.md` both cite that refusal as one of the three reasons staged bytes
+    /// may safely survive a descriptor demotion — but deleting the `prev.chunk_lens ==
+    /// layout.chunk_lens` condition left the whole suite green, including the two tests named for it.
+    /// A load-bearing guarantee no test can falsify is how the next refactor deletes it.
+    ///
+    /// It is genuinely redundant for CORRECTNESS — guard (1) re-hashes every resumed chunk against the
+    /// current descriptor, so stale bytes can never be *counted* — which is exactly why the earlier
+    /// tests could not see it: they assert the artifact is right, and it is right either way. What the
+    /// guard uniquely prevents is a LONGER previous shape's tail outliving its plan. Without it,
+    /// `promote_verified` correctly refuses a staging area with bytes past the verified end, so every
+    /// byte is fetched and verified and the pull **fails anyway** — a self-inflicted denial of the
+    /// capsule rather than a corruption. That is the observable this test pins.
+    ///
+    /// So the fixture varies exactly that: a checkpoint from a 100-byte, two-chunk shape over a
+    /// staging area still holding its 100 stale bytes, then a pull of a DIFFERENT 30-byte, one-chunk
+    /// shape. **100 > 30 is the load-bearing choice** — an equal-or-shorter previous shape leaves no
+    /// tail to survive, and this test would pass with the guard deleted.
+    #[tokio::test]
+    async fn a_checkpoint_from_a_different_shape_wipes_the_stale_tail_it_describes() {
+        let store_id = hex_id(0xD1);
+        let root = hex_id(0xD2);
+
+        // The pull that is about to happen: ONE 30-byte chunk.
+        let module: Vec<u8> = (0..30u8).collect();
+        let transport = Arc::new(MockModuleTransport::serving(
+            &store_id,
+            &root,
+            module.clone(),
+            30,
+        ));
+
+        // The staging area still holds 100 bytes from an abandoned, differently-shaped attempt.
+        let sink = InMemorySink::new();
+        sink.write_at(0, &[0xAA; 100])
+            .await
+            .expect("seed the stale staging area");
+
+        // ...and the checkpoint that describes THAT shape: two 50-byte chunks, both "done".
+        let state_store = Arc::new(InMemoryStateStore::new());
+        let key = module_download_key(&store_id, &root);
+        let mut stale = DownloadState::new(&key);
+        stale.total_length = 100;
+        stale.chunk_lens = vec![50, 50];
+        stale.done_ranges = BTreeSet::from([0usize, 1usize]);
+        state_store
+            .save(&stale)
+            .await
+            .expect("seed the stale checkpoint");
+
+        let len = ModuleDownloader::new(
+            locator_with(1, &store_id, &root),
+            transport,
+            Arc::new(AcceptAnyModuleAnchor),
+            state_store,
+            ModuleDownloadConfig::default(),
+        )
+        .download(&store_id, &root, &sink)
+        .await
+        .expect("a checkpoint of a different shape is discarded WITH its staging area");
+
+        assert_eq!(len, module.len() as u64);
+        assert_eq!(
+            sink.contents().await,
+            module,
+            "the artifact is exactly the new shape's bytes — no 0xAA tail survived the plan change",
+        );
+    }
 }
