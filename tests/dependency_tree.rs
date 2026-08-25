@@ -62,8 +62,8 @@ fn the_peer_client_is_on_the_module_wire_major() {
     let versions = locked_versions("dig-peer");
     assert_eq!(versions.len(), 1, "one dig-peer only, found {versions:?}");
     assert!(
-        versions[0].starts_with("0.12."),
-        "dig-peer must be on the 0.12 line (dig-rpc-protocol 0.10 + the module client methods, re-exporting          dig-nat 0.20 and dig-tls 0.4 on the chia-0.36 line, whose `SafeText` crosses dig-peer's own          error surface); the tree resolved {}",
+        versions[0].starts_with("0.13."),
+        "dig-peer must be on the 0.13 line (dig-rpc-protocol 0.10 + the module client methods, re-exporting          dig-nat 0.21 and dig-tls 0.4 on the chia-0.36 line, whose `SafeText` crosses dig-peer's own          error surface); the tree resolved {}",
         versions[0]
     );
 }
@@ -83,7 +83,7 @@ fn the_transport_stack_is_not_duplicated() {
     }
 }
 
-/// **Proves:** the resolved `dig-nat` is on the 0.20 line.
+/// **Proves:** the resolved `dig-nat` is on the 0.21 line.
 ///
 /// **Catches:** a lock that silently resolves dig-nat 0.11.x. On that line `RangeFrame::encode`
 /// returned a bare `Vec<u8>` with NO ceiling on the payload while the DECODE side already capped the
@@ -115,8 +115,8 @@ fn the_transport_is_on_the_capped_encode_line() {
     let versions = locked_versions("dig-nat");
     assert_eq!(versions.len(), 1, "one dig-nat only, found {versions:?}");
     assert!(
-        versions[0].starts_with("0.20."),
-        "dig-nat must be on the 0.20 line (capped framed ENCODE since 0.12 for #1640, the per-frame          chunk_index setter and public constructors from 0.13, the paged-prologue reassembly primitives          from 0.14, `SafeText` in 0.15, the RLY-009 DHT-record messages in 0.17, the          non_exhaustive RelayMessage in 0.18, and in 0.20 the dig-tls 0.4 re-export that puts          `NodeCert`'s BLS identity on the chia-0.36 line); the tree resolved {}",
+        versions[0].starts_with("0.21."),
+        "dig-nat must be on the 0.21 line (capped framed ENCODE since 0.12 for #1640, the per-frame          chunk_index setter and public constructors from 0.13, the paged-prologue reassembly primitives          from 0.14, `SafeText` in 0.15, the RLY-009 DHT-record messages in 0.17, the          non_exhaustive RelayMessage in 0.18, in 0.20 the dig-tls 0.4 re-export that puts          `NodeCert`'s BLS identity on the chia-0.36 line, and in 0.21 the live-circuit requirement that stops          a stale relayed circuit suppressing a fresh relayed dial); the tree resolved {}",
         versions[0]
     );
 }
@@ -134,12 +134,12 @@ fn the_transport_is_on_the_capped_encode_line() {
 ///
 /// Second, an unaccounted-for spread of dig-constants copies. One is not a number copied back out of
 /// a lock file; it is what the manifest graph requires. Exactly two EDGES reach dig-constants — this
-/// crate's direct `^0.10` and dig-nat 0.20's own `^0.10` — and because they agree, they resolve to a
+/// crate's direct `^0.11` and dig-nat 0.21's own `^0.11.1` — and because they agree, they resolve to a
 /// single COPY. Nothing else in the tree depends on it (dig-dht → dig-ip + dig-nat; dig-peer →
 /// dig-message, dig-nat, dig-rpc-protocol, dig-tls; dig-tls, dig-ip and dig-identity carry no dig
 /// deps at all).
 ///
-/// The `>=0.4, <0.6` pin that used to force a second copy is GONE: dig-nat 0.20 requires
+/// The `>=0.4, <0.6` pin that used to force a second copy is GONE: dig-nat 0.21 requires
 /// `dig-constants = "0.10"`. This assertion has therefore been tightened from two copies to one —
 /// which is exactly the handover its previous form was written to make.
 ///
@@ -156,18 +156,18 @@ fn the_endpoint_ssot_resolves_the_named_constants_line() {
     assert_eq!(
         versions.len(),
         1,
-        "expected exactly one dig-constants — this crate's direct `^0.10` and dig-nat 0.20's own \
-         `^0.10` select the same release — found {versions:?}. A second copy means an edge \
+        "expected exactly one dig-constants — this crate's direct `^0.11` and dig-nat 0.21's own \
+         `^0.11.1` select the same release — found {versions:?}. A second copy means an edge \
          reintroduced an older pin, and with it a second chia stack"
     );
     assert!(
-        versions[0].starts_with("0.10."),
+        versions[0].starts_with("0.11."),
         "the read ladder re-exports its endpoint literals from dig-constants, so the edge must \
-         resolve the 0.10 line the manifest names; the tree resolved {versions:?}"
+         resolve the 0.11 line the manifest names; the tree resolved {versions:?}"
     );
 }
 
-/// **Proves:** exactly one `dig-dht`, on the 0.12 line that itself carries dig-nat 0.20.
+/// **Proves:** exactly one `dig-dht`, on the 0.13 line that itself carries dig-nat 0.21.
 ///
 /// **Catches:** the published-but-unresolvable class this cascade exists to fix — a caret like
 /// `dig-dht = "0.8"` means `>=0.8.0, <0.9`, which can NEVER reach 0.9.0, so the locate leg would keep
@@ -179,8 +179,8 @@ fn the_locator_is_on_the_cascaded_dht_line() {
     let versions = locked_versions("dig-dht");
     assert_eq!(versions.len(), 1, "one dig-dht only, found {versions:?}");
     assert!(
-        versions[0].starts_with("0.12."),
-        "dig-dht must be on the 0.12 line (the release carrying dig-nat 0.20 + the bounded          ProviderStore::snapshot the relay's /dht view is built from); the tree resolved {}",
+        versions[0].starts_with("0.13."),
+        "dig-dht must be on the 0.13 line (the release carrying dig-nat 0.21 + the bounded          ProviderStore::snapshot the relay's /dht view is built from); the tree resolved {}",
         versions[0]
     );
 }
