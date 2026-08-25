@@ -20,7 +20,7 @@
 # by dig-node (see the implementers' note in the crate docs).
 [package]
 name = "dig-download"
-version = "0.20.4"
+version = "0.21.0"
 edition = "2021"
 rust-version = "1.75.0"
 license = "Apache-2.0 OR MIT"
@@ -45,12 +45,12 @@ categories = ["network-programming"]
 # now agree, and the tree carries ONE copy on ONE chia line. `tests/dependency_tree.rs` fails if a
 # second copy ever returns, because a second dig-constants is also a second chia stack.
 #
-# HELD at 0.10 while 0.11 exists (§2.4b). dig-nat 0.20 — this crate's transport, and the edge that
-# actually decides the resolved tree — requires `dig-constants ^0.10`. A 0.x MINOR is
-# semver-INCOMPATIBLE, so declaring 0.11 here would resolve TWO dig-constants, and a second
-# dig-constants is a second chia stack. `tests/dependency_tree.rs` fails on exactly that. Move both
-# edges together when dig-nat adopts 0.11.
-dig-constants = "0.10"
+# RELEASED to 0.11 (§2.4b). The hold recorded here was explicit — "Move both edges together when
+# dig-nat adopts 0.11" — and dig-nat 0.21 is that adoption: it requires `dig-constants ^0.11.1`. A
+# `0.x` MINOR is semver-INCOMPATIBLE, so the two edges must cross together or the tree carries TWO
+# dig-constants, and a second dig-constants is a second chia stack.
+# `tests/dependency_tree.rs` asserts exactly that, and its pinned line moves with this edge.
+dig-constants = "0.11"
 
 # LOCATE — "which peers hold this content?" dig-download derives a `ContentId` (store / root /
 # capsule / resource) and asks dig-dht `find_providers` for the holders' `ProviderRecord`s.
@@ -70,7 +70,7 @@ dig-constants = "0.10"
 # crate RE-EXPORTS `ContentId`/`ProviderRecord`, so their identity is part of dig-download's public
 # API — which is why this bump is breaking for consumers.
 # NC-7: prefer the crates.io release over bare-git.
-dig-dht = "0.12"
+dig-dht = "0.13"
 
 # WIRE — the whole-`.dig`-module pull descriptor + method names (#1576). `ModuleInfo`
 # (`total_size` / `module_hash` / `chunk_hashes` / `chunk_lens`) is the canonical byte-contract a
@@ -101,7 +101,15 @@ dig-rpc-protocol = "0.10"
 #
 # The wire is CANONICAL in dig-nat; never re-declare or fork the shapes here. NC-7: prefer the
 # crates.io release over bare-git.
-dig-nat = "0.20"
+#
+# `0.20` -> `0.21` (dig_ecosystem#3159): dig-nat 0.21 requires a LIVE circuit with a 30s idle window
+# before its duplicate guard suppresses a relayed dial. Before it, a stale circuit made a fresh
+# relayed dial report `relayed failed ... elapsed_ms=0` — NEVER ATTEMPTED — which is the measured
+# cause of a relayed circuit that forms and then carries zero bytes. This crate is the executor that
+# would have carried those bytes, so the fix is squarely on its path even though the diff here is
+# manifest-only: dig-nat 0.20..0.21 changes NO public API (its diff is `src/relay.rs` internals,
+# SPEC.md and the manifest).
+dig-nat = "0.21"
 
 # REACH + FETCH via the shared client — dig-download talks to peers through `DigPeer`, the one DIG
 # Network peer client (#1283), rather than driving dig-nat directly: `DigPeer::connect_with_runtime`
@@ -116,7 +124,7 @@ dig-nat = "0.20"
 # the #836 `serde_bytes`-vs-base64 class of defect that cost six diagnosis rounds. Pinning dig-peer to
 # the SAME dig-rpc-protocol version as this crate prevents regression. dig-peer 0.12 also exports the
 # `get_module_info` / `fetch_module_range` client methods dig-node's `ModuleTransport` adapter uses.
-dig-peer = "0.12"
+dig-peer = "0.13"
 
 # Async runtime for the orchestrator task + the concurrent range fan-out + backoff timers.
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync", "io-util"] }
