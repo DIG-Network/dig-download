@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.21.0] - 2026-08-25
+
+### Build
+- **deps:** Adopt dig-nat 0.21 / dig-constants 0.11 / dig-dht 0.13 / dig-peer 0.13, release 0.21.0 (#45)
+
 ## [0.20.4] - 2026-08-24
 
 ### Bug Fixes
