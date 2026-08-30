@@ -20,7 +20,7 @@
 # by dig-node (see the implementers' note in the crate docs).
 [package]
 name = "dig-download"
-version = "0.21.0"
+version = "0.22.0"
 edition = "2021"
 rust-version = "1.75.0"
 license = "Apache-2.0 OR MIT"
@@ -69,8 +69,18 @@ dig-constants = "0.11"
 # dig-dht defines its OWN `PeerId`/`ProviderRecord` types (NOT re-exported from dig-nat), and this
 # crate RE-EXPORTS `ContentId`/`ProviderRecord`, so their identity is part of dig-download's public
 # API — which is why this bump is breaking for consumers.
+#
+# `0.13` -> `0.15` (dig_ecosystem#3166). 0.14 added an OPTIONAL `unverified_mirror_coin_id` to
+# `ProviderRecord`; 0.15 bounds `CandidateAddr::host` at the shared normalization helper. Neither
+# touches `DhtService::find_providers`, and every construction site in this crate goes through
+# `ProviderRecord::new` (unchanged), so the source delta is nil — but the RE-EXPORTED struct gains a
+# public field, which makes this crate's own public API change and the bump breaking for consumers.
+#
+# dig-dht 0.15 requires `dig-nat ^0.21`, which is exactly the edge this crate already declares, so
+# the tree still carries ONE dig-nat on ONE chia line. `tests/dependency_tree.rs` asserts that rather
+# than assuming it.
 # NC-7: prefer the crates.io release over bare-git.
-dig-dht = "0.13"
+dig-dht = "0.15"
 
 # WIRE — the whole-`.dig`-module pull descriptor + method names (#1576). `ModuleInfo`
 # (`total_size` / `module_hash` / `chunk_hashes` / `chunk_lens`) is the canonical byte-contract a
