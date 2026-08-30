@@ -167,7 +167,7 @@ fn the_endpoint_ssot_resolves_the_named_constants_line() {
     );
 }
 
-/// **Proves:** exactly one `dig-dht`, on the 0.13 line that itself carries dig-nat 0.21.
+/// **Proves:** exactly one `dig-dht`, on the 0.15 line that itself carries dig-nat 0.21.
 ///
 /// **Catches:** the published-but-unresolvable class this cascade exists to fix — a caret like
 /// `dig-dht = "0.8"` means `>=0.8.0, <0.9`, which can NEVER reach 0.9.0, so the locate leg would keep
@@ -179,8 +179,11 @@ fn the_locator_is_on_the_cascaded_dht_line() {
     let versions = locked_versions("dig-dht");
     assert_eq!(versions.len(), 1, "one dig-dht only, found {versions:?}");
     assert!(
-        versions[0].starts_with("0.13."),
-        "dig-dht must be on the 0.13 line (the release carrying dig-nat 0.21 + the bounded          ProviderStore::snapshot the relay's /dht view is built from); the tree resolved {}",
+        versions[0].starts_with("0.15."),
+        "dig-dht must be on the 0.15 line (it still carries dig-nat 0.21 and the bounded \
+         ProviderStore::snapshot the relay's /dht view is built from, and it adds the untrusted \
+         ProviderRecord::unverified_mirror_coin_id that DIG-Network/dig-node#422 needs); the tree \
+         resolved {}",
         versions[0]
     );
 }
