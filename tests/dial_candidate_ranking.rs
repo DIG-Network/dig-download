@@ -8,8 +8,8 @@
 //! These tests exercise the surface this crate EXPORTS and the method `source.rs` actually calls, so
 //! they fail if a local ranking is ever reintroduced behind either.
 
-use dig_download::{dial_candidates, MAX_DIAL_CANDIDATES};
 use dig_dht::{CandidateAddr, Key, ProviderRecord};
+use dig_download::{dial_candidates, MAX_DIAL_CANDIDATES};
 use dig_nat::PeerId;
 
 /// A record whose `addresses` are assigned AFTER construction.
@@ -60,7 +60,11 @@ fn spellings_of_one_endpoint_collapse_to_one_slot() {
         CandidateAddr::direct("2001:db8::1", 9444),
     ];
     let ranked = hosts(&dial_candidates(&addresses));
-    assert_eq!(ranked.len(), 2, "expected one v6 + one collapsed v4; got {ranked:?}");
+    assert_eq!(
+        ranked.len(),
+        2,
+        "expected one v6 + one collapsed v4; got {ranked:?}"
+    );
     assert_eq!(ranked[0], "2001:db8::1");
 }
 
@@ -102,5 +106,8 @@ fn the_provider_method_source_dials_through_carries_the_same_order() {
         hosts(&dial_candidates(&addresses)),
     );
     // A relay marker is not directly dialable and must not appear on the dial path at all.
-    assert_eq!(hosts(&record.dial_candidates()), vec!["2001:db8::1", "::ffff:10.0.0.1"]);
+    assert_eq!(
+        hosts(&record.dial_candidates()),
+        vec!["2001:db8::1", "::ffff:10.0.0.1"]
+    );
 }

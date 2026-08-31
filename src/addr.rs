@@ -101,5 +101,4 @@ mod tests {
             .parse::<SocketAddr>()
             .is_ok());
     }
-
 }
