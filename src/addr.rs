@@ -12,19 +12,21 @@
 //! So: **parse the host as an [`IpAddr`] and CONSTRUCT the [`SocketAddr`]** — no string grammar in
 //! the middle. Rendering is the inverse and goes through [`display`], which brackets v6 correctly.
 //!
-//! # Candidate order (§5.2 IPv6-first, IPv4-fallback)
+//! # Candidate ORDER is NOT owned here (§5.2 IPv6-first, IPv4-fallback)
 //!
-//! [`dial_candidates`] orders a provider's dialable addresses IPv6 first, then IPv4, then anything
-//! unresolvable — so a dialer walks the whole list and only reports failure once EVERY candidate
-//! has been tried. One unusable v6 candidate must never mask a working v4 one.
+//! Ranking a provider's candidates belongs to [`dig_dht::dial_candidates`], which is "the ONE place
+//! the DHT expresses it, so every consumer inherits it instead of re-deriving a ranking of its own."
+//! This module deliberately owns only the two things it can own without duplicating that policy:
+//! constructing the [`SocketAddr`] and rendering the text.
+//!
+//! A local ranking used to live here and it disagreed with the canonical one **in the direction that
+//! matters**: it classified an IPv4-mapped IPv6 literal as PREFERRED, which is the very
+//! `::ffff:172.31.79.22` shape blamed above for killing the #836 read leg, and it capped with a bare
+//! truncation that could evict every IPv4 candidate. Order comes from dig-dht; nothing re-derives it.
 
-use dig_dht::{CandidateAddr, ProviderRecord};
+use dig_dht::CandidateAddr;
 use std::net::{IpAddr, SocketAddr};
 use thiserror::Error;
-
-/// Upper bound on dial candidates tried per provider, so a record padded with many addresses cannot
-/// turn one holder into an unbounded connect storm.
-pub const MAX_DIAL_CANDIDATES: usize = 4;
 
 /// Why a candidate address could not be turned into a dialable [`SocketAddr`].
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -60,41 +62,9 @@ pub fn display(addr: &CandidateAddr) -> String {
     }
 }
 
-/// The provider's dialable candidates in dial order: **IPv6 first, then IPv4** (§5.2), then any
-/// candidate whose host is not a literal — capped at [`MAX_DIAL_CANDIDATES`].
-///
-/// Unresolvable candidates are kept (last) on purpose: a dialer that walks them reports a concrete
-/// per-candidate reason instead of silently pretending the provider had no address at all.
-pub fn dial_candidates(provider: &ProviderRecord) -> Vec<&CandidateAddr> {
-    let mut candidates: Vec<&CandidateAddr> = provider
-        .addresses
-        .iter()
-        .filter(|a| a.kind.is_dialable())
-        .collect();
-    candidates.sort_by_key(|a| match candidate_socket(a) {
-        Ok(SocketAddr::V6(_)) => 0,
-        Ok(SocketAddr::V4(_)) => 1,
-        Err(_) => 2,
-    });
-    candidates.truncate(MAX_DIAL_CANDIDATES);
-    candidates
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dig_dht::{AddressKind, Key};
-    use dig_nat::PeerId;
-
-    fn record(addresses: Vec<CandidateAddr>) -> ProviderRecord {
-        ProviderRecord::new(
-            &Key::from_bytes([0xAB; 32]),
-            &PeerId::from_bytes([1; 32]),
-            addresses,
-            u64::MAX,
-        )
-    }
-
     #[test]
     fn resolves_v4_v6_and_v4_mapped_hosts() {
         for host in ["10.0.0.1", "2001:db8::1", "::ffff:10.0.0.1"] {
@@ -130,29 +100,5 @@ mod tests {
         assert!(display(&CandidateAddr::direct("2001:db8::1", 9444))
             .parse::<SocketAddr>()
             .is_ok());
-    }
-
-    #[test]
-    fn dial_order_is_v6_then_v4_then_unresolvable() {
-        let p = record(vec![
-            CandidateAddr::direct("10.0.0.1", 1),
-            CandidateAddr::direct("peer.example", 2),
-            CandidateAddr::direct("2001:db8::1", 3),
-        ]);
-        let hosts: Vec<&str> = dial_candidates(&p)
-            .iter()
-            .map(|a| a.host.as_str())
-            .collect();
-        assert_eq!(hosts, vec!["2001:db8::1", "10.0.0.1", "peer.example"]);
-    }
-
-    #[test]
-    fn dial_candidates_skip_relay_markers_and_stay_bounded() {
-        let mut addresses = vec![CandidateAddr::relay_marker()];
-        addresses.extend((0..10).map(|i| CandidateAddr::direct(format!("10.0.0.{i}"), 9444)));
-        let p = record(addresses);
-        let candidates = dial_candidates(&p);
-        assert_eq!(candidates.len(), MAX_DIAL_CANDIDATES);
-        assert!(candidates.iter().all(|a| a.kind == AddressKind::Direct));
     }
 }

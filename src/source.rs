@@ -727,7 +727,7 @@ impl NatRangeTransport {
             DownloadError::transport(&provider.provider_peer_id, "malformed provider peer_id")
         })?;
         let mut targets = Vec::new();
-        for candidate in crate::addr::dial_candidates(provider) {
+        for candidate in provider.dial_candidates() {
             match crate::addr::candidate_socket(candidate) {
                 Ok(socket) => targets.push((
                     socket.to_string(),
@@ -1014,7 +1014,7 @@ mod tests {
     }
 
     #[test]
-    fn dial_targets_order_v6_then_v4_then_relay() {
+    fn dial_targets_collapse_one_endpoint_and_rank_a_mapped_literal_as_v4() {
         let t = NatRangeTransport::new(
             fake_node_cert(),
             dig_nat::NatConfig::default(),
@@ -1035,14 +1035,15 @@ mod tests {
             .into_iter()
             .map(|(addr, _)| addr)
             .collect();
-        assert_eq!(
-            addrs,
-            vec![
-                "[::ffff:172.31.79.22]:9444",
-                "172.31.79.22:9444",
-                "relay-only"
-            ]
-        );
+        // These two candidates are ONE endpoint spelled two ways, so they occupy ONE dial slot, and
+        // it is dialled as the IPv4 address it actually is.
+        //
+        // Until #32 this test asserted the opposite — `[::ffff:172.31.79.22]:9444` FIRST, ahead of
+        // its own bare twin — which encoded the defect rather than the contract: this crate ranked a
+        // mapped literal by SYNTAX (an `Ipv6Addr`, so "preferred") instead of by REACHABILITY (IPv4,
+        // so fallback), and deduped nothing. That the fixture used `172.31.79.22` is not incidental:
+        // it is the #836 address, so the test named the failing case and then pinned it in place.
+        assert_eq!(addrs, vec!["172.31.79.22:9444", "relay-only"]);
     }
 
     #[tokio::test]

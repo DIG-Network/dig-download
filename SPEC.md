@@ -422,8 +422,24 @@ A provider record's candidate `host` is an IP **literal** (IPv4, IPv6, or v4-map
   path); such a candidate MUST be skipped with a named reason, never treated as fatal to the provider.
 - **IPv6-first with IPv4 fallback (§5.2).** A dial MUST try EVERY dialable candidate of the provider in
   order — IPv6 candidates first, then IPv4, then relay-only reachability by identity — and MUST report
-  the holder unreachable only after every candidate has failed. The number of candidates tried per
-  provider is bounded. Each failed attempt MUST be logged with the address that produced it.
+  the holder unreachable only after every candidate has failed. Each failed attempt MUST be logged with
+  the address that produced it.
+- **The ordering is dig-dht's and MUST NOT be re-derived.** Candidate order comes from
+  `dig_dht::dial_candidates` (equivalently `ProviderRecord::dial_candidates`). An implementation MUST NOT
+  define a ranking of its own: a second ranking is a divergence in §5.2 policy, and it diverges in the
+  direction that loses reachability. Three properties of that contract are normative here because a
+  naive re-derivation breaks each of them:
+  - A candidate's tier is its **reachability**, not its syntax. An IPv4-mapped IPv6 literal
+    (`::ffff:a.b.c.d`) is IPv4 reachability and MUST rank in the **fallback** tier, never ahead of a
+    native IPv6 candidate.
+  - Candidates MUST be deduplicated by the **parsed endpoint**, so that several spellings of one
+    address (`::ffff:10.0.0.1` and `10.0.0.1`; `2001:db8::1` and `2001:0DB8::1`) occupy ONE slot of the
+    bound and cannot fill it on their own.
+  - The bound on candidates tried per provider MUST NOT be applied as a plain truncation of the
+    ordered list. When the bound would exclude EVERY non-IPv6 candidate and one exists, the
+    least-preferred kept slot MUST be given to the best non-IPv6 candidate — otherwise a dual-stack
+    holder advertising enough IPv6 addresses yields a dial set containing no IPv4 at all, and a dialer
+    that faithfully walks every candidate it is given still never reaches the working address.
 
 ---
 

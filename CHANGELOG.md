@@ -4,6 +4,24 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.23.0] - 2026-08-31
+
+### Fixed
+
+- **Dial-candidate ordering is dig-dht's, and the rival copy is deleted** (#32). `src/addr.rs`
+  re-derived a ranking `dig_dht::dial_candidates` already owns, and the copy disagreed in failure
+  direction: it ranked an IPv4-mapped IPv6 literal (`::ffff:a.b.c.d`) as **preferred** where the
+  canonical implementation ranks it as **fallback** — the exact address shape `addr.rs`'s own header
+  blames for killing the #836 read leg. It also deduped nothing, so re-spellings of one endpoint
+  filled the dial cap, and capped with a bare `truncate(4)`, so a dual-stack holder's IPv6 candidates
+  could evict the only IPv4 address. `dig-download` now keeps only `candidate_socket` / `display` and
+  re-exports the canonical ranking unchanged.
+
+### Changed
+
+- **BREAKING**: `dial_candidates` is re-exported from `dig-dht` and takes `&[CandidateAddr]` rather
+  than `&ProviderRecord`. Callers holding a record use `ProviderRecord::dial_candidates()`.
+
 ## [0.22.0] - 2026-08-30
 
 ### Build
