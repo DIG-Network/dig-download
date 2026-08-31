@@ -727,7 +727,7 @@ impl NatRangeTransport {
             DownloadError::transport(&provider.provider_peer_id, "malformed provider peer_id")
         })?;
         let mut targets = Vec::new();
-        for candidate in crate::addr::dial_candidates(provider) {
+        for candidate in provider.dial_candidates() {
             match crate::addr::candidate_socket(candidate) {
                 Ok(socket) => targets.push((
                     socket.to_string(),

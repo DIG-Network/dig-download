@@ -111,7 +111,12 @@ pub use dig_nat::{AvailabilityItem, AvailabilityResponse, RangeRequest};
 // download (no divergent shape).
 pub use dig_dht::{ContentId, ProviderRecord};
 
-pub use addr::{candidate_socket, dial_candidates, AddrError, MAX_DIAL_CANDIDATES};
+pub use addr::{candidate_socket, AddrError};
+/// Dial-candidate ordering is owned by dig-dht and re-exported unchanged, never re-derived here — a
+/// second ranking is a divergence in §5.2 policy, and the one this crate used to carry ranked an
+/// IPv4-mapped IPv6 literal as preferred (the #836 read-leg shape) and could truncate away every
+/// IPv4 candidate. See `tests/dial_candidate_ranking.rs`.
+pub use dig_dht::{dial_candidates, MAX_DIAL_CANDIDATES};
 pub use error::{
     hex64_or_sentinel, sanitize_untrusted_text, DownloadError, VerifyError,
     MAX_ERROR_CONTEXT_CHARS, MAX_ERROR_REASON_CHARS,
