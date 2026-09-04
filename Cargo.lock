@@ -628,7 +628,7 @@ dependencies = [
 
 [[package]]
 name = "dig-download"
-version = "0.22.0"
+version = "0.22.1"
 dependencies = [
  "async-trait",
  "dig-constants",
