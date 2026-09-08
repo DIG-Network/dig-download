@@ -72,11 +72,15 @@ jobs:
 
       - name: Generate changelog
         if: steps.ver.outputs.skip == 'false'
-        run: git-cliff --config cliff.toml --tag "${{ steps.ver.outputs.tag }}" --output CHANGELOG.md
+        env:
+              TAG: ${{ steps.ver.outputs.tag }}
+            run: git-cliff --config cliff.toml --tag "$TAG" --output CHANGELOG.md
 
       - name: Commit changelog, tag, push
         if: steps.ver.outputs.skip == 'false'
-        shell: bash
+        env:
+              TAG: ${{ steps.ver.outputs.tag }}
+            shell: bash
         run: |
           set -euo pipefail
           git config user.name "dig-release-bot"
