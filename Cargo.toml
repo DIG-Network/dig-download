@@ -20,7 +20,7 @@
 # by dig-node (see the implementers' note in the crate docs).
 [package]
 name = "dig-download"
-version = "0.22.1"
+version = "0.23.0"
 edition = "2021"
 rust-version = "1.75.0"
 license = "Apache-2.0 OR MIT"
@@ -86,9 +86,17 @@ dig-dht = "0.15"
 # (`total_size` / `module_hash` / `chunk_hashes` / `chunk_lens`) is the canonical byte-contract a
 # `getModuleInfo` handshake returns; the `ModuleDownloader` consumes it directly rather than
 # re-declaring the shape (single source of truth, no drift vs the dig-node serve leg). dig-rpc-protocol
-# 0.10 is pinned to match dig-peer's dependency. Foundation-level (L00), zero DIG deps — a legal
+# 0.11 is pinned to match dig-peer's dependency. Foundation-level (L00), zero DIG deps — a legal
 # downward edge from L30. NC-7: prefer the crates.io release over bare-git.
-dig-rpc-protocol = "0.10"
+#
+# `0.10` -> `0.11` (dig_ecosystem#3269): additive-only (760 insertions / 2 manifest-version-line
+# deletions vs 0.10.3; zero public item removed or renamed). Re-checked the three types this crate
+# re-exports/constructs (`ModuleInfo`, `GetModuleInfoParams`, `RelayStatus`) against the published
+# 0.11.0 source: none gained `#[non_exhaustive]`. This crate does not `match` on any type that DID
+# (`ErrorCode`, `Method`, `RangeFrame`, `FetchRangeParams`, `GetAvailabilityParams`), so no wildcard
+# arm is needed. Required because dig-node-core moved to the 0.11 line first and needs the reward
+# RPC methods only 0.11.0 carries.
+dig-rpc-protocol = "0.11"
 
 # REACH + FETCH — the mTLS peer transport the range fetch rides: `dig.getAvailability` +
 # `dig.fetchRange` over dig-nat mux streams, plus the wire shapes (`RangeRequest`, `RangeFrame`,
@@ -128,13 +136,18 @@ dig-nat = "0.21"
 # `RangeRequest`, `AvailabilityItem`/`AvailabilityResponse`, `NodeCert`, `PeerId`), so the tree still
 # carries exactly ONE dig-nat + dig-tls instance. NC-7: prefer the crates.io release over bare-git.
 #
-# Kept on the same dig-rpc-protocol line (0.10) as this crate to collapse a `ModuleInfo` SHAPE SKEW,
+# Kept on the same dig-rpc-protocol line (0.11) as this crate to collapse a `ModuleInfo` SHAPE SKEW,
 # not merely to stay current (#1576). An earlier version skew held TWO `ModuleInfo` types either side
 # of a trust boundary, on the very field (`chunk_lens`/`chunk_hashes`) that drives the whole pull plan —
 # the #836 `serde_bytes`-vs-base64 class of defect that cost six diagnosis rounds. Pinning dig-peer to
 # the SAME dig-rpc-protocol version as this crate prevents regression. dig-peer 0.12 also exports the
 # `get_module_info` / `fetch_module_range` client methods dig-node's `ModuleTransport` adapter uses.
-dig-peer = "0.13"
+#
+# `0.13` -> `0.14` (dig_ecosystem#3269): dig-peer moved its own dig-rpc-protocol requirement to 0.11
+# for the same reason as this crate (dig-node-core needs the 0.11-only reward RPC methods); moving
+# together here keeps both crates on the SAME dig-rpc-protocol line, which is the whole point of this
+# pin. dig-peer 0.14 is a manifest-only bump (no public API change).
+dig-peer = "0.14"
 
 # Async runtime for the orchestrator task + the concurrent range fan-out + backoff timers.
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync", "io-util"] }

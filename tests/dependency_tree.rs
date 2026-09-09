@@ -33,11 +33,17 @@ fn locked_versions(crate_name: &str) -> Vec<&str> {
         .collect()
 }
 
-/// **Proves:** the resolved tree carries EXACTLY ONE `dig-rpc-protocol`, and it is the 0.10 line that
+/// **Proves:** the resolved tree carries EXACTLY ONE `dig-rpc-protocol`, and it is the 0.11 line that
 /// defines the whole-module wire (`ModuleInfo`, `GetModuleInfoParams`, `FetchModuleRangeParams`).
 /// **Catches:** a consumer (today dig-peer) reintroducing an older dig-rpc-protocol major, which would
 /// silently place two `ModuleInfo` shapes either side of the module pull's trust boundary — a defect the
 /// compiler accepts and only a wire test or a real network run would otherwise reveal (#1576/#836).
+///
+/// `0.10` -> `0.11` (dig_ecosystem#3269): additive-only (760 insertions / 2 manifest-version-line
+/// deletions vs 0.10.3; zero public item removed or renamed). `ModuleInfo`, `GetModuleInfoParams`,
+/// `RelayStatus` did NOT gain `#[non_exhaustive]` in 0.11.0 (re-checked against the published source),
+/// so the wire shape this invariant protects is unchanged in substance — only the required line moved,
+/// because dig-node-core needs reward RPC methods that exist only on 0.11.0.
 #[test]
 fn the_tree_carries_exactly_one_dig_rpc_protocol_and_it_is_the_module_wire_major() {
     let versions = locked_versions("dig-rpc-protocol");
@@ -48,13 +54,13 @@ fn the_tree_carries_exactly_one_dig_rpc_protocol_and_it_is_the_module_wire_major
          means two `ModuleInfo` shapes across a trust boundary"
     );
     assert!(
-        versions[0].starts_with("0.10."),
-        "the module wire ships in dig-rpc-protocol 0.10; the tree resolved {}",
+        versions[0].starts_with("0.11."),
+        "the module wire ships in dig-rpc-protocol 0.11; the tree resolved {}",
         versions[0]
     );
 }
 
-/// **Proves:** the peer client itself is on the dig-rpc-protocol 0.10 line — the transitive entry, not
+/// **Proves:** the peer client itself is on the dig-rpc-protocol 0.11 line — the transitive entry, not
 /// just the direct caret dep, since a consumer's own lock is what actually decides which patch is
 /// compiled.
 #[test]
@@ -62,8 +68,8 @@ fn the_peer_client_is_on_the_module_wire_major() {
     let versions = locked_versions("dig-peer");
     assert_eq!(versions.len(), 1, "one dig-peer only, found {versions:?}");
     assert!(
-        versions[0].starts_with("0.13."),
-        "dig-peer must be on the 0.13 line (dig-rpc-protocol 0.10 + the module client methods, re-exporting          dig-nat 0.21 and dig-tls 0.4 on the chia-0.36 line, whose `SafeText` crosses dig-peer's own          error surface); the tree resolved {}",
+        versions[0].starts_with("0.14."),
+        "dig-peer must be on the 0.14 line (dig-rpc-protocol 0.11 + the module client methods, re-exporting          dig-nat 0.21 and dig-tls 0.4 on the chia-0.36 line, whose `SafeText` crosses dig-peer's own          error surface); the tree resolved {}",
         versions[0]
     );
 }
