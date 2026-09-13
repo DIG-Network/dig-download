@@ -44,6 +44,11 @@ fn locked_versions(crate_name: &str) -> Vec<&str> {
 /// `RelayStatus` did NOT gain `#[non_exhaustive]` in 0.11.0 (re-checked against the published source),
 /// so the wire shape this invariant protects is unchanged in substance — only the required line moved,
 /// because dig-node-core needs reward RPC methods that exist only on 0.11.0.
+///
+/// `0.11` -> `0.12` (dig_ecosystem#3269 leg 2): reward-facing result types reworked
+/// (`HalfObservation` -> `Half<T>`, `RewardSubject` -> `PayeeSubject`), none of which this crate
+/// constructs, re-exports or matches on (`ModuleInfo`, `GetModuleInfoParams`, `RelayStatus` only), so
+/// the module wire this invariant protects is unaffected — only the required line moved again.
 #[test]
 fn the_tree_carries_exactly_one_dig_rpc_protocol_and_it_is_the_module_wire_major() {
     let versions = locked_versions("dig-rpc-protocol");
@@ -54,8 +59,8 @@ fn the_tree_carries_exactly_one_dig_rpc_protocol_and_it_is_the_module_wire_major
          means two `ModuleInfo` shapes across a trust boundary"
     );
     assert!(
-        versions[0].starts_with("0.11."),
-        "the module wire ships in dig-rpc-protocol 0.11; the tree resolved {}",
+        versions[0].starts_with("0.12."),
+        "the module wire ships in dig-rpc-protocol 0.12; the tree resolved {}",
         versions[0]
     );
 }
@@ -68,8 +73,8 @@ fn the_peer_client_is_on_the_module_wire_major() {
     let versions = locked_versions("dig-peer");
     assert_eq!(versions.len(), 1, "one dig-peer only, found {versions:?}");
     assert!(
-        versions[0].starts_with("0.14."),
-        "dig-peer must be on the 0.14 line (dig-rpc-protocol 0.11 + the module client methods, re-exporting          dig-nat 0.21 and dig-tls 0.4 on the chia-0.36 line, whose `SafeText` crosses dig-peer's own          error surface); the tree resolved {}",
+        versions[0].starts_with("0.15."),
+        "dig-peer must be on the 0.15 line (dig-rpc-protocol 0.12 + the module client methods, re-exporting          dig-nat 0.21 and dig-tls 0.4 on the chia-0.36 line, whose `SafeText` crosses dig-peer's own          error surface); the tree resolved {}",
         versions[0]
     );
 }
