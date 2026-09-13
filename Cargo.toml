@@ -20,7 +20,7 @@
 # by dig-node (see the implementers' note in the crate docs).
 [package]
 name = "dig-download"
-version = "0.23.0"
+version = "0.24.0"
 edition = "2021"
 rust-version = "1.75.0"
 license = "Apache-2.0 OR MIT"
@@ -96,7 +96,7 @@ dig-dht = "0.15"
 # (`ErrorCode`, `Method`, `RangeFrame`, `FetchRangeParams`, `GetAvailabilityParams`), so no wildcard
 # arm is needed. Required because dig-node-core moved to the 0.11 line first and needs the reward
 # RPC methods only 0.11.0 carries.
-dig-rpc-protocol = "0.11"
+dig-rpc-protocol = "0.12"
 
 # REACH + FETCH — the mTLS peer transport the range fetch rides: `dig.getAvailability` +
 # `dig.fetchRange` over dig-nat mux streams, plus the wire shapes (`RangeRequest`, `RangeFrame`,
@@ -147,7 +147,7 @@ dig-nat = "0.21"
 # for the same reason as this crate (dig-node-core needs the 0.11-only reward RPC methods); moving
 # together here keeps both crates on the SAME dig-rpc-protocol line, which is the whole point of this
 # pin. dig-peer 0.14 is a manifest-only bump (no public API change).
-dig-peer = "0.14"
+dig-peer = "0.15"
 
 # Async runtime for the orchestrator task + the concurrent range fan-out + backoff timers.
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync", "io-util"] }
