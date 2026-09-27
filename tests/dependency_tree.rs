@@ -49,6 +49,16 @@ fn locked_versions(crate_name: &str) -> Vec<&str> {
 /// (`HalfObservation` -> `Half<T>`, `RewardSubject` -> `PayeeSubject`), none of which this crate
 /// constructs, re-exports or matches on (`ModuleInfo`, `GetModuleInfoParams`, `RelayStatus` only), so
 /// the module wire this invariant protects is unaffected — only the required line moved again.
+///
+/// `0.12` -> `0.14` (dig_ecosystem#3246, ONE step — 0.13.x is subsumed): 0.14.0 makes
+/// `chain_peak_height` / `chain_peak_timestamp` REQUIRED on `GetRewardDistributorResult` and
+/// `ListRewardDistributorCommitmentsResult`, so a chain-stalled responder can no longer freeze
+/// `entry_set_stale` at `false` under a freshly stamped wall-clock `observed_at`. Neither type is
+/// constructed, re-exported or matched on here, and this crate holds no compensation for the old
+/// optimistic behaviour to withdraw, so again only the required line moved. The bump is what lets
+/// dig-node adopt 0.14.0 at all: `^0.12` and `^0.14` are semver-INCOMPATIBLE in 0.x, so one stale
+/// requirement anywhere in the graph splits the lock in two — which is the state this assertion
+/// catches.
 #[test]
 fn the_tree_carries_exactly_one_dig_rpc_protocol_and_it_is_the_module_wire_major() {
     let versions = locked_versions("dig-rpc-protocol");
@@ -59,8 +69,8 @@ fn the_tree_carries_exactly_one_dig_rpc_protocol_and_it_is_the_module_wire_major
          means two `ModuleInfo` shapes across a trust boundary"
     );
     assert!(
-        versions[0].starts_with("0.12."),
-        "the module wire ships in dig-rpc-protocol 0.12; the tree resolved {}",
+        versions[0].starts_with("0.14."),
+        "the module wire ships in dig-rpc-protocol 0.14; the tree resolved {}",
         versions[0]
     );
 }
@@ -73,8 +83,8 @@ fn the_peer_client_is_on_the_module_wire_major() {
     let versions = locked_versions("dig-peer");
     assert_eq!(versions.len(), 1, "one dig-peer only, found {versions:?}");
     assert!(
-        versions[0].starts_with("0.15."),
-        "dig-peer must be on the 0.15 line (dig-rpc-protocol 0.12 + the module client methods, re-exporting          dig-nat 0.21 and dig-tls 0.4 on the chia-0.36 line, whose `SafeText` crosses dig-peer's own          error surface); the tree resolved {}",
+        versions[0].starts_with("0.16."),
+        "dig-peer must be on the 0.16 line (dig-rpc-protocol 0.14 + the module client methods, re-exporting          dig-nat 0.21 and dig-tls 0.4 on the chia-0.36 line, whose `SafeText` crosses dig-peer's own          error surface); the tree resolved {}",
         versions[0]
     );
 }
