@@ -628,7 +628,7 @@ dependencies = [
 
 [[package]]
 name = "dig-download"
-version = "0.25.0"
+version = "0.26.0"
 dependencies = [
  "async-trait",
  "dig-constants",
@@ -696,9 +696,9 @@ dependencies = [
 
 [[package]]
 name = "dig-nat"
-version = "0.21.0"
+version = "0.21.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f32d4a8ddbb282a8326dfa4a23d1af37f3d6fdd9d66bd67cba6b7e46658cb915"
+checksum = "6d9b5c5aec7827412fb596d633718c11c53fcc0b5aa7d1854517c8d4973b92de"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -706,6 +706,7 @@ dependencies = [
  "dig-constants",
  "dig-identity",
  "dig-ip",
+ "dig-stun",
  "dig-tls",
  "futures",
  "futures-util",
@@ -726,9 +727,9 @@ dependencies = [
 
 [[package]]
 name = "dig-peer"
-version = "0.16.0"
+version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "779734f3bb8e29d4c94fbbe85b33602e228a51d843033c1104d5ced23f1c2743"
+checksum = "dd816ee4dde0fa218bcc6a5b260b16a0d69132f172a2a57202f1b9b4d67bfd6e"
 dependencies = [
  "chia-protocol",
  "chia-traits 0.36.1",
@@ -745,9 +746,9 @@ dependencies = [
 
 [[package]]
 name = "dig-rpc-protocol"
-version = "0.14.0"
+version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5ef77b4f6f4d6be8f8d479202867ce4e8e33b0f20c34c3e46a0a2d532e727997"
+checksum = "1160e00673f442119f53557896bc155ec808da0df5eb9d09fc1b0e03f8c6b133"
 dependencies = [
  "serde",
  "serde_json",
@@ -755,10 +756,21 @@ dependencies = [
 ]
 
 [[package]]
-name = "dig-tls"
-version = "0.4.0"
+name = "dig-stun"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c0bf7485887113c67b3a1dbbdae603d933edf5cd789379522c4d1874149aeca8"
+checksum = "b6a980e520a5ceccc776b01e860bae3e0fe0e64037ee01b97774d20e385fb025"
+dependencies = [
+ "ring",
+ "thiserror 2.0.20",
+ "tokio",
+]
+
+[[package]]
+name = "dig-tls"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72086798775680e67632d614214973597be0c2aea212683725b9cc20fa458452"
 dependencies = [
  "blst",
  "chia-bls 0.36.1",
