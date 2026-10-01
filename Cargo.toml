@@ -20,7 +20,7 @@
 # by dig-node (see the implementers' note in the crate docs).
 [package]
 name = "dig-download"
-version = "0.25.0"
+version = "0.26.0"
 edition = "2021"
 rust-version = "1.75.0"
 license = "Apache-2.0 OR MIT"
@@ -112,7 +112,12 @@ dig-dht = "0.15"
 # EMPTY. The bump is still mandatory -- a 0.x MINOR is semver-INCOMPATIBLE, so a `^0.12` here
 # resolves a SECOND dig-rpc-protocol for any consumer that also requires `^0.14`, which is exactly
 # what blocks dig-node from adopting 0.14.0 and reaching its `claim_loop`.
-dig-rpc-protocol = "0.14"
+#
+# `0.14` -> `0.15` (dig_ecosystem#3442): recoverable_base_units on RewardWire changes from u64 to
+# Option<u64> to express "not recoverable"; this crate touches the module wire only, no RewardWire
+# construction or matching here, so the bump is mandatory to keep the lock singular as consumers
+# adopt 0.15.
+dig-rpc-protocol = "0.15"
 
 # REACH + FETCH — the mTLS peer transport the range fetch rides: `dig.getAvailability` +
 # `dig.fetchRange` over dig-nat mux streams, plus the wire shapes (`RangeRequest`, `RangeFrame`,
@@ -169,7 +174,13 @@ dig-nat = "0.21"
 # requires `^0.12`, this crate cannot require `^0.14` without resolving TWO dig-rpc-protocol copies
 # -- which `the_tree_carries_exactly_one_dig_rpc_protocol_and_it_is_the_module_wire_major` below
 # fails on, correctly. dig-peer 0.16.0 is a manifest-only bump (no public API change).
-dig-peer = "0.16"
+#
+# `0.16` -> `0.17` (dig_ecosystem#3442): dig-peer moved its OWN dig-rpc-protocol requirement to
+# `^0.15` in the same cascade. It must move with this crate, and it must move FIRST: while dig-peer
+# requires `^0.14`, this crate cannot require `^0.15` without resolving TWO dig-rpc-protocol copies
+# -- which `the_tree_carries_exactly_one_dig_rpc_protocol_and_it_is_the_module_wire_major` below
+# fails on, correctly. dig-peer 0.17.0 is a manifest-only bump (no public API change).
+dig-peer = "0.17"
 
 # Async runtime for the orchestrator task + the concurrent range fan-out + backoff timers.
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync", "io-util"] }
